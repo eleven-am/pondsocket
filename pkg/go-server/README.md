@@ -58,50 +58,89 @@ func main() {
 }
 
 func handleConnection(ctx *pondsocket.ConnectionContext) error {
-    token := ctx.Request().URL.Query().Get("token")
+    // Access query parameters safely
+    token := ctx.Route.Query.Get("token")
     
-    if isValidToken(token) {
-        // Accept connection with user metadata
-        return ctx.Accept(map[string]interface{}{
-            "userId": getUserIdFromToken(token),
-            "role":   getRoleFromToken(token),
-        })
+    // Alternative: access from headers
+    if token == "" {
+        authHeader := ctx.Headers().Get("Authorization")
+        if strings.HasPrefix(authHeader, "Bearer ") {
+            token = strings.TrimPrefix(authHeader, "Bearer ")
+        }
     }
     
-    return ctx.Reject("Invalid token", 401)
+    if isValidToken(token) {
+        userInfo := getUserFromToken(token)
+        // Set assigns using the proper method
+        return ctx.SetAssigns("userId", userInfo.ID).
+                  SetAssigns("role", userInfo.Role).
+                  SetAssigns("username", userInfo.Username).
+                  Accept()
+    }
+    
+    return ctx.Decline(401, "Invalid token")
 }
 
 func handleJoin(ctx *pondsocket.JoinContext) error {
-    userRole := ctx.User().Assigns["role"].(string)
-    roomId := ctx.Event().Params["roomId"]
-    username := ctx.JoinParams()["username"].(string)
-
-    if userRole == "user" {
-        return ctx.Accept(map[string]interface{}{
-            "username": username,
-        }).TrackPresence(map[string]interface{}{
-            "username": username,
-            "status":   "online",
-            "joinedAt": time.Now().Unix(),
-        }).SendToUsers("history", map[string]interface{}{
-            "messages": getChannelHistory(roomId),
-        }, []string{ctx.User().UserID})
+    // Access user assigns safely
+    userRole := ctx.GetAssigns("role")
+    if userRole == nil {
+        return ctx.Decline(401, "No role assigned")
     }
     
-    return ctx.Decline("Unauthorized", 403)
+    // Access route parameters safely
+    roomId := ctx.Route.Params["roomId"]
+    
+    // Parse join payload safely
+    var joinParams struct {
+        Username string `json:"username"`
+    }
+    if err := ctx.ParsePayload(&joinParams); err != nil {
+        return ctx.Decline(400, "Invalid join parameters")
+    }
+
+    if userRole.(string) == "user" {
+        return ctx.Accept().
+                  SetAssigns("username", joinParams.Username).
+                  Track(map[string]interface{}{
+                      "username": joinParams.Username,
+                      "status":   "online",
+                      "joinedAt": time.Now().Unix(),
+                  }).
+                  Reply("history", map[string]interface{}{
+                      "messages": getChannelHistory(roomId),
+                  }).
+                  Err()
+    }
+    
+    return ctx.Decline(403, "Unauthorized")
 }
 
 func handleMessage(ctx *pondsocket.EventContext) error {
-    message := ctx.Event().Payload.(map[string]interface{})
-    text := message["text"].(string)
-    username := ctx.User().Assigns["username"].(string)
+    // Parse message payload safely
+    var message struct {
+        Text string `json:"text"`
+    }
+    if err := ctx.ParsePayload(&message); err != nil {
+        return ctx.Reply("error", map[string]interface{}{
+            "message": "Invalid message format",
+        }).Err()
+    }
+    
+    // Get user assigns safely
+    username, err := ctx.GetAssign("username")
+    if err != nil {
+        return ctx.Reply("error", map[string]interface{}{
+            "message": "Username not found",
+        }).Err()
+    }
 
     // Broadcast message to all users in the channel
     return ctx.Broadcast("message", map[string]interface{}{
-        "text":      text,
+        "text":      message.Text,
         "username":  username,
         "timestamp": time.Now().Unix(),
-    })
+    }).Err()
 }
 ```
 
@@ -270,32 +309,132 @@ lobby.Use(func(ctx context.Context, req *pondsocket.MessageEvent, res *pondsocke
 })
 ```
 
+### Best Practices & Safe API Usage
+
+#### Safe Data Access Patterns
+
+```go
+// ✅ GOOD: Safe query parameter access
+token := ctx.Route.Query.Get("token")
+
+// ✅ GOOD: Safe header access  
+authHeader := ctx.Headers().Get("Authorization")
+
+// ✅ GOOD: Safe route parameter access
+roomId := ctx.Route.Params["roomId"]
+
+// ✅ GOOD: Safe assigns access with nil checking
+userRole := ctx.GetAssigns("role")
+if userRole == nil {
+    return ctx.Decline(401, "Role not found")
+}
+
+// ✅ GOOD: Safe payload parsing with struct validation
+var payload struct {
+    Text string `json:"text"`
+    Type string `json:"type,omitempty"`
+}
+if err := ctx.ParsePayload(&payload); err != nil {
+    return ctx.Reply("error", map[string]interface{}{
+        "message": "Invalid payload format",
+    }).Err()
+}
+
+// ✅ GOOD: Safe assign retrieval with error handling
+username, err := ctx.GetAssign("username")
+if err != nil {
+    return ctx.Reply("error", map[string]interface{}{
+        "message": "Username not found",
+    }).Err()
+}
+
+// ❌ AVOID: Direct type assertions without checking
+// text := ctx.GetPayload().(map[string]interface{})["text"].(string)
+
+// ❌ AVOID: Direct assigns access without validation  
+// role := ctx.GetUser().Assigns["role"].(string)
+
+// ❌ AVOID: Direct request access
+// token := ctx.Request().URL.Query().Get("token")
+```
+
+#### Method Chaining Pattern
+
+```go
+// ✅ GOOD: Use method chaining with proper error handling
+return ctx.Accept().
+          SetAssigns("username", username).
+          Track(presenceData).
+          Reply("welcome", welcomeMessage).
+          Err() // Always call .Err() at the end
+
+// ✅ GOOD: Multiple operations with error checking
+ctx.SetAssigns("score", 100).
+    SetAssigns("level", 5).
+    Update(newPresenceData)
+
+if ctx.Err() != nil {
+    return ctx.Err()
+}
+
+return ctx.Broadcast("level_up", levelData).Err()
+```
+
 ### Error Handling
 
 ```go
 func handleMessage(ctx *pondsocket.EventContext) error {
-    payload := ctx.Event().Payload.(map[string]interface{})
-    
-    // Validate message
-    text, ok := payload["text"].(string)
-    if !ok || len(text) == 0 {
-        return ctx.Decline("Message text is required", 400)
+    // Parse payload safely with struct validation
+    var message struct {
+        Text string `json:"text"`
+        Type string `json:"type,omitempty"`
+    }
+    if err := ctx.ParsePayload(&message); err != nil {
+        return ctx.Reply("error", map[string]interface{}{
+            "code":    "INVALID_FORMAT",
+            "message": "Invalid message format",
+        }).Err()
     }
     
-    if len(text) > 1000 {
-        return ctx.Decline("Message too long", 400)
+    // Validate message content
+    if len(message.Text) == 0 {
+        return ctx.Reply("error", map[string]interface{}{
+            "code":    "EMPTY_MESSAGE",
+            "message": "Message text is required",
+        }).Err()
+    }
+    
+    if len(message.Text) > 1000 {
+        return ctx.Reply("error", map[string]interface{}{
+            "code":    "MESSAGE_TOO_LONG",
+            "message": "Message too long (max 1000 characters)",
+        }).Err()
     }
     
     // Check for profanity
-    if containsProfanity(text) {
-        return ctx.Decline("Profanity not allowed", 400)
+    if containsProfanity(message.Text) {
+        return ctx.Reply("error", map[string]interface{}{
+            "code":    "PROFANITY_DETECTED",
+            "message": "Profanity not allowed",
+        }).Err()
+    }
+    
+    // Get user info safely
+    username, err := ctx.GetAssign("username")
+    if err != nil {
+        return ctx.Reply("error", map[string]interface{}{
+            "code":    "USER_NOT_FOUND",
+            "message": "User information not available",
+        }).Err()
     }
     
     return ctx.Broadcast("message", map[string]interface{}{
-        "text":      text,
-        "userId":    ctx.User().UserID,
+        "text":      message.Text,
+        "userId":    ctx.GetUser().UserID,
+        "username":  username,
         "timestamp": time.Now().Unix(),
-    })
+        "type":      message.Type,
+    }).Err()
 }
 ```
 
@@ -451,52 +590,67 @@ func main() {
 func setupWebSocketEndpoints(manager *pondsocket.Manager) {
     // Create WebSocket endpoint for authentication
     endpoint := manager.CreateEndpoint("/ws/api/socket", func(ctx *pondsocket.ConnectionContext) error {
-        token := ctx.Request().URL.Query().Get("token")
+        token := ctx.Route.Query.Get("token")
         
         if !isValidToken(token) {
-            return ctx.Reject("Invalid authentication token", 401)
+            return ctx.Decline(401, "Invalid authentication token")
         }
 
         userInfo := getUserFromToken(token)
-        return ctx.Accept(map[string]interface{}{
-            "userId":   userInfo.ID,
-            "username": userInfo.Username,
-            "role":     userInfo.Role,
-        })
+        return ctx.SetAssigns("userId", userInfo.ID).
+                  SetAssigns("username", userInfo.Username).
+                  SetAssigns("role", userInfo.Role).
+                  Accept()
     })
 
     // Create chat room channels
     chatLobby := endpoint.CreateChannel("/chat/:roomId", func(ctx *pondsocket.JoinContext) error {
-        roomId := ctx.Event().Params["roomId"]
-        username := ctx.User().Assigns["username"].(string)
+        roomId := ctx.Route.Params["roomId"]
+        username := ctx.GetAssigns("username")
+        
+        if username == nil {
+            return ctx.Decline(401, "Username not found")
+        }
 
-        return ctx.Accept(map[string]interface{}{
-            "roomId":   roomId,
-            "joinedAt": time.Now().Unix(),
-        }).TrackPresence(map[string]interface{}{
-            "username": username,
-            "status":   "online",
-            "joinedAt": time.Now().Unix(),
-        })
+        return ctx.Accept().
+                  SetAssigns("roomId", roomId).
+                  SetAssigns("joinedAt", time.Now().Unix()).
+                  Track(map[string]interface{}{
+                      "username": username,
+                      "status":   "online",
+                      "joinedAt": time.Now().Unix(),
+                  }).
+                  Err()
     })
 
     // Handle chat messages
     chatLobby.OnEvent("message", func(ctx *pondsocket.EventContext) error {
-        payload := ctx.Event().Payload.(map[string]interface{})
-        text, ok := payload["text"].(string)
-        
-        if !ok || len(text) == 0 {
-            return ctx.Decline("Message text is required", 400)
+        var message struct {
+            Text string `json:"text"`
         }
+        if err := ctx.ParsePayload(&message); err != nil {
+            return ctx.Reply("error", map[string]interface{}{
+                "message": "Invalid message format",
+            }).Err()
+        }
+        
+        if len(message.Text) == 0 {
+            return ctx.Reply("error", map[string]interface{}{
+                "message": "Message text is required",
+            }).Err()
+        }
+
+        username, _ := ctx.GetAssign("username")
+        roomId := ctx.Route.Params["roomId"]
 
         // Broadcast message to all users in the room
         return ctx.Broadcast("message", map[string]interface{}{
-            "text":      text,
-            "userId":    ctx.User().UserID,
-            "username":  ctx.User().Assigns["username"],
+            "text":      message.Text,
+            "userId":    ctx.GetUser().UserID,
+            "username":  username,
             "timestamp": time.Now().Unix(),
-            "roomId":    ctx.Event().Params["roomId"],
-        })
+            "roomId":    roomId,
+        }).Err()
     })
 }
 
