@@ -28,7 +28,6 @@ func (m *Manager) GetEndpoints() []*Endpoint {
 }
 
 func createOriginChecker(opts *Options) func(*http.Request) bool {
-
 	var compiledRegexps []*regexp.Regexp
 	if opts.CheckOrigin && len(opts.AllowedOriginRegexps) > 0 {
 		compiledRegexps = make([]*regexp.Regexp, 0, len(opts.AllowedOriginRegexps))
@@ -47,6 +46,9 @@ func createOriginChecker(opts *Options) func(*http.Request) bool {
 			return false
 		}
 		for _, allowed := range opts.AllowedOrigins {
+			if allowed == "*" {
+				return true
+			}
 			if allowed == origin {
 				return true
 			}

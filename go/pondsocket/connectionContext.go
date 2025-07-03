@@ -59,18 +59,19 @@ func newConnectionContext(options connectionOptions) *ConnectionContext {
 func (c *ConnectionContext) Accept() error {
 	if c.hasResponded {
 		c.connectionCancel()
-
 		return badRequest(string(gatewayEntity), "ConnectionContext: the response has already been sent")
 	}
+
 	c.hasResponded = true
 	c.accepted = true
+
 	wsConn, err := c.upgrader.Upgrade(*c.response, c.request, nil)
 
 	if err != nil {
 		c.connectionCancel()
-
 		return wrapF(err, "failed to upgrade connection %s to WebSocket", c.userId)
 	}
+
 	connInstance, err := newConn(c.managerCtx, wsConn, c.assigns, c.userId, c.endpoint.options)
 
 	if err != nil {
