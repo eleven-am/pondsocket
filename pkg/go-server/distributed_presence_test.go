@@ -102,7 +102,7 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 
 		// Check that the new user can see presence from both nodes
-		presence := channelA.GetDistributedPresence()
+		presence := channelA.GetPresence()
 
 		// Should have presence for all users
 		if len(presence) < 2 {
@@ -211,7 +211,7 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 
 		// Check that channel B now has user_A's presence
-		presenceB := channelB.GetDistributedPresence()
+		presenceB := channelB.GetPresence()
 		userAPresence, hasUserA := presenceB["user_A"]
 		if !hasUserA {
 			t.Error("Channel B should have received user_A's presence via sync")

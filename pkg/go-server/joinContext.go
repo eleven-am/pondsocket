@@ -319,6 +319,32 @@ func (c *JoinContext) ParsePresence(v interface{}) error {
 	return parsePresence(v, user.Presence)
 }
 
+// GetAllPresence returns a map of all tracked users' presence data in the channel.
+// Automatically handles distribution if PubSub is configured.
+// Returns nil if there's an error or the channel is shutting down.
+func (c *JoinContext) GetAllPresence() map[string]interface{} {
+	if c.checkStateAndContext() {
+		return nil
+	}
+	if c.Channel == nil {
+		return nil
+	}
+	return c.Channel.GetPresence()
+}
+
+// GetAllAssigns returns a map of all users' assigns data in the channel.
+// Automatically handles distribution if PubSub is configured.
+// Returns nil if there's an error or the channel is shutting down.
+func (c *JoinContext) GetAllAssigns() map[string]map[string]interface{} {
+	if c.checkStateAndContext() {
+		return nil
+	}
+	if c.Channel == nil {
+		return nil
+	}
+	return c.Channel.GetAssigns()
+}
+
 // GetUser returns a User struct representing the joining user.
 // If called before Accept, returns basic user info from the connection.
 // If called after Accept, returns full user info including channel-specific data.

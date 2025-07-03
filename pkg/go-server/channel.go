@@ -38,10 +38,12 @@ type Channel struct {
 	nodeID               string
 	ctx                  context.Context
 	cancel               context.CancelFunc
-	mutex                sync.RWMutex
-	syncCoordinators     map[string]*syncCoordinator
-	syncCoordinatorMutex sync.RWMutex
-	internalQueueTimeout time.Duration
+	mutex                       sync.RWMutex
+	syncCoordinators            map[string]*syncCoordinator
+	assignsSyncCoordinators     map[string]*syncCoordinator
+	syncCoordinatorMutex        sync.RWMutex
+	assignsSyncCoordinatorMutex sync.RWMutex
+	internalQueueTimeout        time.Duration
 }
 
 func newChannel(ctx context.Context, options options) *Channel {
@@ -60,8 +62,9 @@ func newChannel(ctx context.Context, options options) *Channel {
 		nodeID:               uuid.NewString(),
 		ctx:                  channelCtx,
 		cancel:               cancel,
-		syncCoordinators:     make(map[string]*syncCoordinator),
-		internalQueueTimeout: options.InternalQueueTimeout,
+		syncCoordinators:        make(map[string]*syncCoordinator),
+		assignsSyncCoordinators: make(map[string]*syncCoordinator),
+		internalQueueTimeout:    options.InternalQueueTimeout,
 	}
 	c.presence = newPresence(&c)
 
@@ -184,6 +187,9 @@ func (c *Channel) EvictUser(userID, reason string) error {
 }
 
 // GetAssigns returns a map of all users' assigns data in the channel.
+// In single-node deployments, returns local assigns data.
+// In distributed deployments with PubSub configured, triggers a sync request to gather
+// assigns data from all nodes and waits up to 500ms for responses.
 // The returned map is keyed by user ID, with each value being that user's assigns map.
 // Assigns are server-side metadata and are never sent to clients automatically.
 // Returns nil if the channel is shutting down.
@@ -191,6 +197,41 @@ func (c *Channel) GetAssigns() map[string]map[string]interface{} {
 	if err := c.checkState(); err != nil {
 		return nil
 	}
+	
+	if c.pubsub == nil || c.endpointPath == "" {
+		return c.getLocalAssigns()
+	}
+	
+	requestID := c.requestAssignsSync("system")
+	if requestID == "" {
+		return c.getLocalAssigns()
+	}
+	
+	coordinator := c.getAssignsSyncCoordinator(requestID)
+	if coordinator == nil {
+		return c.getLocalAssigns()
+	}
+	
+	select {
+	case aggregated := <-coordinator.completeChan:
+		c.removeAssignsSyncCoordinator(requestID)
+		result := make(map[string]map[string]interface{})
+		for userID, assigns := range aggregated {
+			if assignsMap, ok := assigns.(map[string]interface{}); ok {
+				result[userID] = assignsMap
+			}
+		}
+		return result
+	case <-time.After(500 * time.Millisecond):
+		c.removeAssignsSyncCoordinator(requestID)
+		return c.getLocalAssigns()
+	case <-c.ctx.Done():
+		c.removeAssignsSyncCoordinator(requestID)
+		return nil
+	}
+}
+
+func (c *Channel) getLocalAssigns() map[string]map[string]interface{} {
 	assigns := c.store.List()
 
 	result := make(map[string]map[string]interface{})
@@ -205,6 +246,9 @@ func (c *Channel) GetAssigns() map[string]map[string]interface{} {
 }
 
 // GetPresence returns a map of all tracked users' presence data in the channel.
+// In single-node deployments, returns local presence data.
+// In distributed deployments with PubSub configured, triggers a sync request to gather
+// presence data from all nodes and waits up to 500ms for responses.
 // The returned map is keyed by user ID, with each value being that user's presence data.
 // Only users who have been explicitly tracked will appear in this map.
 // Returns nil if the channel is shutting down.
@@ -212,19 +256,55 @@ func (c *Channel) GetPresence() map[string]interface{} {
 	if err := c.checkState(); err != nil {
 		return nil
 	}
-	return c.presence.GetAll()
-}
-
-// GetDistributedPresence returns aggregated presence data from all nodes in a distributed setup.
-// In single-node deployments, this is equivalent to GetPresence().
-// In multi-node deployments with PubSub configured, this triggers a sync request to gather
-// presence data from all nodes hosting this channel.
-func (c *Channel) GetDistributedPresence() map[string]interface{} {
-	if err := c.checkState(); err != nil {
+	
+	if c.pubsub == nil || c.endpointPath == "" {
+		return c.presence.GetAll()
+	}
+	
+	requestID := uuid.NewString()
+	coordinator := c.addSyncCoordinator(requestID, "system")
+	
+	cleanEndpoint := c.endpointPath
+	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
+		cleanEndpoint = cleanEndpoint[1:]
+	}
+	
+	payload := presencePayload{
+		Event:     syncRequest,
+		RequestID: requestID,
+	}
+	evt := Event{
+		Action:      presence,
+		ChannelName: c.name,
+		RequestId:   requestID,
+		Payload:     payload,
+		Event:       string(syncRequest),
+	}
+	topic := formatTopic(cleanEndpoint, c.name, string(syncRequest))
+	
+	data, err := json.Marshal(evt)
+	if err != nil {
+		c.removeSyncCoordinator(requestID)
+		return c.presence.GetAll()
+	}
+	
+	go func() {
+		_ = c.pubsub.Publish(topic, data)
+	}()
+	
+	select {
+	case aggregated := <-coordinator.completeChan:
+		c.removeSyncCoordinator(requestID)
+		return aggregated
+	case <-time.After(500 * time.Millisecond):
+		c.removeSyncCoordinator(requestID)
+		return c.presence.GetAll()
+	case <-c.ctx.Done():
+		c.removeSyncCoordinator(requestID)
 		return nil
 	}
-	return c.presence.GetAll()
 }
+
 
 // Track starts tracking presence for a user with the provided presence data.
 // Once tracked, the user will receive presence updates from other tracked users.
@@ -404,6 +484,13 @@ func (c *Channel) Close() error {
 		delete(c.syncCoordinators, requestID)
 	}
 	c.syncCoordinatorMutex.Unlock()
+
+	c.assignsSyncCoordinatorMutex.Lock()
+
+	for requestID := range c.assignsSyncCoordinators {
+		delete(c.assignsSyncCoordinators, requestID)
+	}
+	c.assignsSyncCoordinatorMutex.Unlock()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -851,6 +938,14 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 }
 
 func (c *Channel) handleRemoteAssignsEvent(event *Event) {
+	if event.Event == string(assignsSyncRequest) {
+		go c.handleAssignsSyncRequest(event)
+		return
+	}
+	if event.Event == string(assignsSyncResponse) {
+		c.handleAssignsSyncResponse(event)
+		return
+	}
 	payload, ok := event.Payload.(map[string]interface{})
 	if !ok {
 		return
@@ -913,6 +1008,29 @@ func (c *Channel) removeSyncCoordinator(requestID string) {
 	delete(c.syncCoordinators, requestID)
 }
 
+func (c *Channel) addAssignsSyncCoordinator(requestID, requesterUserID string) *syncCoordinator {
+	c.assignsSyncCoordinatorMutex.Lock()
+	defer c.assignsSyncCoordinatorMutex.Unlock()
+	coordinator := newSyncCoordinator(requestID, requesterUserID, 500*time.Millisecond)
+
+	c.assignsSyncCoordinators[requestID] = coordinator
+	go c.handleAssignsSyncTimeout(coordinator)
+
+	return coordinator
+}
+
+func (c *Channel) getAssignsSyncCoordinator(requestID string) *syncCoordinator {
+	c.assignsSyncCoordinatorMutex.RLock()
+	defer c.assignsSyncCoordinatorMutex.RUnlock()
+	return c.assignsSyncCoordinators[requestID]
+}
+
+func (c *Channel) removeAssignsSyncCoordinator(requestID string) {
+	c.assignsSyncCoordinatorMutex.Lock()
+	defer c.assignsSyncCoordinatorMutex.Unlock()
+	delete(c.assignsSyncCoordinators, requestID)
+}
+
 func (coordinator *syncCoordinator) addResponse(nodeID string, presenceData map[string]interface{}) {
 	coordinator.mutex.Lock()
 	defer coordinator.mutex.Unlock()
@@ -967,6 +1085,62 @@ func (c *Channel) handleSyncTimeout(coordinator *syncCoordinator) {
 	case <-c.ctx.Done():
 		c.removeSyncCoordinator(coordinator.requestID)
 	}
+}
+
+func (c *Channel) handleAssignsSyncTimeout(coordinator *syncCoordinator) {
+	select {
+	case <-time.After(coordinator.timeout):
+		aggregated := coordinator.complete()
+
+		if aggregated != nil {
+			c.sendAssignsSyncComplete(coordinator.requestID, coordinator.requesterUserID, aggregated)
+		}
+		c.removeAssignsSyncCoordinator(coordinator.requestID)
+
+	case <-coordinator.completeChan:
+		c.removeAssignsSyncCoordinator(coordinator.requestID)
+
+	case <-c.ctx.Done():
+		c.removeAssignsSyncCoordinator(coordinator.requestID)
+	}
+}
+
+func (c *Channel) requestAssignsSync(requesterUserID string) string {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return ""
+	}
+	cleanEndpoint := c.endpointPath
+	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
+		cleanEndpoint = cleanEndpoint[1:]
+	}
+	requestID := uuid.NewString()
+
+	c.addAssignsSyncCoordinator(requestID, requesterUserID)
+
+	payload := assignsPayload{
+		Event:     assignsSyncRequest,
+		RequestID: requestID,
+	}
+	evt := Event{
+		Action:      assigns,
+		ChannelName: c.name,
+		RequestId:   requestID,
+		Payload:     payload,
+		Event:       string(assignsSyncRequest),
+	}
+	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncRequest))
+
+	data, err := json.Marshal(evt)
+	if err != nil {
+		c.removeAssignsSyncCoordinator(requestID)
+		return ""
+	}
+	
+	go func() {
+		_ = c.pubsub.Publish(topic, data)
+	}()
+	
+	return requestID
 }
 
 func (c *Channel) handlePresenceSyncRequest(requestEvent *Event) {
@@ -1086,6 +1260,131 @@ func (c *Channel) sendSyncComplete(requestID, requesterUserID string, aggregated
 		Event:      evt,
 		Recipients: recipientIDs,
 	}
+	select {
+	case c.channel <- internalEv:
+	case <-c.ctx.Done():
+	default:
+	}
+}
+
+func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+	payload, ok := requestEvent.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+	requestID, _ := payload["requestId"].(string)
+	if requestID == "" {
+		return
+	}
+	
+	assignsData := c.GetAssigns()
+	assignsSlice := make([]interface{}, 0, len(assignsData))
+	
+	for userID, userAssigns := range assignsData {
+		assignsSlice = append(assignsSlice, map[string]interface{}{
+			"userId":  userID,
+			"assigns": userAssigns,
+		})
+	}
+	
+	cleanEndpoint := c.endpointPath
+	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
+		cleanEndpoint = cleanEndpoint[1:]
+	}
+	
+	responsePayload := assignsPayload{
+		Event:     assignsSyncResponse,
+		NodeID:    c.nodeID,
+		RequestID: requestID,
+		Assigns:   assignsSlice,
+	}
+	
+	evt := Event{
+		Action:      assigns,
+		ChannelName: c.name,
+		RequestId:   uuid.NewString(),
+		Payload:     responsePayload,
+		Event:       string(assignsSyncResponse),
+	}
+	
+	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncResponse))
+	data, err := json.Marshal(evt)
+	if err != nil {
+		return
+	}
+	_ = c.pubsub.Publish(topic, data)
+}
+
+func (c *Channel) handleAssignsSyncResponse(event *Event) {
+	payload, ok := event.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+	requestID, _ := payload["requestId"].(string)
+	nodeID, _ := payload["nodeId"].(string)
+	assignsData, _ := payload["assigns"].([]interface{})
+
+	if requestID == "" || nodeID == "" {
+		return
+	}
+	
+	coordinator := c.getAssignsSyncCoordinator(requestID)
+	if coordinator == nil {
+		return
+	}
+	
+	nodeAssigns := make(map[string]interface{})
+	for _, item := range assignsData {
+		if itemMap, ok := item.(map[string]interface{}); ok {
+			if userID, exists := itemMap["userId"].(string); exists {
+				nodeAssigns[userID] = itemMap["assigns"]
+			}
+		}
+	}
+	coordinator.addResponse(nodeID, nodeAssigns)
+}
+
+func (c *Channel) sendAssignsSyncComplete(requestID, requesterUserID string, aggregatedAssigns map[string]interface{}) {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+	
+	assignsSlice := make([]interface{}, 0, len(aggregatedAssigns))
+	for userID, userAssigns := range aggregatedAssigns {
+		assignsSlice = append(assignsSlice, map[string]interface{}{
+			"userId":  userID,
+			"assigns": userAssigns,
+		})
+	}
+	
+	cleanEndpoint := c.endpointPath
+	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
+		cleanEndpoint = cleanEndpoint[1:]
+	}
+	
+	completePayload := assignsPayload{
+		Event:     assignsSyncComplete,
+		RequestID: requestID,
+		Assigns:   assignsSlice,
+	}
+	
+	evt := Event{
+		Action:      assigns,
+		ChannelName: c.name,
+		RequestId:   uuid.NewString(),
+		Payload:     completePayload,
+		Event:       string(assignsSyncComplete),
+	}
+	
+	recipientIDs := fromSlice([]string{requesterUserID})
+	internalEv := internalEvent{
+		Event:      evt,
+		Recipients: recipientIDs,
+	}
+	
 	select {
 	case c.channel <- internalEv:
 	case <-c.ctx.Done():

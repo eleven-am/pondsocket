@@ -25,6 +25,16 @@ type presencePayload struct {
 	RequestID string            `json:"requestId,omitempty"`
 }
 
+type assignsPayload struct {
+	Event     assignsEventType `json:"event"`
+	UserID    string           `json:"userId"`
+	Key       string           `json:"key"`
+	Value     interface{}      `json:"value"`
+	Assigns   []interface{}    `json:"assigns,omitempty"`
+	NodeID    string           `json:"nodeId,omitempty"`
+	RequestID string           `json:"requestId,omitempty"`
+}
+
 func newPresence(channel *Channel) *presenceClient {
 	return &presenceClient{
 		store:   newStore[interface{}](),

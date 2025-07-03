@@ -232,11 +232,8 @@ channel.UpdatePresence(userID, map[string]interface{}{
     "status": "away",
 })
 
-// Get all presence data
+// Get all presence data (automatically distributed if PubSub configured)
 presenceData := channel.GetPresence()
-
-// Get distributed presence (across all nodes)
-distributedPresence := channel.GetDistributedPresence()
 ```
 
 ### User Assigns
@@ -246,6 +243,9 @@ Manage server-side metadata for users:
 ```go
 // Update user assigns
 channel.UpdateAssigns(userID, "score", 100)
+
+// Get all assigns data (automatically distributed if PubSub configured)
+assignsData := channel.GetAssigns()
 
 // Get user information
 user, err := channel.GetUser(userID)
@@ -367,6 +367,12 @@ if err := ctx.ParsePresence(&userPresence); err != nil {
         "message": "Invalid presence format",
     }).Err()
 }
+
+// ✅ GOOD: Get all presence data (automatically distributed)
+allPresence := ctx.GetAllPresence()
+
+// ✅ GOOD: Get all assigns data (automatically distributed)
+allAssigns := ctx.GetAllAssigns()
 
 // ✅ GOOD: Safe assign retrieval with error handling
 username, err := ctx.GetAssign("username")

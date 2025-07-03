@@ -276,6 +276,26 @@ func (c *EventContext) ParsePresence(v interface{}) error {
 	return parsePresence(v, user.Presence)
 }
 
+// GetAllPresence returns a map of all tracked users' presence data in the channel.
+// Automatically handles distribution if PubSub is configured.
+// Returns nil if there's an error or the channel is shutting down.
+func (c *EventContext) GetAllPresence() map[string]interface{} {
+	if c.checkStateAndContext() {
+		return nil
+	}
+	return c.Channel.GetPresence()
+}
+
+// GetAllAssigns returns a map of all users' assigns data in the channel.
+// Automatically handles distribution if PubSub is configured.
+// Returns nil if there's an error or the channel is shutting down.
+func (c *EventContext) GetAllAssigns() map[string]map[string]interface{} {
+	if c.checkStateAndContext() {
+		return nil
+	}
+	return c.Channel.GetAssigns()
+}
+
 // GetUser returns the User struct for the message sender.
 // This includes the user's current assigns and presence data in the channel.
 // The returned user data is fetched fresh from the channel state.

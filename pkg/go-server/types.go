@@ -32,6 +32,8 @@ type messageEvent struct {
 
 type presenceEventType string
 
+type assignsEventType string
+
 // Validate checks if the Event has all required fields populated.
 // Returns true if Action, ChannelName, Event, and RequestId are all non-empty,
 // false otherwise.
@@ -78,6 +80,9 @@ const (
 	syncRequest          presenceEventType = "presence:sync_request"
 	syncResponse         presenceEventType = "presence:sync_response"
 	syncComplete         presenceEventType = "presence:sync_complete"
+	assignsSyncRequest   assignsEventType  = "assigns:sync_request"
+	assignsSyncResponse  assignsEventType  = "assigns:sync_response"
+	assignsSyncComplete  assignsEventType  = "assigns:sync_complete"
 	all                  recipient         = "all"
 	allExceptSender      recipient         = "all_except_sender"
 	presence             action            = "PRESENCE"
