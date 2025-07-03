@@ -57,7 +57,7 @@ git-ssh:
 # Release commands
 release-patch:
 	@echo "Creating patch release..."
-	@current_version=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
+	@current_version=$$(git tag -l "v*.*.*" | sort -V | tail -1 || echo "v0.0.0"); \
 	new_version=$$(echo $$current_version | awk -F. '{$$3 = $$3 + 1; print $$1"."$$2"."$$3}'); \
 	echo "Bumping from $$current_version to $$new_version"; \
 	git tag $$new_version; \
@@ -66,7 +66,7 @@ release-patch:
 
 release-minor:
 	@echo "Creating minor release..."
-	@current_version=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
+	@current_version=$$(git tag -l "v*.*.*" | sort -V | tail -1 || echo "v0.0.0"); \
 	new_version=$$(echo $$current_version | awk -F. '{$$2 = $$2 + 1; $$3 = 0; print $$1"."$$2"."$$3}'); \
 	echo "Bumping from $$current_version to $$new_version"; \
 	git tag $$new_version; \
@@ -75,7 +75,7 @@ release-minor:
 
 release-major:
 	@echo "Creating major release..."
-	@current_version=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
+	@current_version=$$(git tag -l "v*.*.*" | sort -V | tail -1 || echo "v0.0.0"); \
 	new_version=$$(echo $$current_version | awk -F. '{$$1 = $$1 + 1; $$2 = 0; $$3 = 0; print $$1"."$$2"."$$3}' | sed 's/^v/v/'); \
 	echo "Bumping from $$current_version to $$new_version"; \
 	git tag $$new_version; \
