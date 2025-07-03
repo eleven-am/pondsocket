@@ -18,7 +18,7 @@ go get github.com/redis/go-redis/v9
 import (
     "context"
     "github.com/redis/go-redis/v9"
-    "github.com/pondsocket/pkg/go-server/distributed"
+    "github.com/pondsocket/javascript/core-go/distributed"
 )
 
 // Create Redis client

@@ -1,6 +1,6 @@
 #ignore all the node modules and dists in the packages subfolders
-pkg/*/node_modules
-pkg/*/dist
-pkg/*/coverage
+javascript/*/node_modules
+javascript/*/dist
+javascript/*/coverage
 /.idea
 /.claude
