@@ -248,6 +248,34 @@ func (c *EventContext) ParsePayload(v interface{}) error {
 	return parsePayload(v, c.event.Payload)
 }
 
+// ParseAssigns unmarshals the message sender's assigns into the provided struct.
+// This is useful for deserializing user assigns into typed structs.
+// Returns an error if the assigns cannot be parsed into the target type.
+func (c *EventContext) ParseAssigns(v interface{}) error {
+	if c.checkStateAndContext() {
+		return c.err
+	}
+	user := c.GetUser()
+	if user == nil {
+		return wrapF(nil, "user not found")
+	}
+	return parseAssigns(v, user.Assigns)
+}
+
+// ParsePresence unmarshals the message sender's presence data into the provided struct.
+// This is useful for deserializing user presence into typed structs.
+// Returns an error if the presence cannot be parsed into the target type or if user has no presence.
+func (c *EventContext) ParsePresence(v interface{}) error {
+	if c.checkStateAndContext() {
+		return c.err
+	}
+	user := c.GetUser()
+	if user == nil {
+		return wrapF(nil, "user not found")
+	}
+	return parsePresence(v, user.Presence)
+}
+
 // GetUser returns the User struct for the message sender.
 // This includes the user's current assigns and presence data in the channel.
 // The returned user data is fetched fresh from the channel state.

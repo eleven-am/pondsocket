@@ -127,18 +127,22 @@ func handleMessage(ctx *pondsocket.EventContext) error {
         }).Err()
     }
     
-    // Get user assigns safely
-    username, err := ctx.GetAssign("username")
-    if err != nil {
+    // Parse user assigns safely into struct
+    var userAssigns struct {
+        Username string `json:"username"`
+        Role     string `json:"role"`
+    }
+    if err := ctx.ParseAssigns(&userAssigns); err != nil {
         return ctx.Reply("error", map[string]interface{}{
-            "message": "Username not found",
+            "message": "User assigns not found",
         }).Err()
     }
 
     // Broadcast message to all users in the channel
     return ctx.Broadcast("message", map[string]interface{}{
         "text":      message.Text,
-        "username":  username,
+        "username":  userAssigns.Username,
+        "userRole":  userAssigns.Role,
         "timestamp": time.Now().Unix(),
     }).Err()
 }
@@ -337,6 +341,30 @@ var payload struct {
 if err := ctx.ParsePayload(&payload); err != nil {
     return ctx.Reply("error", map[string]interface{}{
         "message": "Invalid payload format",
+    }).Err()
+}
+
+// ✅ GOOD: Safe assigns parsing with struct validation
+var userAssigns struct {
+    Role     string `json:"role"`
+    Username string `json:"username"`
+    Score    int    `json:"score,omitempty"`
+}
+if err := ctx.ParseAssigns(&userAssigns); err != nil {
+    return ctx.Reply("error", map[string]interface{}{
+        "message": "Invalid user assigns format",
+    }).Err()
+}
+
+// ✅ GOOD: Safe presence parsing with struct validation
+var userPresence struct {
+    Status   string `json:"status"`
+    LastSeen int64  `json:"lastSeen,omitempty"`
+    Online   bool   `json:"online"`
+}
+if err := ctx.ParsePresence(&userPresence); err != nil {
+    return ctx.Reply("error", map[string]interface{}{
+        "message": "Invalid presence format",
     }).Err()
 }
 

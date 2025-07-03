@@ -290,6 +290,35 @@ func (c *JoinContext) ParsePayload(v interface{}) error {
 	return parsePayload(v, c.event.Payload)
 }
 
+// ParseAssigns unmarshals the joining user's assigns into the provided struct.
+// If called before Accept, reads from connection assigns. If called after Accept, reads from channel assigns.
+// This is useful for deserializing user assigns into typed structs.
+// Returns an error if the assigns cannot be parsed into the target type.
+func (c *JoinContext) ParseAssigns(v interface{}) error {
+	if c.checkStateAndContext() {
+		return c.err
+	}
+	user := c.GetUser()
+	if user == nil {
+		return wrapF(nil, "user not found")
+	}
+	return parseAssigns(v, user.Assigns)
+}
+
+// ParsePresence unmarshals the joining user's presence data into the provided struct.
+// This is useful for deserializing user presence into typed structs.
+// Returns an error if the presence cannot be parsed into the target type or if user has no presence.
+func (c *JoinContext) ParsePresence(v interface{}) error {
+	if c.checkStateAndContext() {
+		return c.err
+	}
+	user := c.GetUser()
+	if user == nil {
+		return wrapF(nil, "user not found")
+	}
+	return parsePresence(v, user.Presence)
+}
+
 // GetUser returns a User struct representing the joining user.
 // If called before Accept, returns basic user info from the connection.
 // If called after Accept, returns full user info including channel-specific data.

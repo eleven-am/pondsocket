@@ -177,6 +177,13 @@ func (c *ConnectionContext) Headers() http.Header {
 	return c.request.Header
 }
 
+// ParseAssigns unmarshals the connection's assigns into the provided struct.
+// This is useful for deserializing connection assigns into typed structs.
+// Returns an error if the assigns cannot be parsed into the target type.
+func (c *ConnectionContext) ParseAssigns(v interface{}) error {
+	return parseAssigns(v, c.assigns)
+}
+
 // Context returns the context for this connection.
 // The context is cancelled when the connection is closed or declined.
 func (c *ConnectionContext) Context() context.Context {
