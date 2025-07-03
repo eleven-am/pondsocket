@@ -95,9 +95,9 @@ func (c *ConnectionContext) Accept() error {
 func (c *ConnectionContext) Decline(statusCode int, message string) error {
 	if c.hasResponded {
 		c.connectionCancel()
-
 		return badRequest(string(gatewayEntity), "ConnectionContext: the response has already been sent")
 	}
+
 	c.hasResponded = true
 	c.accepted = false
 	c.connectionCancel()
