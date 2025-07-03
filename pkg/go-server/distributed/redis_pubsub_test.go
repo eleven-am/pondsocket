@@ -1,0 +1,296 @@
+package distributed
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// TestRedisPubSub_BasicFunctionality tests basic publish/subscribe operations.
+func TestRedisPubSub_BasicFunctionality(t *testing.T) {
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	// Skip test if Redis is not available
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Skip("Redis not available:", err)
+	}
+
+	// Clean up any existing data
+	client.FlushDB(ctx)
+
+	pubsub, err := NewRedisPubSub(ctx, client)
+	if err != nil {
+		t.Fatal("Failed to create RedisPubSub:", err)
+	}
+	defer pubsub.Close()
+
+	t.Run("PublishSubscribe", func(t *testing.T) {
+		received := make(chan struct{})
+		var receivedTopic string
+		var receivedData []byte
+
+		// Subscribe to a topic
+		err := pubsub.Subscribe("pondsocket:test:channel:.*", func(topic string, data []byte) {
+			receivedTopic = topic
+			receivedData = data
+			close(received)
+		})
+		if err != nil {
+			t.Fatal("Subscribe failed:", err)
+		}
+
+		// Give subscription time to register
+		time.Sleep(100 * time.Millisecond)
+
+		// Publish a message
+		testData := []byte(`{"test": "message"}`)
+		err = pubsub.Publish("pondsocket:test:channel:message", testData)
+		if err != nil {
+			t.Fatal("Publish failed:", err)
+		}
+
+		// Wait for message
+		select {
+		case <-received:
+			if receivedTopic != "pondsocket:test:channel:message" {
+				t.Errorf("Expected topic 'pondsocket:test:channel:message', got '%s'", receivedTopic)
+			}
+			if string(receivedData) != string(testData) {
+				t.Errorf("Expected data '%s', got '%s'", testData, receivedData)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Timeout waiting for message")
+		}
+	})
+
+	t.Run("MultipleSubscribers", func(t *testing.T) {
+		var wg sync.WaitGroup
+		count := 3
+		wg.Add(count)
+
+		// Subscribe multiple handlers
+		for i := 0; i < count; i++ {
+			err := pubsub.Subscribe("pondsocket:multi:.*", func(topic string, data []byte) {
+				wg.Done()
+			})
+			if err != nil {
+				t.Fatal("Subscribe failed:", err)
+			}
+		}
+
+		// Give subscriptions time to register
+		time.Sleep(100 * time.Millisecond)
+
+		// Publish a message
+		err = pubsub.Publish("pondsocket:multi:test", []byte("test"))
+		if err != nil {
+			t.Fatal("Publish failed:", err)
+		}
+
+		// Wait for all handlers
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Success
+		case <-time.After(2 * time.Second):
+			t.Fatal("Timeout waiting for all handlers")
+		}
+	})
+
+	t.Run("Unsubscribe", func(t *testing.T) {
+		received := make(chan struct{})
+
+		// Subscribe
+		err := pubsub.Subscribe("pondsocket:unsub:.*", func(topic string, data []byte) {
+			received <- struct{}{}
+		})
+		if err != nil {
+			t.Fatal("Subscribe failed:", err)
+		}
+
+		// Give subscription time to register
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify subscription works
+		err = pubsub.Publish("pondsocket:unsub:test", []byte("test"))
+		if err != nil {
+			t.Fatal("Publish failed:", err)
+		}
+
+		select {
+		case <-received:
+			// Success
+		case <-time.After(1 * time.Second):
+			t.Fatal("Initial message not received")
+		}
+
+		// Unsubscribe
+		err = pubsub.Unsubscribe("pondsocket:unsub:.*")
+		if err != nil {
+			t.Fatal("Unsubscribe failed:", err)
+		}
+
+		// Give unsubscription time to process
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify unsubscription worked
+		err = pubsub.Publish("pondsocket:unsub:test", []byte("test"))
+		if err != nil {
+			t.Fatal("Publish after unsubscribe failed:", err)
+		}
+
+		select {
+		case <-received:
+			t.Fatal("Received message after unsubscribe")
+		case <-time.After(500 * time.Millisecond):
+			// Success - no message received
+		}
+	})
+}
+
+// TestRedisPubSub_PatternMatching tests pattern matching functionality.
+func TestRedisPubSub_PatternMatching(t *testing.T) {
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Skip("Redis not available:", err)
+	}
+
+	client.FlushDB(ctx)
+
+	pubsub, err := NewRedisPubSub(ctx, client)
+	if err != nil {
+		t.Fatal("Failed to create RedisPubSub:", err)
+	}
+	defer pubsub.Close()
+
+	tests := []struct {
+		name        string
+		pattern     string
+		topic       string
+		shouldMatch bool
+	}{
+		{"Exact match", "pondsocket:app:channel:event", "pondsocket:app:channel:event", true},
+		{"Wildcard match", "pondsocket:app:channel:.*", "pondsocket:app:channel:event", true},
+		{"Wildcard no match", "pondsocket:app:channel:.*", "pondsocket:app:other:event", false},
+		{"No wildcard no match", "pondsocket:app:channel:event", "pondsocket:app:channel:other", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			received := make(chan struct{})
+
+			err := pubsub.Subscribe(tt.pattern, func(topic string, data []byte) {
+				if topic == tt.topic {
+					close(received)
+				}
+			})
+			if err != nil {
+				t.Fatal("Subscribe failed:", err)
+			}
+
+			time.Sleep(100 * time.Millisecond)
+
+			err = pubsub.Publish(tt.topic, []byte("test"))
+			if err != nil {
+				t.Fatal("Publish failed:", err)
+			}
+
+			select {
+			case <-received:
+				if !tt.shouldMatch {
+					t.Error("Received message when should not match")
+				}
+			case <-time.After(500 * time.Millisecond):
+				if tt.shouldMatch {
+					t.Error("Did not receive message when should match")
+				}
+			}
+
+			pubsub.Unsubscribe(tt.pattern)
+		})
+	}
+}
+
+// TestRedisPubSub_Concurrency tests concurrent operations.
+func TestRedisPubSub_Concurrency(t *testing.T) {
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Skip("Redis not available:", err)
+	}
+
+	client.FlushDB(ctx)
+
+	pubsub, err := NewRedisPubSub(ctx, client)
+	if err != nil {
+		t.Fatal("Failed to create RedisPubSub:", err)
+	}
+	defer pubsub.Close()
+
+	// Concurrent publishers and subscribers
+	var wg sync.WaitGroup
+	messageCount := 100
+	subscriberCount := 5
+
+	received := make([]int, subscriberCount)
+	var mu sync.Mutex
+
+	// Create subscribers
+	for i := 0; i < subscriberCount; i++ {
+		idx := i
+		err := pubsub.Subscribe("pondsocket:concurrent:.*", func(topic string, data []byte) {
+			mu.Lock()
+			received[idx]++
+			mu.Unlock()
+		})
+		if err != nil {
+			t.Fatal("Subscribe failed:", err)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Concurrent publishers
+	wg.Add(messageCount)
+	for i := 0; i < messageCount; i++ {
+		go func(n int) {
+			defer wg.Done()
+			topic := fmt.Sprintf("pondsocket:concurrent:msg%d", n)
+			err := pubsub.Publish(topic, []byte(fmt.Sprintf("message %d", n)))
+			if err != nil {
+				t.Error("Publish failed:", err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(500 * time.Millisecond) // Allow time for message delivery
+
+	// Verify all subscribers received all messages
+	mu.Lock()
+	defer mu.Unlock()
+	for i, count := range received {
+		if count != messageCount {
+			t.Errorf("Subscriber %d received %d messages, expected %d", i, count, messageCount)
+		}
+	}
+}
