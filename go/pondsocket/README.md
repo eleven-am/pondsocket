@@ -31,7 +31,7 @@ package main
 import (
     "log"
     "time"
-    pondsocket "github.com/eleven-am/pondsocket/javascript/core-go"
+    "github.com/eleven-am/pondsocket/go/pondsocket"
 )
 
 func main() {
@@ -580,7 +580,7 @@ import (
 
     "github.com/labstack/echo/v4"
     "github.com/labstack/echo/v4/middleware"
-    pondsocket "github.com/eleven-am/pondsocket/javascript/core-go"
+    "github.com/eleven-am/pondsocket/go/pondsocket"
 )
 
 func main() {
@@ -750,7 +750,7 @@ package main
 import (
     "context"
     "github.com/gin-gonic/gin"
-    pondsocket "github.com/eleven-am/pondsocket/javascript/core-go"
+    "github.com/eleven-am/pondsocket/go/pondsocket"
 )
 
 func main() {
@@ -782,7 +782,7 @@ import (
     "context"
     "net/http"
     "github.com/gorilla/mux"
-    pondsocket "github.com/eleven-am/pondsocket/javascript/core-go"
+    "github.com/eleven-am/pondsocket/go/pondsocket"
 )
 
 func main() {
@@ -813,7 +813,7 @@ import (
     "net/http"
     "github.com/go-chi/chi/v5"
     "github.com/go-chi/chi/v5/middleware"
-    pondsocket "github.com/eleven-am/pondsocket/javascript/core-go"
+    "github.com/eleven-am/pondsocket/go/pondsocket"
 )
 
 func main() {
@@ -846,7 +846,7 @@ package main
 import (
     "context"
     "net/http"
-    pondsocket "github.com/eleven-am/pondsocket/javascript/core-go"
+    "github.com/eleven-am/pondsocket/go/pondsocket"
 )
 
 func main() {
@@ -877,7 +877,7 @@ import (
     "context"
     "github.com/gofiber/fiber/v2"
     "github.com/gofiber/fiber/v2/middleware/adaptor"
-    pondsocket "github.com/eleven-am/pondsocket/javascript/core-go"
+    "github.com/eleven-am/pondsocket/go/pondsocket"
 )
 
 func main() {
