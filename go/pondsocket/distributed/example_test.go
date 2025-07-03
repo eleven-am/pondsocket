@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/eleven-am/pondsocket/pkg/go-server/distributed"
+	"github.com/eleven-am/pondsocket/go/pondsocket/distributed"
 )
 
 // Example demonstrates how to use RedisPubSub with PondSocket
