@@ -1,7 +1,7 @@
 // This file contains the ConnectionContext struct which provides the interface for handling
 // new WebSocket connection requests. It allows accepting or declining connections,
 // setting initial metadata, and accessing request information.
-package main
+package pondsocket
 
 import (
 	"context"

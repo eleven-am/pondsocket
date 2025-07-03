@@ -1,7 +1,7 @@
 // This file defines the PubSub interface and utilities for distributed messaging.
 // PubSub enables PondSocket to work in distributed environments by synchronizing
 // state and broadcasting messages across multiple server nodes.
-package main
+package pondsocket
 
 import (
 	"errors"

@@ -1,7 +1,7 @@
 // This file contains the Manager struct which handles WebSocket upgrades, HTTP routing,
 // origin checking, and endpoint management. The Manager acts as the central coordinator
 // between the HTTP server and WebSocket endpoints.
-package main
+package pondsocket
 
 import (
 	"context"

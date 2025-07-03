@@ -1,4 +1,4 @@
-package main
+package pondsocket
 
 import (
 	"github.com/gorilla/websocket"

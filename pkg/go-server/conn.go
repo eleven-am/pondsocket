@@ -1,7 +1,7 @@
 // This file contains the Conn struct which represents a WebSocket connection to a client.
 // It handles the low-level WebSocket communication, including reading and writing messages,
 // ping/pong keepalive, graceful shutdown, and connection lifecycle management.
-package main
+package pondsocket
 
 import (
 	"context"

@@ -1,7 +1,7 @@
 // This file contains the JoinContext struct which provides the interface for handling
 // channel join requests. It allows accepting or declining join requests, setting initial
 // presence, and configuring the user's state in the channel.
-package main
+package pondsocket
 
 import (
 	"context"

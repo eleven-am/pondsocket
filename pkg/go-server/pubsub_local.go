@@ -1,7 +1,7 @@
 // This file contains the LocalPubSub implementation which provides an in-memory
 // publish-subscribe system for single-node deployments. It implements the PubSub
 // interface using Go channels and is suitable for development and single-server setups.
-package main
+package pondsocket
 
 import (
 	"context"

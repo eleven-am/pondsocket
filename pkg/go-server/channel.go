@@ -1,7 +1,7 @@
 // This file contains the Channel struct which represents a communication room where users
 // can join, send messages, and track presence. Channels handle message broadcasting,
 // user management, presence tracking, and distributed state synchronization through PubSub.
-package main
+package pondsocket
 
 import (
 	"context"
@@ -24,20 +24,20 @@ type syncCoordinator struct {
 }
 
 type Channel struct {
-	name                 string
-	endpointPath         string
-	presence             *presenceClient
-	leave                *LeaveHandler
-	store                *store[map[string]interface{}]
-	channel              chan internalEvent
-	connections          *store[*Conn]
-	middleware           *middleware[*messageEvent, *Channel]
-	outgoing             *middleware[*OutgoingContext, interface{}]
-	onDestroy            func() error
-	pubsub               PubSub
-	nodeID               string
-	ctx                  context.Context
-	cancel               context.CancelFunc
+	name                        string
+	endpointPath                string
+	presence                    *presenceClient
+	leave                       *LeaveHandler
+	store                       *store[map[string]interface{}]
+	channel                     chan internalEvent
+	connections                 *store[*Conn]
+	middleware                  *middleware[*messageEvent, *Channel]
+	outgoing                    *middleware[*OutgoingContext, interface{}]
+	onDestroy                   func() error
+	pubsub                      PubSub
+	nodeID                      string
+	ctx                         context.Context
+	cancel                      context.CancelFunc
 	mutex                       sync.RWMutex
 	syncCoordinators            map[string]*syncCoordinator
 	assignsSyncCoordinators     map[string]*syncCoordinator
@@ -50,18 +50,18 @@ func newChannel(ctx context.Context, options options) *Channel {
 	channelCtx, cancel := context.WithCancel(ctx)
 
 	c := Channel{
-		name:                 options.Name,
-		store:                newStore[map[string]interface{}](),
-		outgoing:             options.Outgoing,
-		connections:          newStore[*Conn](),
-		channel:              make(chan internalEvent, 128),
-		middleware:           options.Middleware,
-		leave:                options.Leave,
-		onDestroy:            options.OnDestroy,
-		pubsub:               options.PubSub,
-		nodeID:               uuid.NewString(),
-		ctx:                  channelCtx,
-		cancel:               cancel,
+		name:                    options.Name,
+		store:                   newStore[map[string]interface{}](),
+		outgoing:                options.Outgoing,
+		connections:             newStore[*Conn](),
+		channel:                 make(chan internalEvent, 128),
+		middleware:              options.Middleware,
+		leave:                   options.Leave,
+		onDestroy:               options.OnDestroy,
+		pubsub:                  options.PubSub,
+		nodeID:                  uuid.NewString(),
+		ctx:                     channelCtx,
+		cancel:                  cancel,
 		syncCoordinators:        make(map[string]*syncCoordinator),
 		assignsSyncCoordinators: make(map[string]*syncCoordinator),
 		internalQueueTimeout:    options.InternalQueueTimeout,
@@ -197,21 +197,21 @@ func (c *Channel) GetAssigns() map[string]map[string]interface{} {
 	if err := c.checkState(); err != nil {
 		return nil
 	}
-	
+
 	if c.pubsub == nil || c.endpointPath == "" {
 		return c.getLocalAssigns()
 	}
-	
+
 	requestID := c.requestAssignsSync("system")
 	if requestID == "" {
 		return c.getLocalAssigns()
 	}
-	
+
 	coordinator := c.getAssignsSyncCoordinator(requestID)
 	if coordinator == nil {
 		return c.getLocalAssigns()
 	}
-	
+
 	select {
 	case aggregated := <-coordinator.completeChan:
 		c.removeAssignsSyncCoordinator(requestID)
@@ -256,19 +256,19 @@ func (c *Channel) GetPresence() map[string]interface{} {
 	if err := c.checkState(); err != nil {
 		return nil
 	}
-	
+
 	if c.pubsub == nil || c.endpointPath == "" {
 		return c.presence.GetAll()
 	}
-	
+
 	requestID := uuid.NewString()
 	coordinator := c.addSyncCoordinator(requestID, "system")
-	
+
 	cleanEndpoint := c.endpointPath
 	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 		cleanEndpoint = cleanEndpoint[1:]
 	}
-	
+
 	payload := presencePayload{
 		Event:     syncRequest,
 		RequestID: requestID,
@@ -281,17 +281,17 @@ func (c *Channel) GetPresence() map[string]interface{} {
 		Event:       string(syncRequest),
 	}
 	topic := formatTopic(cleanEndpoint, c.name, string(syncRequest))
-	
+
 	data, err := json.Marshal(evt)
 	if err != nil {
 		c.removeSyncCoordinator(requestID)
 		return c.presence.GetAll()
 	}
-	
+
 	go func() {
 		_ = c.pubsub.Publish(topic, data)
 	}()
-	
+
 	select {
 	case aggregated := <-coordinator.completeChan:
 		c.removeSyncCoordinator(requestID)
@@ -304,7 +304,6 @@ func (c *Channel) GetPresence() map[string]interface{} {
 		return nil
 	}
 }
-
 
 // Track starts tracking presence for a user with the provided presence data.
 // Once tracked, the user will receive presence updates from other tracked users.
@@ -1135,11 +1134,11 @@ func (c *Channel) requestAssignsSync(requesterUserID string) string {
 		c.removeAssignsSyncCoordinator(requestID)
 		return ""
 	}
-	
+
 	go func() {
 		_ = c.pubsub.Publish(topic, data)
 	}()
-	
+
 	return requestID
 }
 
@@ -1279,29 +1278,29 @@ func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
 	if requestID == "" {
 		return
 	}
-	
+
 	assignsData := c.GetAssigns()
 	assignsSlice := make([]interface{}, 0, len(assignsData))
-	
+
 	for userID, userAssigns := range assignsData {
 		assignsSlice = append(assignsSlice, map[string]interface{}{
 			"userId":  userID,
 			"assigns": userAssigns,
 		})
 	}
-	
+
 	cleanEndpoint := c.endpointPath
 	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 		cleanEndpoint = cleanEndpoint[1:]
 	}
-	
+
 	responsePayload := assignsPayload{
 		Event:     assignsSyncResponse,
 		NodeID:    c.nodeID,
 		RequestID: requestID,
 		Assigns:   assignsSlice,
 	}
-	
+
 	evt := Event{
 		Action:      assigns,
 		ChannelName: c.name,
@@ -1309,7 +1308,7 @@ func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
 		Payload:     responsePayload,
 		Event:       string(assignsSyncResponse),
 	}
-	
+
 	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncResponse))
 	data, err := json.Marshal(evt)
 	if err != nil {
@@ -1330,12 +1329,12 @@ func (c *Channel) handleAssignsSyncResponse(event *Event) {
 	if requestID == "" || nodeID == "" {
 		return
 	}
-	
+
 	coordinator := c.getAssignsSyncCoordinator(requestID)
 	if coordinator == nil {
 		return
 	}
-	
+
 	nodeAssigns := make(map[string]interface{})
 	for _, item := range assignsData {
 		if itemMap, ok := item.(map[string]interface{}); ok {
@@ -1351,7 +1350,7 @@ func (c *Channel) sendAssignsSyncComplete(requestID, requesterUserID string, agg
 	if c.pubsub == nil || c.endpointPath == "" {
 		return
 	}
-	
+
 	assignsSlice := make([]interface{}, 0, len(aggregatedAssigns))
 	for userID, userAssigns := range aggregatedAssigns {
 		assignsSlice = append(assignsSlice, map[string]interface{}{
@@ -1359,18 +1358,18 @@ func (c *Channel) sendAssignsSyncComplete(requestID, requesterUserID string, agg
 			"assigns": userAssigns,
 		})
 	}
-	
+
 	cleanEndpoint := c.endpointPath
 	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 		cleanEndpoint = cleanEndpoint[1:]
 	}
-	
+
 	completePayload := assignsPayload{
 		Event:     assignsSyncComplete,
 		RequestID: requestID,
 		Assigns:   assignsSlice,
 	}
-	
+
 	evt := Event{
 		Action:      assigns,
 		ChannelName: c.name,
@@ -1378,13 +1377,13 @@ func (c *Channel) sendAssignsSyncComplete(requestID, requesterUserID string, agg
 		Payload:     completePayload,
 		Event:       string(assignsSyncComplete),
 	}
-	
+
 	recipientIDs := fromSlice([]string{requesterUserID})
 	internalEv := internalEvent{
 		Event:      evt,
 		Recipients: recipientIDs,
 	}
-	
+
 	select {
 	case c.channel <- internalEv:
 	case <-c.ctx.Done():

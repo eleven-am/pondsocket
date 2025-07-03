@@ -1,7 +1,7 @@
 // This file defines interfaces and implementations for extensibility hooks in PondSocket.
 // It provides rate limiting, metrics collection, and lifecycle callbacks that can be
 // integrated with external monitoring and control systems.
-package main
+package pondsocket
 
 import (
 	"context"

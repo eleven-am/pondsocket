@@ -1,7 +1,7 @@
 // This file contains the OutgoingContext struct which provides the interface for handling
 // outgoing messages before they are sent to clients. It allows transforming message payloads,
 // blocking messages, and refreshing user data.
-package main
+package pondsocket
 
 import (
 	"context"

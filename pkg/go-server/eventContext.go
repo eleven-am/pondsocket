@@ -1,7 +1,7 @@
 // This file contains the EventContext struct which provides the interface for handling
 // messages within a channel. It allows replying to messages, broadcasting events,
 // managing presence, and updating user state.
-package main
+package pondsocket
 
 import (
 	"context"

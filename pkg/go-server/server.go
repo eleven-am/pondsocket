@@ -1,7 +1,7 @@
-// package main provides a WebSocket server implementation with channel-based messaging.
+// package pondsocket provides a WebSocket server implementation with channel-based messaging.
 // This file contains the main Server struct which manages the HTTP server lifecycle,
 // WebSocket endpoints, and graceful shutdown handling.
-package main
+package pondsocket
 
 import (
 	"context"

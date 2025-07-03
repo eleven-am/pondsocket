@@ -1,6 +1,6 @@
 // This file contains type definitions for PondSocket including event structures,
 // configuration options, interfaces, and constants used throughout the library.
-package main
+package pondsocket
 
 import (
 	"context"

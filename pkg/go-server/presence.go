@@ -1,7 +1,7 @@
 // This file contains the presenceClient struct which manages presence tracking for users
 // in a channel. It handles presence state updates, broadcasts presence changes to tracked
 // users, and coordinates distributed presence synchronization across nodes.
-package main
+package pondsocket
 
 import (
 	"encoding/json"

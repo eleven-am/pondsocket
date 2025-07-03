@@ -1,7 +1,7 @@
 // This file contains the Lobby struct which provides a high-level interface for managing
 // channels within an endpoint. It allows configuration of message handlers, presence tracking,
 // and outgoing message transformations for channels matching specific patterns.
-package main
+package pondsocket
 
 import (
 	"context"

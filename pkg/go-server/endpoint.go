@@ -1,7 +1,7 @@
 // This file contains the Endpoint struct which manages WebSocket connections for a specific path.
 // Endpoints handle connection lifecycle, message routing between clients and channels,
 // and coordinate join/leave operations for channel-based communication.
-package main
+package pondsocket
 
 import (
 	"context"

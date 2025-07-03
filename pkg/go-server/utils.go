@@ -1,4 +1,4 @@
-package main
+package pondsocket
 
 import (
 	"context"
@@ -53,17 +53,17 @@ func parseAssigns(v interface{}, assigns map[string]interface{}) error {
 	if assigns == nil {
 		return wrapF(nil, "assigns data is nil")
 	}
-	
+
 	marshaled, err := json.Marshal(assigns)
 	if err != nil {
 		return wrapF(err, "failed to marshal assigns: %v", err)
 	}
-	
+
 	err = json.Unmarshal(marshaled, v)
 	if err != nil {
 		return wrapF(err, "failed to unmarshal assigns: %v", err)
 	}
-	
+
 	return nil
 }
 
@@ -74,16 +74,16 @@ func parsePresence(v interface{}, presence interface{}) error {
 	if presence == nil {
 		return wrapF(nil, "presence data is nil")
 	}
-	
+
 	marshaled, err := json.Marshal(presence)
 	if err != nil {
 		return wrapF(err, "failed to marshal presence: %v", err)
 	}
-	
+
 	err = json.Unmarshal(marshaled, v)
 	if err != nil {
 		return wrapF(err, "failed to unmarshal presence: %v", err)
 	}
-	
+
 	return nil
 }
