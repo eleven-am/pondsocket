@@ -99,6 +99,26 @@ func (l *Lobby) OnOutgoing(event Path, handler OutgoingEventHandler) {
 	})
 }
 
+// GetChannel retrieves a channel by name.
+// If the channel does not exist, it returns an error with StatusNotFound.
+// This method is safe to call concurrently.
+func (l *Lobby) GetChannel(name string) (*Channel, error) {
+	if err := l.endpoint.checkState(); err != nil {
+		return nil, err
+	}
+
+	ch, err := l.channels.Read(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if ch == nil {
+		return nil, &Error{Code: StatusNotFound, Message: "channel not found"}
+	}
+
+	return ch, nil
+}
+
 func (l *Lobby) createChannel(name string) (*Channel, error) {
 	l.channelMutex.Lock()
 	defer l.channelMutex.Unlock()
