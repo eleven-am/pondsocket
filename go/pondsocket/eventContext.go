@@ -337,6 +337,21 @@ func (c *EventContext) SetAssign(key string, value interface{}) *EventContext {
 	return c.SetAssigns(key, value)
 }
 
+// Context returns the context for this message event.
+// The context is cancelled if the operation times out or the server shuts down.
+func (c *EventContext) Context() context.Context {
+	return c.ctx
+}
+
+// Error implements the error interface for EventContext.
+// Returns the string representation of any error that occurred during event context operations.
+func (c *EventContext) Error() string {
+	if c.err != nil {
+		return c.err.Error()
+	}
+	return ""
+}
+
 func (c *EventContext) routines(userIds []string, handler func(ctx context.Context, ch *Channel, userId string) error) error {
 	idsToProcess := userIds
 	if len(idsToProcess) == 0 {
@@ -381,10 +396,4 @@ func (c *EventContext) routines(userIds []string, handler func(ctx context.Conte
 	wg.Wait()
 
 	return allErrors
-}
-
-// Context returns the context for this message event.
-// The context is cancelled if the operation times out or the server shuts down.
-func (c *EventContext) Context() context.Context {
-	return c.ctx
 }

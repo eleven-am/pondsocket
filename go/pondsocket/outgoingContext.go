@@ -195,3 +195,12 @@ func (c *OutgoingContext) setRoute(route *Route) {
 
 	c.Route = route
 }
+
+// Error implements the error interface for OutgoingContext.
+// Returns the string representation of any error that occurred during outgoing context operations.
+func (c *OutgoingContext) Error() string {
+	if c.err != nil {
+		return c.err.Error()
+	}
+	return ""
+}

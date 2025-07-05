@@ -378,3 +378,12 @@ func (c *JoinContext) GetUser() *User {
 func (c *JoinContext) Context() context.Context {
 	return c.ctx
 }
+
+// Error implements the error interface for JoinContext.
+// Returns the string representation of any error that occurred during join context operations.
+func (c *JoinContext) Error() string {
+	if c.err != nil {
+		return c.err.Error()
+	}
+	return ""
+}

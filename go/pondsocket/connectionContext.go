@@ -76,16 +76,15 @@ func (c *ConnectionContext) Accept() error {
 
 	if err != nil {
 		c.connectionCancel()
-
 		_ = wsConn.Close()
-
 		return wrapF(err, "failed to create internal connection for %s", c.userId)
 	}
+
 	if err = c.endpoint.addConnection(connInstance); err != nil {
 		c.connectionCancel()
-
 		return wrapF(err, "failed to add connection %s to endpoint", c.userId)
 	}
+
 	return nil
 }
 
