@@ -62,6 +62,8 @@ release-patch:
 	echo "Bumping from $$current_version to $$new_version"; \
 	git tag $$new_version; \
 	git push origin $$new_version; \
+	git tag go/pondsocket/$$new_version; \
+	git push origin go/pondsocket/$$new_version; \
 	echo "Released $$new_version"
 
 release-minor:
@@ -71,6 +73,8 @@ release-minor:
 	echo "Bumping from $$current_version to $$new_version"; \
 	git tag $$new_version; \
 	git push origin $$new_version; \
+	git tag go/pondsocket/$$new_version; \
+	git push origin go/pondsocket/$$new_version; \
 	echo "Released $$new_version"
 
 release-major:
@@ -80,6 +84,8 @@ release-major:
 	echo "Bumping from $$current_version to $$new_version"; \
 	git tag $$new_version; \
 	git push origin $$new_version; \
+	git tag go/pondsocket/$$new_version; \
+	git push origin go/pondsocket/$$new_version; \
 	echo "Released $$new_version"
 
 .DEFAULT_GOAL := test
