@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 func (e *Error) Error() string {
@@ -195,4 +197,37 @@ func addError(base, new error) error {
 		return me
 	}
 	return &MultiError{errors: []error{base, new}}
+}
+
+func errorEvent(err error) *Event {
+	if err == nil {
+		return nil
+	}
+
+	var e *Error
+	if errors.As(err, &e) {
+		return &Event{
+			Action:      system,
+			ChannelName: e.ChannelName,
+			RequestId:   uuid.NewString(),
+			Event:       string(internalErrorEvent),
+			Payload: map[string]interface{}{
+				"message":   e.Message,
+				"code":      e.Code,
+				"details":   e.Details,
+				"temporary": e.Temporary,
+				"cause":     e.cause.Error(),
+			},
+		}
+	}
+
+	return &Event{
+		Action:      system,
+		ChannelName: string(gatewayEntity),
+		RequestId:   uuid.NewString(),
+		Event:       string(internalErrorEvent),
+		Payload: map[string]interface{}{
+			"message": err.Error(),
+		},
+	}
 }

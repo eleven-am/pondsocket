@@ -45,13 +45,14 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 		closeHandlers: newArray[func(*Conn) error](),
 		options:       options,
 	}
-	wsConn.SetReadLimit(options.MaxMessageSize)
 
+	wsConn.SetReadLimit(options.MaxMessageSize)
 	if err := wsConn.SetReadDeadline(time.Now().Add(options.PongWait)); err != nil {
 		cancel()
 
 		return nil, wrapF(err, "failed to set initial read deadline for connection %s", id)
 	}
+
 	wsConn.SetPongHandler(func(string) error {
 		err := wsConn.SetReadDeadline(time.Now().Add(options.PongWait))
 
@@ -200,19 +201,24 @@ func (c *Conn) handleMessages() {
 
 				var event Event
 				if err := json.Unmarshal(message, &event); err != nil {
+					_ = c.sendJSON(errorEvent(wrapF(err, "failed to unmarshal event from connection %s", c.ID)))
 					continue
 				}
-				c.mutex.RLock()
 
+				c.mutex.RLock()
 				handler := c.handler
 				c.mutex.RUnlock()
 
 				if handler == nil {
+					_ = c.sendJSON(errorEvent(internal(string(gatewayEntity), "no handler registered for connection "+c.ID)))
 					continue
 				}
+
 				if !event.Validate() {
+					_ = c.sendJSON(errorEvent(internal(string(gatewayEntity), "invalid event received from connection "+c.ID)))
 					continue
 				}
+
 				_ = (*handler)(event, c)
 
 			case <-c.ctx.Done():
