@@ -212,11 +212,10 @@ func errorEvent(err error) *Event {
 			RequestId:   uuid.NewString(),
 			Event:       string(internalErrorEvent),
 			Payload: map[string]interface{}{
-				"message":   e.Message,
 				"code":      e.Code,
 				"details":   e.Details,
 				"temporary": e.Temporary,
-				"cause":     e.cause.Error(),
+				"message":   e.cause.Error(),
 			},
 		}
 	}
