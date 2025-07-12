@@ -279,6 +279,7 @@ func (c *Channel) GetPresence() map[string]interface{} {
 		RequestId:   requestID,
 		Payload:     payload,
 		Event:       string(syncRequest),
+		NodeID:      c.nodeID,
 	}
 	topic := formatTopic(cleanEndpoint, c.name, string(syncRequest))
 
@@ -614,7 +615,11 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 		}
 		topic := formatTopic(cleanEndpoint, c.name, event.Event)
 
-		data, err := json.Marshal(event)
+		// Add nodeID to event for distributed processing
+		eventForPubSub := event
+		eventForPubSub.NodeID = c.nodeID
+
+		data, err := json.Marshal(eventForPubSub)
 
 		if err == nil {
 			go func() {
@@ -824,6 +829,11 @@ func (c *Channel) subscribeToPubSub() {
 		if err := json.Unmarshal(data, &event); err != nil {
 			return
 		}
+
+		// Skip processing messages from the same node to prevent duplication
+		if event.NodeID == c.nodeID {
+			return
+		}
 		if event.Action == assigns {
 			c.handleRemoteAssignsEvent(&event)
 
@@ -925,6 +935,7 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 		RequestId:   uuid.NewString(),
 		Event:       "assigns:update",
 		Payload:     assignsPayload,
+		NodeID:      c.nodeID,
 	}
 	topic := formatTopic(cleanEndpoint, c.name, "assigns:update")
 
@@ -1126,6 +1137,7 @@ func (c *Channel) requestAssignsSync(requesterUserID string) string {
 		RequestId:   requestID,
 		Payload:     payload,
 		Event:       string(assignsSyncRequest),
+		NodeID:      c.nodeID,
 	}
 	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncRequest))
 
@@ -1182,6 +1194,7 @@ func (c *Channel) handlePresenceSyncRequest(requestEvent *Event) {
 		RequestId:   uuid.NewString(),
 		Payload:     responsePayload,
 		Event:       string(syncResponse),
+		NodeID:      c.nodeID,
 	}
 	topic := formatTopic(cleanEndpoint, c.name, string(syncResponse))
 
@@ -1252,6 +1265,7 @@ func (c *Channel) sendSyncComplete(requestID, requesterUserID string, aggregated
 		RequestId:   uuid.NewString(),
 		Payload:     completePayload,
 		Event:       string(syncComplete),
+		NodeID:      c.nodeID,
 	}
 	recipientIDs := fromSlice([]string{requesterUserID})
 
@@ -1307,6 +1321,7 @@ func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
 		RequestId:   uuid.NewString(),
 		Payload:     responsePayload,
 		Event:       string(assignsSyncResponse),
+		NodeID:      c.nodeID,
 	}
 
 	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncResponse))
@@ -1376,6 +1391,7 @@ func (c *Channel) sendAssignsSyncComplete(requestID, requesterUserID string, agg
 		RequestId:   uuid.NewString(),
 		Payload:     completePayload,
 		Event:       string(assignsSyncComplete),
+		NodeID:      c.nodeID,
 	}
 
 	recipientIDs := fromSlice([]string{requesterUserID})

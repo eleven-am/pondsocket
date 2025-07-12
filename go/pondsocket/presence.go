@@ -172,6 +172,7 @@ func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userI
 		RequestId:   uuid.NewString(),
 		Payload:     payload,
 		Event:       string(eventType),
+		NodeID:      p.channel.nodeID,
 	}
 	if p.channel.pubsub != nil && p.channel.endpointPath != "" {
 		cleanEndpoint := p.channel.endpointPath
@@ -238,6 +239,7 @@ func (p *presenceClient) requestPresenceSync(requesterUserID string) {
 		RequestId:   requestID,
 		Payload:     payload,
 		Event:       string(syncRequest),
+		NodeID:      p.channel.nodeID,
 	}
 	topic := formatTopic(cleanEndpoint, p.channel.name, string(syncRequest))
 

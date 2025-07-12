@@ -11,13 +11,15 @@ import (
 
 // Event represents a message that flows through the PondSocket system.
 // It contains the action type, target channel, unique request ID, payload data,
-// and event name for routing and processing WebSocket messages.
+// event name for routing and processing WebSocket messages, and optional nodeID
+// for distributed deployments to prevent processing own messages.
 type Event struct {
 	Action      action      `json:"action"`
 	ChannelName string      `json:"channelName"`
 	RequestId   string      `json:"requestId"`
 	Payload     interface{} `json:"payload"`
 	Event       string      `json:"event"`
+	NodeID      string      `json:"nodeId,omitempty"`
 }
 
 type internalEvent struct {
