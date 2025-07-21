@@ -18,7 +18,7 @@ A high-performance, concurrent WebSocket server implementation in Go that provid
 ## Installation
 
 ```bash
-go get github.com/eleven-am/pondsocket/javascript/core-go
+go get github.com/eleven-am/pondsocket/go/pondsocket
 ```
 
 ## Quick Start
