@@ -5,7 +5,6 @@ package pondsocket
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"os"
 	"os/signal"
@@ -79,15 +78,12 @@ func (s *Server) Start() error {
 	s.mutex.Unlock()
 
 	go func() {
-		var err error
 		if s.server.TLSConfig != nil {
-			err = s.server.ListenAndServeTLS("", "")
+			s.server.ListenAndServeTLS("", "")
 		} else {
-			err = s.server.ListenAndServe()
+			s.server.ListenAndServe()
 		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		} else {
-		}
+
 		s.mutex.Lock()
 
 		s.isRunning = false

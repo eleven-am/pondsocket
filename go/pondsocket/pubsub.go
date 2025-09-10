@@ -41,6 +41,9 @@ func (e *pubsubClosedError) Error() string {
 }
 
 func isPubSubClosed(err error) bool {
+	if err == nil {
+		return false
+	}
 
 	var pubsubClosedError *pubsubClosedError
 	ok := errors.As(err, &pubsubClosedError)

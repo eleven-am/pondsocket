@@ -81,36 +81,33 @@ func (c *Channel) RemoveUser(userID string) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
+
 	c.mutex.Lock()
-
 	defer c.mutex.Unlock()
-
 	if err := c.checkState(); err != nil {
 		return err
 	}
-	user, userErr := c.getUserUnsafe(userID)
 
+	user, userErr := c.getUserUnsafe(userID)
 	if userErr != nil {
 		return userErr
 	}
+
 	storeErr := c.store.Delete(userID)
-
 	presenceErr := c.presence.UnTrack(userID)
-
 	connectionErr := c.connections.Delete(userID)
-
 	combinedErr := combine(storeErr, presenceErr, connectionErr)
-
 	if combinedErr != nil {
 		return wrapF(combinedErr, "failed to fully remove user %s resources", userID)
 	}
+
 	if c.leave != nil && user != nil {
 		go func(u User) {
 			(*c.leave)(u)
 		}(*user)
 	}
-	remainingUsers := c.store.Len()
 
+	remainingUsers := c.store.Len()
 	if c.onDestroy != nil && remainingUsers == 0 {
 		go func() {
 			if err := c.Close(); err != nil {
@@ -121,6 +118,7 @@ func (c *Channel) RemoveUser(userID string) error {
 			}
 		}()
 	}
+
 	return nil
 }
 
@@ -150,15 +148,17 @@ func (c *Channel) EvictUser(userID, reason string) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
-	_, err := c.GetUser(userID)
 
+	_, err := c.GetUser(userID)
 	if err != nil {
 		return err
 	}
+
 	evictionPayload := map[string]interface{}{
 		"reason": reason,
 		"userId": userID,
 	}
+
 	broadcastEvent := Event{
 		Action:      system,
 		ChannelName: c.name,
@@ -166,6 +166,7 @@ func (c *Channel) EvictUser(userID, reason string) error {
 		Event:       "user_evicted",
 		Payload:     evictionPayload,
 	}
+
 	systemEvent := Event{
 		Action:      system,
 		ChannelName: c.name,
@@ -173,15 +174,19 @@ func (c *Channel) EvictUser(userID, reason string) error {
 		Event:       "evicted",
 		Payload:     evictionPayload,
 	}
+
 	if err = c.sendMessage(string(channelEntity), recipients{userIds: []string{userID}}, systemEvent); err != nil {
 		return wrapF(err, "failed to send eviction system message to user %s", userID)
 	}
+
 	if err = c.RemoveUser(userID); err != nil {
 		return wrapF(err, "failed to remove user %s during eviction", userID)
 	}
+
 	if err = c.checkState(); err != nil {
 		return nil
 	}
+
 	recp := all
 	return c.sendMessage(string(channelEntity), recipients{recipient: &recp}, broadcastEvent)
 }
@@ -365,6 +370,7 @@ func (c *Channel) UpdateAssigns(userID string, key string, value interface{}) er
 			assignsCopy[k] = v
 		}
 	}
+
 	assignsCopy[key] = value
 	err = c.store.Update(userID, assignsCopy)
 
@@ -374,6 +380,7 @@ func (c *Channel) UpdateAssigns(userID string, key string, value interface{}) er
 	if c.pubsub != nil && c.endpointPath != "" {
 		go c.broadcastAssignsUpdate(userID, key, value)
 	}
+
 	return nil
 }
 
@@ -920,15 +927,18 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 	if err := c.checkState(); err != nil {
 		return
 	}
+
 	cleanEndpoint := c.endpointPath
 	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 		cleanEndpoint = cleanEndpoint[1:]
 	}
+
 	assignsPayload := map[string]interface{}{
 		"UserID": userID,
 		"Key":    key,
 		"Value":  value,
 	}
+
 	event := Event{
 		Action:      assigns,
 		ChannelName: c.name,
@@ -1041,21 +1051,21 @@ func (c *Channel) removeAssignsSyncCoordinator(requestID string) {
 	delete(c.assignsSyncCoordinators, requestID)
 }
 
-func (coordinator *syncCoordinator) addResponse(nodeID string, presenceData map[string]interface{}) {
-	coordinator.mutex.Lock()
-	defer coordinator.mutex.Unlock()
-	if coordinator.completed {
+func (c *syncCoordinator) addResponse(nodeID string, presenceData map[string]interface{}) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.completed {
 		return
 	}
-	coordinator.responses[nodeID] = presenceData
+	c.responses[nodeID] = presenceData
 }
 
-func (coordinator *syncCoordinator) aggregateResponses() map[string]interface{} {
-	coordinator.mutex.RLock()
-	defer coordinator.mutex.RUnlock()
+func (c *syncCoordinator) aggregateResponses() map[string]interface{} {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 	merged := make(map[string]interface{})
 
-	for _, presenceData := range coordinator.responses {
+	for _, presenceData := range c.responses {
 		for userID, userData := range presenceData {
 			merged[userID] = userData
 		}
@@ -1063,17 +1073,17 @@ func (coordinator *syncCoordinator) aggregateResponses() map[string]interface{} 
 	return merged
 }
 
-func (coordinator *syncCoordinator) complete() map[string]interface{} {
-	coordinator.mutex.Lock()
-	defer coordinator.mutex.Unlock()
-	if coordinator.completed {
+func (c *syncCoordinator) complete() map[string]interface{} {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.completed {
 		return nil
 	}
-	coordinator.completed = true
-	aggregated := coordinator.aggregateResponses()
+	c.completed = true
+	aggregated := c.aggregateResponses()
 
 	select {
-	case coordinator.completeChan <- aggregated:
+	case c.completeChan <- aggregated:
 	default:
 	}
 	return aggregated
