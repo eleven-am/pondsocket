@@ -128,7 +128,8 @@ type Error struct {
 }
 
 // LeaveHandler is a callback function invoked when a user leaves a channel.
-type LeaveHandler func(user User)
+// It receives a LeaveContext with information about the leaving user and the channel state.
+type LeaveHandler func(ctx *LeaveContext)
 
 // User represents a connected user in a channel.
 // It contains the unique user identifier, server-side assigns metadata (never sent to clients),
@@ -165,6 +166,9 @@ type ConnectionEventHandler HandlerFunc[ConnectionContext]
 
 // OutgoingEventHandler processes outgoing messages before they are sent to clients.
 type OutgoingEventHandler HandlerFunc[OutgoingContext]
+
+// LeaveEventHandler processes user leave events from a channel.
+type LeaveEventHandler HandlerFunc[LeaveContext]
 
 // Options configures WebSocket server behavior and connection parameters.
 // It includes settings for origin checking, buffer sizes, timeouts, connection limits,

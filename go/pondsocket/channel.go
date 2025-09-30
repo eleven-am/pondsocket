@@ -75,9 +75,10 @@ func newChannel(ctx context.Context, options options) *Channel {
 
 // RemoveUser removes a user from the channel, cleaning up their presence and assigns data.
 // This method is automatically called when a user disconnects or leaves the channel.
+// The reason parameter describes why the user is leaving (e.g., "disconnect", "evicted", "explicit_leave").
 // If a leave handler is configured, it will be called asynchronously after removal.
 // If this was the last user in the channel and an onDestroy handler is set, the channel will be destroyed.
-func (c *Channel) RemoveUser(userID string) error {
+func (c *Channel) RemoveUser(userID string, reason string) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
@@ -102,9 +103,10 @@ func (c *Channel) RemoveUser(userID string) error {
 	}
 
 	if c.leave != nil && user != nil {
-		go func(u User) {
-			(*c.leave)(u)
-		}(*user)
+		go func(u User, channelName string, leaveReason string) {
+			leaveCtx := newLeaveContext(c.ctx, c, &u, leaveReason)
+			(*c.leave)(leaveCtx)
+		}(*user, c.name, reason)
 	}
 
 	remainingUsers := c.store.Len()
@@ -179,7 +181,7 @@ func (c *Channel) EvictUser(userID, reason string) error {
 		return wrapF(err, "failed to send eviction system message to user %s", userID)
 	}
 
-	if err = c.RemoveUser(userID); err != nil {
+	if err = c.RemoveUser(userID, "evicted:"+reason); err != nil {
 		return wrapF(err, "failed to remove user %s during eviction", userID)
 	}
 
@@ -729,7 +731,7 @@ func (c *Channel) onConnectionClose(user *Conn) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
-	return c.RemoveUser(user.ID)
+	return c.RemoveUser(user.ID, "connection_closed")
 }
 
 func (c *Channel) getUserAssigns(userID, key string) (interface{}, error) {

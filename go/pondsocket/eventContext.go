@@ -226,12 +226,6 @@ func (c *EventContext) Evict(reason string, userIds ...string) *EventContext {
 	return c
 }
 
-// Err returns any error that occurred during event context operations.
-// This should be checked after method chaining to handle any errors.
-func (c *EventContext) Err() error {
-	return c.err
-}
-
 // GetPayload returns the payload from the received message event.
 // This contains the data sent by the client with the message.
 func (c *EventContext) GetPayload() interface{} {

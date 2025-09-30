@@ -158,12 +158,6 @@ func (c *OutgoingContext) GetEvent() string {
 	return c.Event.Event
 }
 
-// Err returns any error that occurred during outgoing context operations.
-// This should be checked after method chaining to handle any errors.
-func (c *OutgoingContext) Err() error {
-	return c.err
-}
-
 // Context returns the context for this outgoing message operation.
 // The context is cancelled if the operation times out or the server shuts down.
 func (c *OutgoingContext) Context() context.Context {

@@ -137,9 +137,7 @@ func TestEndpointChannelCreation(t *testing.T) {
 
 	t.Run("can create channels", func(t *testing.T) {
 		lobby := endpoint.CreateChannel("room:*", func(ctx *JoinContext) error {
-			ctx.Accept()
-
-			return ctx.Err()
+			return ctx.Accept()
 		})
 
 		if lobby == nil {
@@ -154,9 +152,7 @@ func TestEndpointChannelCreation(t *testing.T) {
 
 	t.Run("channel handlers work", func(t *testing.T) {
 		lobby := endpoint.CreateChannel("test:*", func(ctx *JoinContext) error {
-			ctx.Accept()
-
-			return ctx.Err()
+			return ctx.Accept()
 		})
 
 		lobby.OnMessage("test:event", func(ctx *EventContext) error {
@@ -183,9 +179,7 @@ func TestEndpointShutdown(t *testing.T) {
 			endpoint.connections.Create(conn.ID, conn)
 		}
 		endpoint.CreateChannel("test:*", func(ctx *JoinContext) error {
-			ctx.Accept()
-
-			return ctx.Err()
+			return ctx.Accept()
 		})
 
 		cancel()
@@ -229,9 +223,7 @@ func TestEndpointConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 
 			endpoint.CreateChannel(fmt.Sprintf("channel-%d:*", n), func(ctx *JoinContext) error {
-				ctx.Accept()
-
-				return ctx.Err()
+				return ctx.Accept()
 			})
 		}(i)
 	}

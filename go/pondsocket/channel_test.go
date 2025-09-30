@@ -113,7 +113,7 @@ func TestChannelRemoveUser(t *testing.T) {
 			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
 			InternalQueueTimeout: 1 * time.Second,
 		}
-		leaveHandler := LeaveHandler(func(u User) {
+		leaveHandler := LeaveHandler(func(ctx *LeaveContext) {
 			leaveCalledMutex.Lock()
 
 			leaveCalled = true
@@ -129,7 +129,7 @@ func TestChannelRemoveUser(t *testing.T) {
 
 		channel.addUser(mockConn)
 
-		err := channel.RemoveUser("user1")
+		err := channel.RemoveUser("user1", "test_disconnect")
 
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)
@@ -160,7 +160,7 @@ func TestChannelRemoveUser(t *testing.T) {
 
 		defer channel.Close()
 
-		err := channel.RemoveUser("nonexistent")
+		err := channel.RemoveUser("nonexistent", "test_disconnect")
 
 		if err == nil {
 			t.Error("expected error when removing non-existent user")
@@ -190,7 +190,7 @@ func TestChannelRemoveUser(t *testing.T) {
 
 		channel.addUser(mockConn)
 
-		err := channel.RemoveUser("user1")
+		err := channel.RemoveUser("user1", "test_disconnect")
 
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)

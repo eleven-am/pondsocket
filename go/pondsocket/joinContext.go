@@ -292,12 +292,6 @@ func (c *JoinContext) Track(presence interface{}) *JoinContext {
 	return c
 }
 
-// Err returns any error that occurred during join context operations.
-// This should be checked after method chaining to handle any errors.
-func (c *JoinContext) Err() error {
-	return c.err
-}
-
 // GetPayload returns the payload sent with the join request.
 // This can contain authentication tokens, initial state, or other join parameters.
 func (c *JoinContext) GetPayload() interface{} {

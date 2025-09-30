@@ -82,7 +82,13 @@ func (e *Endpoint) CreateChannel(path string, handlerFunc JoinEventHandler) *Lob
 		}
 		joinCtx := newJoinContext(ctx, ch, route, request.user, ev)
 
-		return handlerFunc(joinCtx)
+		if err := handlerFunc(joinCtx); err != nil {
+			return err
+		}
+		if joinCtx.err != nil {
+			return joinCtx
+		}
+		return nil
 	})
 
 	return lobby
@@ -191,7 +197,7 @@ func (e *Endpoint) leaveChannel(ev *Event, user *Conn) error {
 
 		return err
 	}
-	if err = currentChannel.RemoveUser(user.ID); err != nil {
+	if err = currentChannel.RemoveUser(user.ID, "explicit_leave"); err != nil {
 		_ = user.sendJSON(Event{
 			Action:      system,
 			ChannelName: ev.ChannelName,
