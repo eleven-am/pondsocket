@@ -148,12 +148,20 @@ func (r *Route) ParseParams(v interface{}) error {
 	return parsePayload(v, r.params)
 }
 
-func (r *Route) Param(key string) (string, bool) {
+func (r *Route) Param(key string) string {
 	value, ok := r.params[key]
-	return value, ok
+	if !ok {
+		return ""
+	}
+
+	return value
 }
 
-func (r *Route) QueryParam(key string) ([]string, bool) {
+func (r *Route) QueryParam(key string) []string {
 	value, ok := r.query[key]
-	return value, ok
+	if !ok {
+		return []string{}
+	}
+
+	return value
 }
