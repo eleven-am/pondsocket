@@ -331,10 +331,27 @@ func (c *EventContext) GetAssign(key string) (interface{}, error) {
 	return value, nil
 }
 
-// SetAssign is an alias for SetAssigns, updating a single key-value pair.
+// Assign sets multiple key-value pairs in the sender's channel assigns.
+// Assigns are server-side metadata that persist with the user in this channel.
+// These values are never automatically sent to clients.
 // Returns the EventContext for method chaining.
-func (c *EventContext) SetAssign(key string, value interface{}) *EventContext {
-	return c.SetAssigns(key, value)
+func (c *EventContext) Assign(value interface{}) *EventContext {
+	if c.checkStateAndContext() {
+		return c
+	}
+
+	mapValue, ok := value.(map[string]interface{})
+	if !ok {
+		c.err = badRequest(c.Channel.name, "Assign value must be a map[string]interface{}")
+
+		return c
+	}
+
+	for key, val := range mapValue {
+		c.SetAssigns(key, val)
+	}
+
+	return c
 }
 
 // Context returns the context for this message event.

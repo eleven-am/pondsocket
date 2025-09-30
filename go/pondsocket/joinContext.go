@@ -166,6 +166,30 @@ func (c *JoinContext) SetAssigns(key string, value interface{}) *JoinContext {
 	return c
 }
 
+// Assigns sets multiple key-value pairs in the user's assigns for this channel.
+// If called before Accept, it updates the connection's assigns.
+// If called after Accept, it updates the user's assigns in the channel.
+// Assigns are server-side metadata and are never sent to clients.
+// Returns the JoinContext for method chaining.
+func (c *JoinContext) Assigns(assigns interface{}) *JoinContext {
+	if c.checkStateAndContext() {
+		return c
+	}
+
+	mapAssigns, ok := assigns.(map[string]interface{})
+	if !ok {
+		c.err = badRequest(c.Channel.name, "Assigns must be a map[string]interface{}")
+
+		return c
+	}
+
+	for key, value := range mapAssigns {
+		c.SetAssigns(key, value)
+	}
+
+	return c
+}
+
 // GetAssigns retrieves a value from the user's assigns by key.
 // If called before Accept, it reads from the connection's assigns.
 // If called after Accept, it reads from the user's channel assigns.
