@@ -70,8 +70,8 @@ func parse(route, currentPath string) (*Route, error) {
 		return nil, fmt.Errorf("route %s does not match path %s", route, currentPath)
 	}
 	return &Route{
-		Query:    query,
-		Params:   params,
+		query:    query,
+		params:   params,
 		Wildcard: wildcard,
 	}, nil
 }
@@ -141,9 +141,19 @@ func splitPath(path string) []string {
 }
 
 func (r *Route) ParseQuery(v interface{}) error {
-	return parsePayload(v, r.Query)
+	return parsePayload(v, r.query)
 }
 
 func (r *Route) ParseParams(v interface{}) error {
-	return parsePayload(v, r.Params)
+	return parsePayload(v, r.params)
+}
+
+func (r *Route) Param(key string) (string, bool) {
+	value, ok := r.params[key]
+	return value, ok
+}
+
+func (r *Route) QueryParam(key string) ([]string, bool) {
+	value, ok := r.query[key]
+	return value, ok
 }

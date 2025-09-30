@@ -17,16 +17,16 @@ func TestParse(t *testing.T) {
 				pattern: "/room/123",
 				path:    "/room/123",
 				want: &Route{
-					Query:  map[string][]string{},
-					Params: map[string]string{},
+					query:  map[string][]string{},
+					params: map[string]string{},
 				},
 			},
 			{
 				pattern: "/user/profile",
 				path:    "/user/profile",
 				want: &Route{
-					Query:  map[string][]string{},
-					Params: map[string]string{},
+					query:  map[string][]string{},
+					params: map[string]string{},
 				},
 			},
 		}
@@ -57,8 +57,8 @@ func TestParse(t *testing.T) {
 				pattern: "/room/:id",
 				path:    "/room/123",
 				want: &Route{
-					Query: map[string][]string{},
-					Params: map[string]string{
+					query: map[string][]string{},
+					params: map[string]string{
 						"id": "123",
 					},
 				},
@@ -67,8 +67,8 @@ func TestParse(t *testing.T) {
 				pattern: "/user/:userId/profile",
 				path:    "/user/john/profile",
 				want: &Route{
-					Query: map[string][]string{},
-					Params: map[string]string{
+					query: map[string][]string{},
+					params: map[string]string{
 						"userId": "john",
 					},
 				},
@@ -101,8 +101,8 @@ func TestParse(t *testing.T) {
 				pattern: "/api/:version/users/:id",
 				path:    "/api/v1/users/123",
 				want: &Route{
-					Query: map[string][]string{},
-					Params: map[string]string{
+					query: map[string][]string{},
+					params: map[string]string{
 						"version": "v1",
 						"id":      "123",
 					},
@@ -136,8 +136,8 @@ func TestParse(t *testing.T) {
 				pattern: "/files/*",
 				path:    "/files/docs/readme.txt",
 				want: &Route{
-					Query:  map[string][]string{},
-					Params: map[string]string{},
+					query:  map[string][]string{},
+					params: map[string]string{},
 					Wildcard: func() *string {
 						s := "docs/readme.txt"
 						return &s
@@ -174,21 +174,21 @@ func TestParse(t *testing.T) {
 				pattern: "/search",
 				path:    "/search?q=test&sort=asc",
 				want: &Route{
-					Query: map[string][]string{
+					query: map[string][]string{
 						"q":    {"test"},
 						"sort": {"asc"},
 					},
-					Params: map[string]string{},
+					params: map[string]string{},
 				},
 			},
 			{
 				pattern: "/search",
 				path:    "/search?q=test&q=another",
 				want: &Route{
-					Query: map[string][]string{
+					query: map[string][]string{
 						"q": {"test", "another"},
 					},
-					Params: map[string]string{},
+					params: map[string]string{},
 				},
 			},
 		}
@@ -201,8 +201,8 @@ func TestParse(t *testing.T) {
 
 					return
 				}
-				if !reflect.DeepEqual(route.Query, tt.want.Query) {
-					t.Errorf("parse() Query = %+v, want %+v", route.Query, tt.want.Query)
+				if !reflect.DeepEqual(route.query, tt.want.query) {
+					t.Errorf("parse() query = %+v, want %+v", route.query, tt.want.query)
 				}
 			})
 		}
@@ -219,8 +219,8 @@ func TestParse(t *testing.T) {
 				pattern: "/user/:name",
 				path:    "/user/John%20Doe",
 				want: &Route{
-					Query: map[string][]string{},
-					Params: map[string]string{
+					query: map[string][]string{},
+					params: map[string]string{
 						"name": "John Doe",
 					},
 				},

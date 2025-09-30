@@ -142,8 +142,8 @@ type User struct {
 // Route contains parsed route information from URL patterns.
 // It includes query parameters, path parameters, and optional wildcard segments.
 type Route struct {
-	Query    map[string][]string
-	Params   map[string]string
+	query    map[string][]string
+	params   map[string]string
 	Wildcard *string
 }
 
