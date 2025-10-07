@@ -313,8 +313,8 @@ func (c *EventContext) GetAssign(key string) (interface{}, error) {
 	if c.checkStateAndContext() {
 		return nil, c.err
 	}
-	value, err := c.Channel.getUserAssigns(c.user.UserID, key)
 
+	value, err := c.Channel.getUserAssigns(c.user.UserID, key)
 	if err != nil {
 		var pondErr *Error
 		if !errors.As(err, &pondErr) || pondErr.Code != StatusNotFound {
@@ -370,10 +370,9 @@ func (c *EventContext) routines(userIds []string, handler func(ctx context.Conte
 	}
 
 	var wg sync.WaitGroup
-
 	var mu sync.Mutex
-
 	var allErrors error
+
 	for _, id := range idsToProcess {
 		select {
 		case <-c.ctx.Done():
