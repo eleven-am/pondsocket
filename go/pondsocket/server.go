@@ -29,10 +29,16 @@ type Server struct {
 func NewServer(options *ServerOptions) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	opts := options.Options
-	if opts == nil {
+	var opts *Options
+	if options == nil {
 		opts = DefaultOptions()
+		options = &ServerOptions{}
+	} else if options.Options == nil {
+		opts = DefaultOptions()
+	} else {
+		opts = options.Options
 	}
+
 	manager := NewManager(ctx, *opts)
 
 	addr := options.ServerAddr
@@ -78,10 +84,15 @@ func (s *Server) Start() error {
 	s.mutex.Unlock()
 
 	go func() {
+		var err error
 		if s.server.TLSConfig != nil {
-			s.server.ListenAndServeTLS("", "")
+			err = s.server.ListenAndServeTLS("", "")
 		} else {
-			s.server.ListenAndServe()
+			err = s.server.ListenAndServe()
+		}
+
+		if err != nil && err != http.ErrServerClosed {
+			s.manager.reportError("http_server", err)
 		}
 
 		s.mutex.Lock()

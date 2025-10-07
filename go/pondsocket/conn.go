@@ -6,6 +6,7 @@ package pondsocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/gorilla/websocket"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type Conn struct {
 	receive       chan []byte
 	assigns       map[string]interface{}
 	closeChan     chan struct{}
+	readDone      chan struct{}
 	closeOnce     sync.Once
 	mutex         sync.RWMutex
 	isClosing     bool
@@ -40,6 +42,7 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 		ctx:           ctx,
 		cancel:        cancel,
 		closeChan:     make(chan struct{}),
+		readDone:      make(chan struct{}),
 		send:          make(chan []byte, options.SendChannelBuffer),
 		receive:       make(chan []byte, options.ReceiveChannelBuffer),
 		closeHandlers: newArray[func(*Conn) error](),
@@ -77,9 +80,9 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 
 func (c *Conn) readPump() {
 	defer func() {
-		c.cancel()
+		close(c.readDone)
 
-		c.Close()
+		c.close(true)
 	}()
 
 	for {
@@ -88,18 +91,38 @@ func (c *Conn) readPump() {
 			return
 		default:
 			if err := c.conn.SetReadDeadline(time.Now().Add(c.options.PongWait)); err != nil {
+				c.reportError("read_deadline", err)
+
 				return
 			}
-			_, message, err := c.conn.ReadMessage()
+			messageType, message, err := c.conn.ReadMessage()
 
 			if err != nil {
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+					return
+				}
+
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+					c.reportError("read_pump", err)
+				} else if !errors.Is(err, context.Canceled) {
+					c.reportError("read_pump", err)
+				}
+
 				return
+			}
+
+			if messageType != websocket.TextMessage {
+				_ = c.sendJSON(errorEvent(badRequest(string(gatewayEntity), "Unsupported message type; expected text frame")))
+
+				continue
 			}
 			select {
 			case c.receive <- message:
 			case <-c.ctx.Done():
 				return
 			case <-time.After(c.options.WriteWait):
+				c.reportError("read_pump", timeout(string(gatewayEntity), "timed out delivering message to handler"))
+
 				return
 			}
 		}
@@ -219,7 +242,13 @@ func (c *Conn) handleMessages() {
 					continue
 				}
 
-				_ = (*handler)(event, c)
+				if err := (*handler)(event, c); err != nil {
+					c.reportError("connection_handler", err)
+
+					if ev := errorEvent(err); ev != nil {
+						_ = c.sendJSON(ev)
+					}
+				}
 
 			case <-c.ctx.Done():
 				return
@@ -320,6 +349,10 @@ func (c *Conn) IsActive() bool {
 // closes the WebSocket connection, and cleans up all channels.
 // This method is idempotent and can be called multiple times safely.
 func (c *Conn) Close() {
+	c.close(false)
+}
+
+func (c *Conn) close(fromReader bool) {
 	c.closeOnce.Do(func() {
 		c.mutex.Lock()
 
@@ -335,6 +368,18 @@ func (c *Conn) Close() {
 		}
 		close(c.closeChan)
 
+		conn := c.conn
+
+		if !fromReader && conn != nil {
+			_ = conn.Close()
+		}
+
+		if !fromReader {
+			if c.readDone != nil {
+				<-c.readDone
+			}
+		}
+
 		var closeHandlerErrors error
 		for _, handler := range handlersToRun {
 			if err := handler(c); err != nil {
@@ -342,14 +387,23 @@ func (c *Conn) Close() {
 			}
 		}
 		if closeHandlerErrors != nil {
+			c.reportError("connection_close_handlers", closeHandlerErrors)
 		}
-		if c.conn != nil {
-			c.conn.Close()
+
+		if fromReader && conn != nil {
+			_ = conn.Close()
 		}
 		close(c.send)
 
 		close(c.receive)
 	})
+}
+
+func (c *Conn) reportError(component string, err error) {
+	if err == nil || c == nil || c.options == nil || c.options.Hooks == nil || c.options.Hooks.Metrics == nil {
+		return
+	}
+	c.options.Hooks.Metrics.Error(component, err)
 }
 
 func (c *Conn) cloneAssigns() map[string]interface{} {

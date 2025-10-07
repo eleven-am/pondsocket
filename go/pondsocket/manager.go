@@ -91,25 +91,29 @@ func DefaultOptions() *Options {
 // If no options are provided, default options will be used.
 // If no PubSub implementation is provided in options, a local in-memory PubSub will be created.
 func NewManager(ctx context.Context, options ...Options) *Manager {
-	opts := DefaultOptions()
+	optionCopy := *DefaultOptions()
 
 	if len(options) > 0 {
-		opts = &options[0]
+		optionCopy = options[0]
 	}
+
+	if optionCopy.PubSub == nil {
+		optionCopy.PubSub = NewLocalPubSub(ctx, 100)
+	}
+
+	opts := optionCopy
+
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:    opts.ReadBufferSize,
 		WriteBufferSize:   opts.WriteBufferSize,
-		CheckOrigin:       createOriginChecker(opts),
+		CheckOrigin:       createOriginChecker(&opts),
 		EnableCompression: opts.EnableCompression,
 	}
 	httpMiddleware := newMiddleWare[*http.Request, *http.ResponseWriter]()
 
-	if opts.PubSub == nil {
-		opts.PubSub = NewLocalPubSub(ctx, 100)
-	}
 	return &Manager{
 		middleware: httpMiddleware,
-		Options:    opts,
+		Options:    &opts,
 		upgrader:   upgrader,
 		ctx:        ctx,
 		endpoints:  newArray[*Endpoint](),
@@ -189,11 +193,18 @@ func (m *Manager) HTTPHandler() http.HandlerFunc {
 				statusCode = http.StatusGatewayTimeout
 				errMsg = "Gateway Timeout"
 			} else {
-				return
+				m.reportError("http_handler", err)
 			}
 			if w.Header().Get("Content-Type") == "" {
 				http.Error(w, errMsg, statusCode)
 			}
 		}
 	}
+}
+
+func (m *Manager) reportError(component string, err error) {
+	if err == nil || m == nil || m.Options == nil || m.Options.Hooks == nil || m.Options.Hooks.Metrics == nil {
+		return
+	}
+	m.Options.Hooks.Metrics.Error(component, err)
 }

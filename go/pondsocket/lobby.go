@@ -140,6 +140,7 @@ func (l *Lobby) createChannelUnsafe(name string) (*Channel, error) {
 		Outgoing:             l.outgoing,
 		InternalQueueTimeout: l.endpoint.options.InternalQueueTimeout,
 		PubSub:               l.endpoint.options.PubSub,
+		Hooks:                l.endpoint.options.Hooks,
 	}
 	c := newChannel(l.endpoint.ctx, opts)
 
