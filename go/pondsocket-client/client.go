@@ -29,11 +29,13 @@ type PondClient struct {
 	reconnectCount  int
 
 	// Connection state subscribers
-	connectionSubs   []chan bool
+	connectionSubs   map[int]chan bool
+	nextConnSubID    int
 	connectionSubsMu sync.RWMutex
 
 	// Event broadcast subscribers
-	eventSubs   []chan ChannelEvent
+	eventSubs   map[int]chan ChannelEvent
+	nextEventID int
 	eventSubsMu sync.RWMutex
 }
 
@@ -47,6 +49,13 @@ func NewPondClientWithConfig(endpoint string, params map[string]interface{}, con
 	address, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("invalid endpoint URL: %w", err)
+	}
+
+	if config == nil {
+		config = DefaultClientConfig()
+	} else {
+		cfgCopy := *config
+		config = &cfgCopy
 	}
 
 	// Set WebSocket protocol based on HTTP scheme
@@ -83,8 +92,8 @@ func NewPondClientWithConfig(endpoint string, params map[string]interface{}, con
 		ctx:             ctx,
 		cancel:          cancel,
 		reconnectCount:  0,
-		connectionSubs:  make([]chan bool, 0),
-		eventSubs:       make([]chan ChannelEvent, 0),
+		connectionSubs:  make(map[int]chan bool),
+		eventSubs:       make(map[int]chan ChannelEvent),
 	}
 
 	// Start the event dispatcher
@@ -130,7 +139,6 @@ func (c *PondClient) Disconnect() error {
 	defer c.connMu.Unlock()
 
 	c.disconnecting = true
-	c.cancel()
 
 	if c.conn != nil {
 		c.conn.Close()
@@ -138,6 +146,8 @@ func (c *PondClient) Disconnect() error {
 	}
 
 	c.setConnectionState(false)
+
+	c.cancel()
 
 	// Clear all channels
 	c.channelsMu.Lock()
@@ -174,11 +184,11 @@ func (c *PondClient) CreateChannel(name string, params JoinParams) *Channel {
 // OnConnectionChange subscribes to connection state changes
 func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 	c.connectionSubsMu.Lock()
-	defer c.connectionSubsMu.Unlock()
-
 	sub := make(chan bool, 1)
-	c.connectionSubs = append(c.connectionSubs, sub)
-	index := len(c.connectionSubs) - 1
+	id := c.nextConnSubID
+	c.nextConnSubID++
+	c.connectionSubs[id] = sub
+	c.connectionSubsMu.Unlock()
 
 	// Send current state immediately
 	go func() {
@@ -195,27 +205,26 @@ func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 	// Return unsubscribe function
 	return func() {
 		c.connectionSubsMu.Lock()
-		defer c.connectionSubsMu.Unlock()
-
-		if index < len(c.connectionSubs) {
-			close(c.connectionSubs[index])
-			// Remove from slice
-			c.connectionSubs = append(c.connectionSubs[:index], c.connectionSubs[index+1:]...)
+		if existing, ok := c.connectionSubs[id]; ok {
+			delete(c.connectionSubs, id)
+			close(existing)
 		}
+		c.connectionSubsMu.Unlock()
 	}
 }
 
 // subscribeToConnection returns a channel that receives connection state changes
 func (c *PondClient) subscribeToConnection() <-chan bool {
 	c.connectionSubsMu.Lock()
-	defer c.connectionSubsMu.Unlock()
-
 	sub := make(chan bool, 1)
-	c.connectionSubs = append(c.connectionSubs, sub)
+	id := c.nextConnSubID
+	c.nextConnSubID++
+	c.connectionSubs[id] = sub
+	c.connectionSubsMu.Unlock()
 
 	// Send current state immediately
 	go func() {
-		sub <- c.GetState()
+		c.safeSendBool(sub, c.GetState())
 	}()
 
 	return sub
@@ -224,10 +233,11 @@ func (c *PondClient) subscribeToConnection() <-chan bool {
 // subscribeToEvents returns a channel that receives all events
 func (c *PondClient) subscribeToEvents() <-chan ChannelEvent {
 	c.eventSubsMu.Lock()
-	defer c.eventSubsMu.Unlock()
-
 	sub := make(chan ChannelEvent, 100)
-	c.eventSubs = append(c.eventSubs, sub)
+	id := c.nextEventID
+	c.nextEventID++
+	c.eventSubs[id] = sub
+	c.eventSubsMu.Unlock()
 
 	return sub
 }
@@ -283,16 +293,14 @@ func (c *PondClient) dispatchConnectionChanges() {
 		select {
 		case state := <-c.connectionState:
 			c.connectionSubsMu.RLock()
-			subs := make([]chan bool, len(c.connectionSubs))
-			copy(subs, c.connectionSubs)
+			subs := make([]chan bool, 0, len(c.connectionSubs))
+			for _, sub := range c.connectionSubs {
+				subs = append(subs, sub)
+			}
 			c.connectionSubsMu.RUnlock()
 
 			for _, sub := range subs {
-				select {
-				case sub <- state:
-				default:
-					// Channel is full or closed, skip
-				}
+				c.safeSendBool(sub, state)
 			}
 		case <-c.ctx.Done():
 			return
@@ -306,16 +314,14 @@ func (c *PondClient) dispatchEvents() {
 		select {
 		case event := <-c.eventBroadcast:
 			c.eventSubsMu.RLock()
-			subs := make([]chan ChannelEvent, len(c.eventSubs))
-			copy(subs, c.eventSubs)
+			subs := make([]chan ChannelEvent, 0, len(c.eventSubs))
+			for _, sub := range c.eventSubs {
+				subs = append(subs, sub)
+			}
 			c.eventSubsMu.RUnlock()
 
 			for _, sub := range subs {
-				select {
-				case sub <- event:
-				default:
-					// Channel is full or closed, skip
-				}
+				c.safeSendEvent(sub, event)
 			}
 		case <-c.ctx.Done():
 			return
@@ -430,4 +436,30 @@ func (c *PondClient) handleAcknowledge(event ChannelEvent) {
 	}
 
 	channel.Acknowledge(c.subscribeToEvents())
+}
+
+func (c *PondClient) safeSendBool(ch chan bool, value bool) {
+	defer func() {
+		if recover() != nil {
+			// Channel closed, ignore
+		}
+	}()
+
+	select {
+	case ch <- value:
+	default:
+	}
+}
+
+func (c *PondClient) safeSendEvent(ch chan ChannelEvent, event ChannelEvent) {
+	defer func() {
+		if recover() != nil {
+			// Channel closed, ignore
+		}
+	}()
+
+	select {
+	case ch <- event:
+	default:
+	}
 }

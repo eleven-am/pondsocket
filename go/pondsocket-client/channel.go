@@ -23,9 +23,11 @@ type Channel struct {
 	ctx            chan struct{}
 
 	// Subscribers
-	eventSubs   []chan ChannelEvent
+	eventSubs   map[int]chan ChannelEvent
+	nextEventID int
 	eventSubsMu sync.RWMutex
-	stateSubs   []chan ChannelState
+	stateSubs   map[int]chan ChannelState
+	nextStateID int
 	stateSubsMu sync.RWMutex
 }
 
@@ -42,8 +44,8 @@ func NewChannel(publisher func(ClientMessage), connectionChan <-chan bool, name 
 		channelState:   make(chan ChannelState, 1),
 		currentState:   Idle,
 		ctx:            make(chan struct{}),
-		eventSubs:      make([]chan ChannelEvent, 0),
-		stateSubs:      make([]chan ChannelState, 0),
+		eventSubs:      make(map[int]chan ChannelEvent),
+		stateSubs:      make(map[int]chan ChannelState),
 	}
 
 	// Start event and state dispatchers
@@ -141,7 +143,6 @@ func (c *Channel) SendForResponse(event string, payload PondMessage, timeout tim
 			unsubscribe()
 		case <-timer.C:
 			unsubscribe()
-			close(responseChan)
 		}
 	}()
 
@@ -160,11 +161,11 @@ func (c *Channel) SendForResponse(event string, payload PondMessage, timeout tim
 // OnMessage subscribes to all messages on the channel
 func (c *Channel) OnMessage(callback EventHandler) func() {
 	c.eventSubsMu.Lock()
-	defer c.eventSubsMu.Unlock()
-
 	sub := make(chan ChannelEvent, 100)
-	c.eventSubs = append(c.eventSubs, sub)
-	index := len(c.eventSubs) - 1
+	id := c.nextEventID
+	c.nextEventID++
+	c.eventSubs[id] = sub
+	c.eventSubsMu.Unlock()
 
 	// Start listener goroutine
 	go func() {
@@ -179,13 +180,11 @@ func (c *Channel) OnMessage(callback EventHandler) func() {
 	// Return unsubscribe function
 	return func() {
 		c.eventSubsMu.Lock()
-		defer c.eventSubsMu.Unlock()
-
-		if index < len(c.eventSubs) {
-			close(c.eventSubs[index])
-			// Remove from slice
-			c.eventSubs = append(c.eventSubs[:index], c.eventSubs[index+1:]...)
+		if existing, ok := c.eventSubs[id]; ok {
+			delete(c.eventSubs, id)
+			close(existing)
 		}
+		c.eventSubsMu.Unlock()
 	}
 }
 
@@ -235,11 +234,11 @@ func (c *Channel) OnUsersChange(callback func([]PondPresence)) func() {
 // OnChannelStateChange subscribes to channel state changes
 func (c *Channel) OnChannelStateChange(callback ChannelStateHandler) func() {
 	c.stateSubsMu.Lock()
-	defer c.stateSubsMu.Unlock()
-
 	sub := make(chan ChannelState, 1)
-	c.stateSubs = append(c.stateSubs, sub)
-	index := len(c.stateSubs) - 1
+	id := c.nextStateID
+	c.nextStateID++
+	c.stateSubs[id] = sub
+	c.stateSubsMu.Unlock()
 
 	// Send current state immediately
 	go func() {
@@ -256,13 +255,11 @@ func (c *Channel) OnChannelStateChange(callback ChannelStateHandler) func() {
 	// Return unsubscribe function
 	return func() {
 		c.stateSubsMu.Lock()
-		defer c.stateSubsMu.Unlock()
-
-		if index < len(c.stateSubs) {
-			close(c.stateSubs[index])
-			// Remove from slice
-			c.stateSubs = append(c.stateSubs[:index], c.stateSubs[index+1:]...)
+		if existing, ok := c.stateSubs[id]; ok {
+			delete(c.stateSubs, id)
+			close(existing)
 		}
+		c.stateSubsMu.Unlock()
 	}
 }
 
@@ -320,7 +317,7 @@ func (c *Channel) setState(state ChannelState) {
 
 // publish sends a message, queuing it if the channel is not joined
 func (c *Channel) publish(message ClientMessage) {
-	if c.State() == Joined {
+	if message.Action == JoinChannel || message.Action == LeaveChannel || c.State() == Joined {
 		c.publisher(message)
 		return
 	}
@@ -344,11 +341,11 @@ func (c *Channel) emptyQueue() {
 // subscribeToPresence subscribes to presence events
 func (c *Channel) subscribeToPresence(callback func(PresenceEventTypes, PresencePayload)) func() {
 	c.eventSubsMu.Lock()
-	defer c.eventSubsMu.Unlock()
-
 	sub := make(chan ChannelEvent, 100)
-	c.eventSubs = append(c.eventSubs, sub)
-	index := len(c.eventSubs) - 1
+	id := c.nextEventID
+	c.nextEventID++
+	c.eventSubs[id] = sub
+	c.eventSubsMu.Unlock()
 
 	// Start listener goroutine
 	go func() {
@@ -365,13 +362,11 @@ func (c *Channel) subscribeToPresence(callback func(PresenceEventTypes, Presence
 	// Return unsubscribe function
 	return func() {
 		c.eventSubsMu.Lock()
-		defer c.eventSubsMu.Unlock()
-
-		if index < len(c.eventSubs) {
-			close(c.eventSubs[index])
-			// Remove from slice
-			c.eventSubs = append(c.eventSubs[:index], c.eventSubs[index+1:]...)
+		if existing, ok := c.eventSubs[id]; ok {
+			delete(c.eventSubs, id)
+			close(existing)
 		}
+		c.eventSubsMu.Unlock()
 	}
 }
 
@@ -381,16 +376,14 @@ func (c *Channel) dispatchEvents() {
 		select {
 		case event := <-c.eventChan:
 			c.eventSubsMu.RLock()
-			subs := make([]chan ChannelEvent, len(c.eventSubs))
-			copy(subs, c.eventSubs)
+			subs := make([]chan ChannelEvent, 0, len(c.eventSubs))
+			for _, sub := range c.eventSubs {
+				subs = append(subs, sub)
+			}
 			c.eventSubsMu.RUnlock()
 
 			for _, sub := range subs {
-				select {
-				case sub <- event:
-				default:
-					// Channel is full or closed, skip
-				}
+				safeSendChannelEvent(sub, event)
 			}
 		case <-c.ctx:
 			return
@@ -404,16 +397,14 @@ func (c *Channel) dispatchStateChanges() {
 		select {
 		case state := <-c.channelState:
 			c.stateSubsMu.RLock()
-			subs := make([]chan ChannelState, len(c.stateSubs))
-			copy(subs, c.stateSubs)
+			subs := make([]chan ChannelState, 0, len(c.stateSubs))
+			for _, sub := range c.stateSubs {
+				subs = append(subs, sub)
+			}
 			c.stateSubsMu.RUnlock()
 
 			for _, sub := range subs {
-				select {
-				case sub <- state:
-				default:
-					// Channel is full or closed, skip
-				}
+				safeSendChannelState(sub, state)
 			}
 		case <-c.ctx:
 			return
@@ -435,5 +426,31 @@ func (c *Channel) handleConnectionChanges() {
 		case <-c.ctx:
 			return
 		}
+	}
+}
+
+func safeSendChannelEvent(ch chan ChannelEvent, event ChannelEvent) {
+	defer func() {
+		if recover() != nil {
+			// Subscriber closed, ignore
+		}
+	}()
+
+	select {
+	case ch <- event:
+	default:
+	}
+}
+
+func safeSendChannelState(ch chan ChannelState, state ChannelState) {
+	defer func() {
+		if recover() != nil {
+			// Subscriber closed, ignore
+		}
+	}()
+
+	select {
+	case ch <- state:
+	default:
 	}
 }
