@@ -66,6 +66,7 @@ type options struct {
 	OnDestroy            func() error
 	InternalQueueTimeout time.Duration
 	PubSub               PubSub
+	Hooks                *Hooks
 }
 
 type recipient string

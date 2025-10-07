@@ -44,6 +44,7 @@ type Channel struct {
 	syncCoordinatorMutex        sync.RWMutex
 	assignsSyncCoordinatorMutex sync.RWMutex
 	internalQueueTimeout        time.Duration
+	hooks                       *Hooks
 }
 
 func newChannel(ctx context.Context, options options) *Channel {
@@ -59,6 +60,7 @@ func newChannel(ctx context.Context, options options) *Channel {
 		leave:                   options.Leave,
 		onDestroy:               options.OnDestroy,
 		pubsub:                  options.PubSub,
+		hooks:                   options.Hooks,
 		nodeID:                  uuid.NewString(),
 		ctx:                     channelCtx,
 		cancel:                  cancel,
@@ -113,9 +115,11 @@ func (c *Channel) RemoveUser(userID string, reason string) error {
 	if c.onDestroy != nil && remainingUsers == 0 {
 		go func() {
 			if err := c.Close(); err != nil {
+				c.reportError("channel_close", err)
 			}
 			if c.onDestroy != nil {
 				if err := c.onDestroy(); err != nil {
+					c.reportError("channel_on_destroy", err)
 				}
 			}
 		}()
@@ -297,7 +301,9 @@ func (c *Channel) GetPresence() map[string]interface{} {
 	}
 
 	go func() {
-		_ = c.pubsub.Publish(topic, data)
+		if err := c.pubsub.Publish(topic, data); err != nil {
+			c.reportError("pubsub_publish", err)
+		}
 	}()
 
 	select {
@@ -632,7 +638,9 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 
 		if err == nil {
 			go func() {
-				_ = c.pubsub.Publish(topic, data)
+				if err := c.pubsub.Publish(topic, data); err != nil {
+					c.reportError("pubsub_publish", err)
+				}
 			}()
 		}
 	}
@@ -772,6 +780,8 @@ func (c *Channel) handleMessageEvents() {
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						return
 					}
+
+					c.reportError("channel_dispatch", err)
 				}
 			case <-c.ctx.Done():
 				return
@@ -788,6 +798,13 @@ func (c *Channel) checkState() error {
 	default:
 		return nil
 	}
+}
+
+func (c *Channel) reportError(component string, err error) {
+	if err == nil || c == nil || c.hooks == nil || c.hooks.Metrics == nil {
+		return
+	}
+	c.hooks.Metrics.Error(component, err)
 }
 
 func (c *Channel) processOutgoing(event *Event, conn *Conn) error {
@@ -884,7 +901,7 @@ func (c *Channel) subscribeToPubSub() {
 	})
 
 	if err != nil {
-		_ = err
+		c.reportError("pubsub_subscribe", err)
 	}
 }
 
@@ -956,7 +973,9 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 	if err != nil {
 		return
 	}
-	_ = c.pubsub.Publish(topic, data)
+	if err := c.pubsub.Publish(topic, data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
 }
 
 func (c *Channel) handleRemoteAssignsEvent(event *Event) {
@@ -1160,7 +1179,9 @@ func (c *Channel) requestAssignsSync(requesterUserID string) string {
 	}
 
 	go func() {
-		_ = c.pubsub.Publish(topic, data)
+		if err := c.pubsub.Publish(topic, data); err != nil {
+			c.reportError("pubsub_publish", err)
+		}
 	}()
 
 	return requestID
@@ -1215,7 +1236,9 @@ func (c *Channel) handlePresenceSyncRequest(requestEvent *Event) {
 	if err != nil {
 		return
 	}
-	_ = c.pubsub.Publish(topic, data)
+	if err := c.pubsub.Publish(topic, data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
 }
 
 func (c *Channel) handleSyncResponse(event *Event) {
@@ -1341,7 +1364,9 @@ func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
 	if err != nil {
 		return
 	}
-	_ = c.pubsub.Publish(topic, data)
+	if err := c.pubsub.Publish(topic, data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
 }
 
 func (c *Channel) handleAssignsSyncResponse(event *Event) {

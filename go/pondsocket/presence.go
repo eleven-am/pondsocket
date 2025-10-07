@@ -249,6 +249,8 @@ func (p *presenceClient) requestPresenceSync(requesterUserID string) {
 		return
 	}
 	go func() {
-		_ = p.channel.pubsub.Publish(topic, data)
+		if err := p.channel.pubsub.Publish(topic, data); err != nil {
+			p.channel.reportError("pubsub_publish", err)
+		}
 	}()
 }
