@@ -34,6 +34,6 @@ describe('Subject', () => {
 
     it('should throw an error when trying to subscribe to a closed subject', () => {
         testSubject.close();
-        expect(() => testSubject.subscribe(observer1)).toThrowError('Cannot subscribe to a closed subject');
+        expect(() => testSubject.subscribe(observer1)).toThrow('Cannot subscribe to a closed subject');
     });
 });

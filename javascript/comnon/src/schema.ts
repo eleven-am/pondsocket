@@ -6,7 +6,7 @@ export const clientMessageSchema = z.object({
     event: z.string(),
     requestId: z.string(),
     channelName: z.string(),
-    payload: z.record(z.any()),
+    payload: z.record(z.string(), z.any()),
     action: z.nativeEnum(ClientActions),
 });
 
@@ -18,8 +18,8 @@ export const presenceMessageSchema = z.object({
     event: z.nativeEnum(PresenceEventTypes),
     action: z.literal(ServerActions.PRESENCE),
     payload: z.object({
-        presence: z.array(z.record(z.any())),
-        changed: z.record(z.any()),
+        presence: z.array(z.record(z.string(), z.any())),
+        changed: z.record(z.string(), z.any()),
     }),
 });
 
@@ -27,7 +27,7 @@ export const serverMessageSchema = z.object({
     event: z.string(),
     requestId: z.string(),
     channelName: z.string(),
-    payload: z.record(z.any()),
+    payload: z.record(z.string(), z.any()),
     action: z.enum([ServerActions.BROADCAST, ServerActions.CONNECT, ServerActions.ERROR, ServerActions.SYSTEM]),
 });
 
