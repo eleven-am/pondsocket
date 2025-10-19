@@ -1,6 +1,6 @@
 {
   "name": "@eleven-am/pondsocket-express",
-  "version": "0.0.37",
+  "version": "0.0.38",
   "description": "PondSocket is a fast simple socket server",
   "keywords": [
     "socket",
@@ -29,7 +29,7 @@
     "pipeline": "npm run lint:fix && npm run lint && npm run build && npm run push"
   },
   "dependencies": {
-    "@eleven-am/pondsocket": "^0.1.212"
+    "@eleven-am/pondsocket": "^0.1.214"
   },
   "devDependencies": {
     "@eslint/compat": "^1.4.0",

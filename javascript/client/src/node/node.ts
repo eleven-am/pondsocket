@@ -2,7 +2,7 @@ import { ChannelEvent } from '@eleven-am/pondsocket-common';
 
 import PondSocketClient from '../browser/client';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
+// eslint-disable-next-line @typescript-eslint/no-var-requires,@typescript-eslint/no-require-imports
 const WebSocket = require('websocket').w3cwebsocket as typeof import('websocket').w3cwebsocket;
 
 export default class PondClient extends PondSocketClient {

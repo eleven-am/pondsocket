@@ -1,6 +1,6 @@
 {
   "name": "@eleven-am/pondsocket-common",
-  "version": "0.0.29",
+  "version": "0.0.32",
   "description": "PondSocket is a fast simple socket server",
   "keywords": [
     "socket",
@@ -27,9 +27,6 @@
     "lint:fix": "eslint --fix --ext .ts src",
     "push": "npm version patch && cp package.json dist && cd dist && npm publish && cd ..",
     "pipeline": "npm run lint && npm run test && npm run build && npm run push"
-  },
-  "dependencies": {
-    "zod": "^4.1.12"
   },
   "devDependencies": {
     "@eslint/compat": "^1.4.0",
