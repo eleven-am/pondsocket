@@ -18,6 +18,7 @@
   "author": "Roy OSSAI",
   "main": "./index.js",
   "types": "./index.d.ts",
+  "sideEffects": false,
   "license": "GPL-3.0",
   "scripts": {
     "test": "jest --coverage --verbose",
