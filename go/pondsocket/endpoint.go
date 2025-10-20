@@ -105,15 +105,24 @@ func (e *Endpoint) CloseConnection(ids ...string) error {
 	if len(ids) == 0 {
 		return nil
 	}
+	var errs []error
+	for _, id := range ids {
+		if _, err := e.connections.Read(id); err != nil {
+			errs = append(errs, wrapF(err, "connection %s not found", id))
+		}
+	}
+
 	connsToClose := e.connections.GetByKeys(ids...)
 
-	if connsToClose.length() < len(ids) {
-	}
-	return mapToError(connsToClose, func(conn *Conn) error {
+	closeErr := mapToError(connsToClose, func(conn *Conn) error {
 		conn.Close()
 
 		return e.connections.Delete(conn.ID)
 	})
+
+	errs = append(errs, closeErr)
+
+	return combine(errs...)
 }
 
 // GetClients returns a slice of active connections for this endpoint.

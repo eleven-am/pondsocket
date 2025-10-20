@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/eleven-am/pondsocket/go/pondsocket/distributed"
+	"github.com/redis/go-redis/v9"
 )
 
 // Example demonstrates how to use RedisPubSub with PondSocket
