@@ -5,6 +5,7 @@ package pondsocket
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -80,19 +81,29 @@ func (s *Server) Start() error {
 
 		return internal("SERVER", "Server is already running")
 	}
+
+	listener, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		s.mutex.Unlock()
+
+		return wrapF(err, "failed to listen on %s", s.server.Addr)
+	}
+
 	s.isRunning = true
 	s.mutex.Unlock()
 
 	go func() {
-		var err error
+		defer listener.Close()
+
+		var serveErr error
 		if s.server.TLSConfig != nil {
-			err = s.server.ListenAndServeTLS("", "")
+			serveErr = s.server.ServeTLS(listener, "", "")
 		} else {
-			err = s.server.ListenAndServe()
+			serveErr = s.server.Serve(listener)
 		}
 
-		if err != nil && err != http.ErrServerClosed {
-			s.manager.reportError("http_server", err)
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			s.manager.reportError("http_server", serveErr)
 		}
 
 		s.mutex.Lock()

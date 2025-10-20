@@ -31,9 +31,9 @@ func (a *array[T]) find(predicate arrayPredicate[T]) *T {
 	a.lock.RLock()
 	defer a.lock.RUnlock()
 
-	for _, item := range a.items {
-		if predicate(item) {
-			return &item
+	for i := range a.items {
+		if predicate(a.items[i]) {
+			return &a.items[i]
 		}
 	}
 	return nil
