@@ -62,11 +62,16 @@ export class PondClient {
         const socket = new WebSocket(this._address.toString());
 
         socket.onmessage = (message) => {
-            const data = JSON.parse(message.data);
+            const lines = (message.data as string).trim().split('\n');
 
-            const event = channelEventSchema.parse(data);
+            for (const line of lines) {
+                if (line.trim()) {
+                    const data = JSON.parse(line);
+                    const event = channelEventSchema.parse(data);
 
-            this._broadcaster.publish(event);
+                    this._broadcaster.publish(event);
+                }
+            }
         };
 
         socket.onerror = () => socket.close();

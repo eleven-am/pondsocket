@@ -1,4 +1,4 @@
-import { ChannelEvent } from '@eleven-am/pondsocket-common';
+import {ChannelEvent, channelEventSchema} from '@eleven-am/pondsocket-common';
 
 import { PondClient as PondSocketClient } from '../browser/client';
 
@@ -17,9 +17,16 @@ export class PondClient extends PondSocketClient {
         socket.onopen = () => this._connectionState.publish(true);
 
         socket.onmessage = (message) => {
-            const data = JSON.parse(message.data as string) as ChannelEvent;
+            const lines = (message.data as string).trim().split('\n');
 
-            this._broadcaster.publish(data);
+            for (const line of lines) {
+                if (line.trim()) {
+                    const data = JSON.parse(line);
+                    const event = channelEventSchema.parse(data);
+
+                    this._broadcaster.publish(event);
+                }
+            }
         };
 
         socket.onerror = () => socket.close();
