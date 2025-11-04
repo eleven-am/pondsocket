@@ -1,6 +1,6 @@
 import { ChannelEvent, ClientActions, Events, ServerActions } from '@eleven-am/pondsocket-common';
 
-import PondClient from './client';
+import { PondClient } from './client';
 
 class MockWebSocket {
     send: Function = jest.fn();
