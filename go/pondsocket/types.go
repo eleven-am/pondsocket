@@ -91,6 +91,7 @@ const (
 	presence             action            = "PRESENCE"
 	assigns              action            = "ASSIGNS"
 	system               action            = "SYSTEM"
+	connect              action            = "CONNECT"
 	broadcast            action            = "BROADCAST"
 	joinChannelEvent     action            = "JOIN_CHANNEL"
 	leaveChannelEvent    action            = "LEAVE_CHANNEL"

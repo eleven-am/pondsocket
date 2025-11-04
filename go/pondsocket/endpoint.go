@@ -362,7 +362,7 @@ func (e *Endpoint) addConnection(conn *Conn) error {
 	conn.handleMessages()
 
 	err := conn.sendJSON(Event{
-		Action:      system,
+		Action:      connect,
 		ChannelName: string(gatewayEntity),
 		RequestId:   uuid.NewString(),
 		Event:       string(connectionEvent),
