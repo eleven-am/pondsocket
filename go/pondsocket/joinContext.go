@@ -80,7 +80,7 @@ func (c *JoinContext) Accept() *JoinContext {
 		ChannelName: c.Channel.name,
 		RequestId:   c.event.RequestId,
 		Event:       string(acknowledgeEvent),
-		Payload:     nil,
+		Payload:     make(map[string]interface{}),
 	}
 	recp := recipients{userIds: []string{c.conn.ID}}
 	if err := c.Channel.sendMessage(string(channelEntity), recp, ackEvent); err != nil {

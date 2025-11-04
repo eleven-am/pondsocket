@@ -6,8 +6,9 @@ package pondsocket
 import (
 	"context"
 	"errors"
-	"github.com/google/uuid"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 type Endpoint struct {
@@ -222,7 +223,7 @@ func (e *Endpoint) leaveChannel(ev *Event, user *Conn) error {
 		ChannelName: ev.ChannelName,
 		RequestId:   ev.RequestId,
 		Event:       string(exitAcknowledgeEvent),
-		Payload:     nil,
+		Payload:     make(map[string]interface{}),
 	})
 
 	return nil
@@ -365,7 +366,7 @@ func (e *Endpoint) addConnection(conn *Conn) error {
 		ChannelName: string(gatewayEntity),
 		RequestId:   uuid.NewString(),
 		Event:       string(connectionEvent),
-		Payload:     nil,
+		Payload:     make(map[string]interface{}),
 	})
 
 	if err != nil {

@@ -5,9 +5,10 @@ package pondsocket
 
 import (
 	"context"
+	"net/http"
+
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"net/http"
 )
 
 type ConnectionContext struct {
