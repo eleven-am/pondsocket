@@ -12,7 +12,7 @@ import {
 import { Channel } from '../core/channel';
 import { ClientMessage } from '../types';
 
-export default class PondClient {
+export class PondClient {
     protected readonly _address: URL;
 
     protected _disconnecting: boolean;
