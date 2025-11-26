@@ -10,12 +10,11 @@ import (
 
 func TestMessageDuplicationPrevention(t *testing.T) {
 	t.Run("prevents message duplication in distributed setup", func(t *testing.T) {
-		// Create a local PubSub for testing
+
 		ctx := context.Background()
 		pubsub := NewLocalPubSub(ctx, 100)
 		defer pubsub.Close()
 
-		// Create two channels on the same PubSub (simulating distributed nodes)
 		channelOpts1 := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -35,19 +34,15 @@ func TestMessageDuplicationPrevention(t *testing.T) {
 		channel1 := newChannel(ctx, channelOpts1)
 		channel2 := newChannel(ctx, channelOpts2)
 
-		// Set up the channels' endpoint paths for PubSub
 		channel1.endpointPath = "/socket"
 		channel2.endpointPath = "/socket"
 
-		// Subscribe to PubSub for both channels
 		channel1.subscribeToPubSub()
 		channel2.subscribeToPubSub()
 
-		// Create mock connections
 		conn1 := createTestConn("user1", make(map[string]interface{}))
 		conn2 := createTestConn("user2", make(map[string]interface{}))
 
-		// Add users to channels
 		err := channel1.addUser(conn1)
 		if err != nil {
 			t.Fatal(err)
@@ -62,7 +57,6 @@ func TestMessageDuplicationPrevention(t *testing.T) {
 		var messages2 []Event
 		var mu sync.Mutex
 
-		// Monitor channel send channels for messages
 		go func() {
 			for {
 				select {
@@ -95,7 +89,6 @@ func TestMessageDuplicationPrevention(t *testing.T) {
 			}
 		}()
 
-		// Send a broadcast message from channel1
 		err = channel1.Broadcast("test_event", map[string]interface{}{
 			"message": "hello world",
 		})
@@ -103,17 +96,13 @@ func TestMessageDuplicationPrevention(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Wait for message processing
 		time.Sleep(200 * time.Millisecond)
 
-		// Check that user1 received exactly one message (not duplicated)
 		mu.Lock()
 		user1MessageCount := len(messages1)
 		user2MessageCount := len(messages2)
 		mu.Unlock()
 
-		// user1 should receive exactly 1 message (from local delivery)
-		// user2 should receive exactly 1 message (from PubSub delivery)
 		if user1MessageCount != 1 {
 			t.Errorf("Expected user1 to receive 1 message, got %d", user1MessageCount)
 		}
@@ -121,7 +110,6 @@ func TestMessageDuplicationPrevention(t *testing.T) {
 			t.Errorf("Expected user2 to receive 1 message, got %d", user2MessageCount)
 		}
 
-		// Verify that the messages are the same
 		if user1MessageCount > 0 && user2MessageCount > 0 {
 			mu.Lock()
 			msg1 := messages1[0]
@@ -133,7 +121,6 @@ func TestMessageDuplicationPrevention(t *testing.T) {
 			}
 		}
 
-		// Clean up
 		channel1.Close()
 		channel2.Close()
 	})
@@ -141,12 +128,11 @@ func TestMessageDuplicationPrevention(t *testing.T) {
 
 func TestNodeIDFiltering(t *testing.T) {
 	t.Run("filters messages from same nodeID", func(t *testing.T) {
-		// Create a local PubSub for testing
+
 		ctx := context.Background()
 		pubsub := NewLocalPubSub(ctx, 100)
 		defer pubsub.Close()
 
-		// Create a channel
 		channelOpts := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -157,16 +143,12 @@ func TestNodeIDFiltering(t *testing.T) {
 
 		channel := newChannel(ctx, channelOpts)
 
-		// Set up the channel's endpoint path for PubSub
 		channel.endpointPath = "/socket"
 
-		// Subscribe to PubSub
 		channel.subscribeToPubSub()
 
-		// Create mock connection
 		conn := createTestConn("user1", make(map[string]interface{}))
 
-		// Add user to channel
 		err := channel.addUser(conn)
 		if err != nil {
 			t.Fatal(err)
@@ -176,7 +158,6 @@ func TestNodeIDFiltering(t *testing.T) {
 		var messages []Event
 		var mu sync.Mutex
 
-		// Monitor channel send channel for messages
 		go func() {
 			for {
 				select {
@@ -193,7 +174,6 @@ func TestNodeIDFiltering(t *testing.T) {
 			}
 		}()
 
-		// Send a broadcast message
 		err = channel.Broadcast("test_event", map[string]interface{}{
 			"message": "hello world",
 		})
@@ -201,10 +181,8 @@ func TestNodeIDFiltering(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Wait for message processing
 		time.Sleep(200 * time.Millisecond)
 
-		// Check that user received exactly one message (not duplicated)
 		mu.Lock()
 		messageCount := len(messages)
 		mu.Unlock()
@@ -213,7 +191,6 @@ func TestNodeIDFiltering(t *testing.T) {
 			t.Errorf("Expected to receive 1 message, got %d. This indicates message duplication was not prevented.", messageCount)
 		}
 
-		// Clean up
 		channel.Close()
 	})
 }

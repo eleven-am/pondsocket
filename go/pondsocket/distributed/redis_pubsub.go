@@ -32,7 +32,7 @@ type RedisPubSub struct {
 // NewRedisPubSub creates a new Redis-based PubSub implementation.
 // The provided Redis client should be properly configured and connected.
 func NewRedisPubSub(ctx context.Context, client *redis.Client) (*RedisPubSub, error) {
-	// Test the connection
+
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
@@ -47,10 +47,8 @@ func NewRedisPubSub(ctx context.Context, client *redis.Client) (*RedisPubSub, er
 		cancel:        cancel,
 	}
 
-	// Create a new PubSub instance
 	r.pubsub = client.Subscribe(pubsubCtx)
 
-	// Start the message handler
 	r.wg.Add(1)
 	go r.handleMessages()
 
@@ -67,10 +65,8 @@ func (r *RedisPubSub) Subscribe(pattern string, handler func(topic string, data 
 		return fmt.Errorf("pubsub: closed")
 	}
 
-	// Convert PondSocket pattern to Redis pattern
 	redisPattern := convertToRedisPattern(pattern)
 
-	// Subscribe to the pattern if not already subscribed
 	if _, exists := r.patterns[redisPattern]; !exists {
 		if err := r.pubsub.PSubscribe(r.ctx, redisPattern); err != nil {
 			return fmt.Errorf("failed to subscribe to pattern %s: %w", pattern, err)
@@ -78,7 +74,6 @@ func (r *RedisPubSub) Subscribe(pattern string, handler func(topic string, data 
 		r.patterns[redisPattern] = struct{}{}
 	}
 
-	// Add the handler
 	r.subscriptions[pattern] = append(r.subscriptions[pattern], handler)
 
 	return nil
@@ -93,10 +88,8 @@ func (r *RedisPubSub) Unsubscribe(pattern string) error {
 		return fmt.Errorf("pubsub: closed")
 	}
 
-	// Remove handlers
 	delete(r.subscriptions, pattern)
 
-	// Check if any other subscriptions use this Redis pattern
 	redisPattern := convertToRedisPattern(pattern)
 	stillNeeded := false
 	for p := range r.subscriptions {
@@ -106,7 +99,6 @@ func (r *RedisPubSub) Unsubscribe(pattern string) error {
 		}
 	}
 
-	// Unsubscribe from Redis if pattern is no longer needed
 	if !stillNeeded {
 		if err := r.pubsub.PUnsubscribe(r.ctx, redisPattern); err != nil {
 			return fmt.Errorf("failed to unsubscribe from pattern %s: %w", pattern, err)
@@ -144,15 +136,12 @@ func (r *RedisPubSub) Close() error {
 	r.closed = true
 	r.mu.Unlock()
 
-	// Cancel context to stop message handler
 	r.cancel()
 
-	// Close the PubSub connection
 	if err := r.pubsub.Close(); err != nil {
 		return fmt.Errorf("failed to close pubsub: %w", err)
 	}
 
-	// Wait for message handler to finish
 	r.wg.Wait()
 
 	return nil
@@ -174,7 +163,6 @@ func (r *RedisPubSub) handleMessages() {
 				return
 			}
 
-			// Redis v9 returns Message directly, not as interface
 			if msg.Payload != "" {
 				r.deliverMessage(msg.Channel, []byte(msg.Payload))
 			}
@@ -187,17 +175,16 @@ func (r *RedisPubSub) deliverMessage(topic string, data []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Find all matching subscriptions
 	for pattern, handlers := range r.subscriptions {
 		if matchPattern(pattern, topic) {
-			// Call each handler in a goroutine to prevent blocking
+
 			for _, handler := range handlers {
-				h := handler // Capture for goroutine
+				h := handler
 				go func() {
-					// Recover from panics in handlers
+
 					defer func() {
 						if r := recover(); r != nil {
-							// In production, log the panic
+
 						}
 					}()
 					h(topic, data)
@@ -210,7 +197,7 @@ func (r *RedisPubSub) deliverMessage(topic string, data []byte) {
 // convertToRedisPattern converts PondSocket patterns to Redis patterns.
 // PondSocket uses .* for wildcards, Redis uses *
 func convertToRedisPattern(pattern string) string {
-	// Replace .* with * for Redis
+
 	if len(pattern) > 2 && pattern[len(pattern)-2:] == ".*" {
 		return pattern[:len(pattern)-2] + "*"
 	}
@@ -219,12 +206,11 @@ func convertToRedisPattern(pattern string) string {
 
 // matchPattern checks if a topic matches a PondSocket pattern.
 func matchPattern(pattern, topic string) bool {
-	// Exact match
+
 	if pattern == topic {
 		return true
 	}
 
-	// Wildcard match
 	if len(pattern) > 2 && pattern[len(pattern)-2:] == ".*" {
 		prefix := pattern[:len(pattern)-2]
 		return len(topic) >= len(prefix) && topic[:len(prefix)] == prefix

@@ -630,7 +630,6 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 		}
 		topic := formatTopic(cleanEndpoint, c.name, event.Event)
 
-		// Add nodeID to event for distributed processing
 		eventForPubSub := event
 		eventForPubSub.NodeID = c.nodeID
 
@@ -856,7 +855,6 @@ func (c *Channel) subscribeToPubSub() {
 			return
 		}
 
-		// Skip processing messages from the same node to prevent duplication
 		if event.NodeID == c.nodeID {
 			return
 		}

@@ -13,10 +13,6 @@ func TestAssignsSync(t *testing.T) {
 		ctx := context.Background()
 		sharedPubSub := NewLocalPubSub(ctx, 100)
 
-		// Create two channels on different "nodes" sharing the same PubSub
-		// This simulates two nodes in a cluster
-
-		// Node 1 - Channel A
 		channelOptsA := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -30,7 +26,6 @@ func TestAssignsSync(t *testing.T) {
 		channelA.subscribeToPubSub()
 		defer channelA.Close()
 
-		// Node 2 - Channel B (same name, different instance)
 		channelOptsB := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -44,7 +39,6 @@ func TestAssignsSync(t *testing.T) {
 		channelB.subscribeToPubSub()
 		defer channelB.Close()
 
-		// Add the same user to both channels (simulating user connected to both nodes)
 		connA := createTestConn("user1", map[string]interface{}{
 			"role": "user",
 		})
@@ -62,16 +56,13 @@ func TestAssignsSync(t *testing.T) {
 			t.Fatalf("Failed to add user to channel B: %v", err)
 		}
 
-		// Update assigns on channel A
 		err = channelA.UpdateAssigns("user1", "status", "online")
 		if err != nil {
 			t.Fatalf("Failed to update assigns on channel A: %v", err)
 		}
 
-		// Give time for synchronization
 		time.Sleep(200 * time.Millisecond)
 
-		// Check that the assigns were updated on channel B
 		assignsB := channelB.GetAssigns()
 		userAssignsB, exists := assignsB["user1"]
 		if !exists {
@@ -85,16 +76,13 @@ func TestAssignsSync(t *testing.T) {
 			t.Errorf("Expected status 'online', got '%v'", status)
 		}
 
-		// Update assigns on channel B
 		err = channelB.UpdateAssigns("user1", "location", "home")
 		if err != nil {
 			t.Fatalf("Failed to update assigns on channel B: %v", err)
 		}
 
-		// Give time for synchronization
 		time.Sleep(200 * time.Millisecond)
 
-		// Check that the assigns were updated on channel A
 		assignsA := channelA.GetAssigns()
 		userAssignsA, exists := assignsA["user1"]
 		if !exists {
@@ -108,12 +96,10 @@ func TestAssignsSync(t *testing.T) {
 			t.Errorf("Expected location 'home', got '%v'", location)
 		}
 
-		// Verify that both assigns exist on both channels
 		if userAssignsA["status"] != "online" {
 			t.Error("Status should still be 'online' on channel A after location update")
 		}
 
-		// Re-fetch assigns from channel B to verify update
 		assignsB = channelB.GetAssigns()
 		userAssignsB, exists = assignsB["user1"]
 		if !exists {
@@ -157,7 +143,6 @@ func TestAssignsSync(t *testing.T) {
 		channel.subscribeToPubSub()
 		defer channel.Close()
 
-		// Add a user
 		conn := createTestConn("user1", map[string]interface{}{
 			"role": "user",
 		})
@@ -167,16 +152,13 @@ func TestAssignsSync(t *testing.T) {
 			t.Fatalf("Failed to add user: %v", err)
 		}
 
-		// Update assigns
 		err = channel.UpdateAssigns("user1", "status", "online")
 		if err != nil {
 			t.Fatalf("Failed to update assigns: %v", err)
 		}
 
-		// Give time for async operations
 		time.Sleep(100 * time.Millisecond)
 
-		// Verify assigns update was published to PubSub
 		found := false
 		messagesMutex.Lock()
 		messagesCopy := make([]PubSubMessage, len(publishedMessages))
@@ -233,7 +215,6 @@ func TestAssignsSync(t *testing.T) {
 		channel.subscribeToPubSub()
 		defer channel.Close()
 
-		// Add a user
 		conn := createTestConn("user1", map[string]interface{}{
 			"role": "user",
 		})
@@ -243,10 +224,8 @@ func TestAssignsSync(t *testing.T) {
 			t.Fatalf("Failed to add user: %v", err)
 		}
 
-		// Wait for subscription to be set up
 		time.Sleep(200 * time.Millisecond)
 
-		// Simulate a remote assigns update (this should NOT trigger another publish)
 		topic := formatTopic("socket", "test:channel", "assigns:update")
 		assignsEvent := Event{
 			Action:      assigns,
@@ -269,17 +248,13 @@ func TestAssignsSync(t *testing.T) {
 		initialPublishCount := publishCount
 		countMutex.Unlock()
 
-		// Publish directly to PubSub (simulating another node)
-		// We use the underlying PubSub to avoid counting this publish
 		err = origPubSub.Publish(topic, data)
 		if err != nil {
 			t.Fatalf("Failed to publish to PubSub: %v", err)
 		}
 
-		// Give time for message to be processed
 		time.Sleep(200 * time.Millisecond)
 
-		// Check that no additional publishes occurred (no infinite loop)
 		countMutex.Lock()
 		finalPublishCount := publishCount
 		countMutex.Unlock()
@@ -288,7 +263,6 @@ func TestAssignsSync(t *testing.T) {
 			t.Errorf("Remote assigns update triggered additional publishes (infinite loop), initial: %d, final: %d", initialPublishCount, finalPublishCount)
 		}
 
-		// Verify the assigns were updated locally
 		assigns := channel.GetAssigns()
 		userAssigns, exists := assigns["user1"]
 		if !exists {

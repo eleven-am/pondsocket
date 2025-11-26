@@ -89,11 +89,9 @@ func TestLocalPubSub(t *testing.T) {
 
 		time.Sleep(10 * time.Millisecond)
 
-		// These should match
 		pubsub.Publish("room.123", []byte("msg1"))
 		pubsub.Publish("room.456", []byte("msg2"))
 
-		// This should not match
 		pubsub.Publish("user.123", []byte("msg3"))
 
 		topics := make([]string, 0, 2)
@@ -106,12 +104,11 @@ func TestLocalPubSub(t *testing.T) {
 			}
 		}
 
-		// Should not receive third message
 		select {
 		case topic := <-received:
 			t.Errorf("Unexpected message received for topic: %s", topic)
 		case <-time.After(50 * time.Millisecond):
-			// Expected timeout
+
 		}
 
 		if len(topics) != 2 {
@@ -131,30 +128,27 @@ func TestLocalPubSub(t *testing.T) {
 
 		time.Sleep(10 * time.Millisecond)
 
-		// First publish should work
 		pubsub.Publish("unsub.topic", []byte("msg1"))
 
 		select {
 		case <-received:
-			// Expected
+
 		case <-time.After(100 * time.Millisecond):
 			t.Error("Did not receive first message")
 		}
 
-		// Unsubscribe
 		err = pubsub.Unsubscribe("unsub.topic")
 		if err != nil {
 			t.Fatalf("Unsubscribe failed: %v", err)
 		}
 
-		// Second publish should not be received
 		pubsub.Publish("unsub.topic", []byte("msg2"))
 
 		select {
 		case <-received:
 			t.Error("Received message after unsubscribe")
 		case <-time.After(50 * time.Millisecond):
-			// Expected timeout
+
 		}
 	})
 
@@ -166,13 +160,11 @@ func TestLocalPubSub(t *testing.T) {
 			t.Fatalf("Subscribe failed: %v", err)
 		}
 
-		// Close the pubsub
 		err = ps.Close()
 		if err != nil {
 			t.Fatalf("Close failed: %v", err)
 		}
 
-		// Operations after close should fail
 		err = ps.Publish("close.topic", []byte("msg"))
 		if !isPubSubClosed(err) {
 			t.Error("Expected closed error on Publish")
@@ -188,7 +180,6 @@ func TestLocalPubSub(t *testing.T) {
 			t.Error("Expected closed error on Unsubscribe")
 		}
 
-		// Close again should be safe
 		err = ps.Close()
 		if err != nil {
 			t.Errorf("Second close returned error: %v", err)
@@ -235,18 +226,16 @@ func TestTopicMatching(t *testing.T) {
 		topic   string
 		match   bool
 	}{
-		// Exact matches
+
 		{"room:123", "room:123", true},
 		{"room:123", "room:456", false},
 
-		// Wildcard matches
 		{"room.*", "room.123", true},
 		{"room.*", "room.456", true},
 		{"room.*", "user.123", false},
 		{"pondsocket:socket:room.*", "pondsocket:socket:room:123", true},
 		{"pondsocket:socket:room.*", "pondsocket:admin:room:123", false},
 
-		// No wildcards in the middle
 		{"room.*.test", "room.123.test", false},
 	}
 

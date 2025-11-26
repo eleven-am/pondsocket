@@ -12,8 +12,6 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 		ctx := context.Background()
 		sharedPubSub := NewLocalPubSub(ctx, 100)
 
-		// Create two channels on different "nodes" sharing the same PubSub
-		// Node 1
 		channelOptsA := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -27,7 +25,6 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 		channelA.subscribeToPubSub()
 		defer channelA.Close()
 
-		// Node 2
 		channelOptsB := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -41,10 +38,8 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 		channelB.subscribeToPubSub()
 		defer channelB.Close()
 
-		// Wait for subscriptions to be set up
 		time.Sleep(200 * time.Millisecond)
 
-		// Add existing users with presence on both nodes
 		connA1 := createTestConn("user_on_A", nil)
 		connB1 := createTestConn("user_on_B", nil)
 
@@ -58,7 +53,6 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 			t.Fatalf("Failed to add user to channel B: %v", err)
 		}
 
-		// Track presence for users on both nodes
 		err = channelA.Track("user_on_A", map[string]interface{}{
 			"status": "online",
 			"node":   "A",
@@ -75,21 +69,17 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 			t.Fatalf("Failed to track user on channel B: %v", err)
 		}
 
-		// Give time for presence sync
 		time.Sleep(300 * time.Millisecond)
 
-		// Clear message queues before the test
 		clearMessages(connA1)
 		clearMessages(connB1)
 
-		// Now add a new user to channel A - they should receive distributed presence
 		connA2 := createTestConn("new_user", nil)
 		err = channelA.addUser(connA2)
 		if err != nil {
 			t.Fatalf("Failed to add new user to channel A: %v", err)
 		}
 
-		// Track the new user to trigger presence join event
 		err = channelA.Track("new_user", map[string]interface{}{
 			"status": "joining",
 			"node":   "A",
@@ -98,18 +88,14 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 			t.Fatalf("Failed to track new user: %v", err)
 		}
 
-		// Give time for sync request and responses
 		time.Sleep(500 * time.Millisecond)
 
-		// Check that the new user can see presence from both nodes
 		presence := channelA.GetPresence()
 
-		// Should have presence for all users
 		if len(presence) < 2 {
 			t.Errorf("Expected at least 2 users in distributed presence, got %d", len(presence))
 		}
 
-		// Check specific users
 		userAPresence, hasUserA := presence["user_on_A"]
 		if !hasUserA {
 			t.Error("New user should see presence for user_on_A")
@@ -139,7 +125,6 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 		ctx := context.Background()
 		sharedPubSub := NewLocalPubSub(ctx, 100)
 
-		// Create two channels
 		channelOptsA := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -166,10 +151,8 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 		channelB.subscribeToPubSub()
 		defer channelB.Close()
 
-		// Wait for subscriptions to be set up
 		time.Sleep(200 * time.Millisecond)
 
-		// Add and track a user on channel A
 		connA := createTestConn("user_A", nil)
 		err := channelA.addUser(connA)
 		if err != nil {
@@ -183,10 +166,8 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 			t.Fatalf("Failed to track user on channel A: %v", err)
 		}
 
-		// Give time for initial presence setup
 		time.Sleep(200 * time.Millisecond)
 
-		// Manually trigger a presence sync request from channel B
 		topic := formatTopic("socket", "test:channel", "presence:sync_request")
 		syncEvent := Event{
 			Action:      presence,
@@ -201,16 +182,13 @@ func TestDistributedPresenceOnJoin(t *testing.T) {
 			t.Fatalf("Failed to marshal sync event: %v", err)
 		}
 
-		// Publish sync request
 		err = sharedPubSub.Publish(topic, data)
 		if err != nil {
 			t.Fatalf("Failed to publish sync request: %v", err)
 		}
 
-		// Give time for sync response
 		time.Sleep(300 * time.Millisecond)
 
-		// Check that channel B now has user_A's presence
 		presenceB := channelB.GetPresence()
 		userAPresence, hasUserA := presenceB["user_A"]
 		if !hasUserA {
@@ -231,7 +209,7 @@ func clearMessages(conn *Conn) {
 	for {
 		select {
 		case <-conn.send:
-			// Drain message
+
 		default:
 			return
 		}

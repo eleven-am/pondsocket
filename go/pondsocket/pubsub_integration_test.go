@@ -18,7 +18,6 @@ func TestPubSubIntegration(t *testing.T) {
 		var publishedMessages []PubSubMessage
 		var messagesMutex sync.Mutex
 
-		// Wrap the PubSub to intercept publishes
 		origPubSub := opts.PubSub
 		pubsubWrapper := &pubsubTestWrapper{
 			PubSub: origPubSub,
@@ -33,7 +32,6 @@ func TestPubSubIntegration(t *testing.T) {
 		}
 		opts.PubSub = pubsubWrapper
 
-		// Create channel with wrapped PubSub
 		channelOpts := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -44,14 +42,12 @@ func TestPubSubIntegration(t *testing.T) {
 
 		channel := newChannel(ctx, channelOpts)
 		channel.endpointPath = "/socket"
-		channel.subscribeToPubSub() // Subscribe after setting endpoint path
+		channel.subscribeToPubSub()
 		defer channel.Close()
 
-		// Create mock connections
 		conn1 := createTestConn("user1", nil)
 		conn2 := createTestConn("user2", nil)
 
-		// Add users to channel
 		err := channel.addUser(conn1)
 		if err != nil {
 			t.Fatalf("Failed to add user1: %v", err)
@@ -61,7 +57,6 @@ func TestPubSubIntegration(t *testing.T) {
 			t.Fatalf("Failed to add user2: %v", err)
 		}
 
-		// Broadcast a message
 		err = channel.Broadcast("test:event", map[string]interface{}{
 			"message": "Hello from test",
 		})
@@ -69,10 +64,8 @@ func TestPubSubIntegration(t *testing.T) {
 			t.Fatalf("Failed to broadcast: %v", err)
 		}
 
-		// Give time for async operations
 		time.Sleep(100 * time.Millisecond)
 
-		// Verify message was published to PubSub
 		messagesMutex.Lock()
 		messagesCopy := make([]PubSubMessage, len(publishedMessages))
 		copy(messagesCopy, publishedMessages)
@@ -87,7 +80,6 @@ func TestPubSubIntegration(t *testing.T) {
 			}
 		}
 
-		// Verify local delivery still works by checking send channels
 		select {
 		case msg := <-conn1.send:
 			var event Event
@@ -118,7 +110,6 @@ func TestPubSubIntegration(t *testing.T) {
 		opts := DefaultOptions()
 		opts.PubSub = NewLocalPubSub(ctx, 100)
 
-		// Create channel
 		channelOpts := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -129,20 +120,17 @@ func TestPubSubIntegration(t *testing.T) {
 
 		channel := newChannel(ctx, channelOpts)
 		channel.endpointPath = "/socket"
-		channel.subscribeToPubSub() // Subscribe after setting endpoint path
+		channel.subscribeToPubSub()
 		defer channel.Close()
 
-		// Wait for subscription to be set up
 		time.Sleep(200 * time.Millisecond)
 
-		// Create local connection
 		conn := createTestConn("user1", nil)
 		err := channel.addUser(conn)
 		if err != nil {
 			t.Fatalf("Failed to add user: %v", err)
 		}
 
-		// Simulate message from another node
 		topic := formatTopic("socket", "test:channel", "remote:event")
 		event := Event{
 			Action:      broadcast,
@@ -159,16 +147,13 @@ func TestPubSubIntegration(t *testing.T) {
 			t.Fatalf("Failed to marshal event: %v", err)
 		}
 
-		// Publish directly to PubSub (simulating another node)
 		err = opts.PubSub.Publish(topic, data)
 		if err != nil {
 			t.Fatalf("Failed to publish to PubSub: %v", err)
 		}
 
-		// Give time for message to be processed
 		time.Sleep(200 * time.Millisecond)
 
-		// Verify local connection received the message
 		select {
 		case msg := <-conn.send:
 			var event Event
@@ -185,7 +170,6 @@ func TestPubSubIntegration(t *testing.T) {
 	t.Run("channel unsubscribes on close", func(t *testing.T) {
 		ctx := context.Background()
 
-		// Create a PubSub that tracks subscriptions
 		trackingPubSub := &subscriptionTracker{
 			PubSub:        NewLocalPubSub(ctx, 100),
 			subscriptions: make(map[string]bool),
@@ -194,7 +178,6 @@ func TestPubSubIntegration(t *testing.T) {
 		opts := DefaultOptions()
 		opts.PubSub = trackingPubSub
 
-		// Create channel
 		channelOpts := options{
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
@@ -205,12 +188,10 @@ func TestPubSubIntegration(t *testing.T) {
 
 		channel := newChannel(ctx, channelOpts)
 		channel.endpointPath = "/socket"
-		channel.subscribeToPubSub() // Subscribe after setting endpoint path
+		channel.subscribeToPubSub()
 
-		// Wait for subscription to be set up
 		time.Sleep(200 * time.Millisecond)
 
-		// Verify subscription exists
 		pattern := "pondsocket:socket:test:channel:.*"
 		trackingPubSub.mu.Lock()
 		subscribed := trackingPubSub.subscriptions[pattern]
@@ -219,13 +200,11 @@ func TestPubSubIntegration(t *testing.T) {
 			t.Errorf("Expected channel to be subscribed to pattern %s", pattern)
 		}
 
-		// Close channel
 		err := channel.Close()
 		if err != nil {
 			t.Fatalf("Failed to close channel: %v", err)
 		}
 
-		// Verify unsubscription
 		trackingPubSub.mu.Lock()
 		stillSubscribed := trackingPubSub.subscriptions[pattern]
 		trackingPubSub.mu.Unlock()

@@ -17,12 +17,10 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 		Addr: "localhost:6379",
 	})
 
-	// Skip test if Redis is not available
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Skip("Redis not available:", err)
 	}
 
-	// Clean up any existing data
 	client.FlushDB(ctx)
 
 	pubsub, err := NewRedisPubSub(ctx, client)
@@ -36,7 +34,6 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 		var receivedTopic string
 		var receivedData []byte
 
-		// Subscribe to a topic
 		err := pubsub.Subscribe("pondsocket:test:channel:.*", func(topic string, data []byte) {
 			receivedTopic = topic
 			receivedData = data
@@ -46,17 +43,14 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 			t.Fatal("Subscribe failed:", err)
 		}
 
-		// Give subscription time to register
 		time.Sleep(100 * time.Millisecond)
 
-		// Publish a message
 		testData := []byte(`{"test": "message"}`)
 		err = pubsub.Publish("pondsocket:test:channel:message", testData)
 		if err != nil {
 			t.Fatal("Publish failed:", err)
 		}
 
-		// Wait for message
 		select {
 		case <-received:
 			if receivedTopic != "pondsocket:test:channel:message" {
@@ -75,7 +69,6 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 		count := 3
 		wg.Add(count)
 
-		// Subscribe multiple handlers
 		for i := 0; i < count; i++ {
 			err := pubsub.Subscribe("pondsocket:multi:.*", func(topic string, data []byte) {
 				wg.Done()
@@ -85,16 +78,13 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 			}
 		}
 
-		// Give subscriptions time to register
 		time.Sleep(100 * time.Millisecond)
 
-		// Publish a message
 		err = pubsub.Publish("pondsocket:multi:test", []byte("test"))
 		if err != nil {
 			t.Fatal("Publish failed:", err)
 		}
 
-		// Wait for all handlers
 		done := make(chan struct{})
 		go func() {
 			wg.Wait()
@@ -103,7 +93,7 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 
 		select {
 		case <-done:
-			// Success
+
 		case <-time.After(2 * time.Second):
 			t.Fatal("Timeout waiting for all handlers")
 		}
@@ -112,7 +102,6 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 	t.Run("Unsubscribe", func(t *testing.T) {
 		received := make(chan struct{})
 
-		// Subscribe
 		err := pubsub.Subscribe("pondsocket:unsub:.*", func(topic string, data []byte) {
 			received <- struct{}{}
 		})
@@ -120,10 +109,8 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 			t.Fatal("Subscribe failed:", err)
 		}
 
-		// Give subscription time to register
 		time.Sleep(100 * time.Millisecond)
 
-		// Verify subscription works
 		err = pubsub.Publish("pondsocket:unsub:test", []byte("test"))
 		if err != nil {
 			t.Fatal("Publish failed:", err)
@@ -131,21 +118,18 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 
 		select {
 		case <-received:
-			// Success
+
 		case <-time.After(1 * time.Second):
 			t.Fatal("Initial message not received")
 		}
 
-		// Unsubscribe
 		err = pubsub.Unsubscribe("pondsocket:unsub:.*")
 		if err != nil {
 			t.Fatal("Unsubscribe failed:", err)
 		}
 
-		// Give unsubscription time to process
 		time.Sleep(100 * time.Millisecond)
 
-		// Verify unsubscription worked
 		err = pubsub.Publish("pondsocket:unsub:test", []byte("test"))
 		if err != nil {
 			t.Fatal("Publish after unsubscribe failed:", err)
@@ -155,7 +139,7 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 		case <-received:
 			t.Fatal("Received message after unsubscribe")
 		case <-time.After(500 * time.Millisecond):
-			// Success - no message received
+
 		}
 	})
 }
@@ -246,7 +230,6 @@ func TestRedisPubSub_Concurrency(t *testing.T) {
 	}
 	defer pubsub.Close()
 
-	// Concurrent publishers and subscribers
 	var wg sync.WaitGroup
 	messageCount := 100
 	subscriberCount := 5
@@ -254,7 +237,6 @@ func TestRedisPubSub_Concurrency(t *testing.T) {
 	received := make([]int, subscriberCount)
 	var mu sync.Mutex
 
-	// Create subscribers
 	for i := 0; i < subscriberCount; i++ {
 		idx := i
 		err := pubsub.Subscribe("pondsocket:concurrent:.*", func(topic string, data []byte) {
@@ -269,7 +251,6 @@ func TestRedisPubSub_Concurrency(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Concurrent publishers
 	wg.Add(messageCount)
 	for i := 0; i < messageCount; i++ {
 		go func(n int) {
@@ -283,9 +264,8 @@ func TestRedisPubSub_Concurrency(t *testing.T) {
 	}
 
 	wg.Wait()
-	time.Sleep(500 * time.Millisecond) // Allow time for message delivery
+	time.Sleep(500 * time.Millisecond)
 
-	// Verify all subscribers received all messages
 	mu.Lock()
 	defer mu.Unlock()
 	for i, count := range received {
