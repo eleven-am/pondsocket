@@ -224,14 +224,17 @@ func TestChannel_OnMessage(t *testing.T) {
 	connectionChan := make(chan bool, 1)
 	channel := NewChannel(publisher, connectionChan, "lobby", JoinParams{})
 
-	var receivedEvent string
-	var receivedPayload PondMessage
-	var callbackCalled bool
+	// Use channels for thread-safe communication
+	resultChan := make(chan struct {
+		event   string
+		payload PondMessage
+	}, 1)
 
 	unsubscribe := channel.OnMessage(func(event string, payload PondMessage) {
-		receivedEvent = event
-		receivedPayload = payload
-		callbackCalled = true
+		resultChan <- struct {
+			event   string
+			payload PondMessage
+		}{event: event, payload: payload}
 	})
 	defer unsubscribe()
 
@@ -251,19 +254,17 @@ func TestChannel_OnMessage(t *testing.T) {
 		t.Error("Failed to send event to channel")
 	}
 
-	// Wait for callback
-	time.Sleep(100 * time.Millisecond)
-
-	if !callbackCalled {
-		t.Error("Expected callback to be called")
-	}
-
-	if receivedEvent != "test_message" {
-		t.Errorf("Expected event 'test_message', got %s", receivedEvent)
-	}
-
-	if receivedPayload["text"] != "Hello" {
-		t.Errorf("Expected payload text 'Hello', got %v", receivedPayload["text"])
+	// Wait for callback with timeout
+	select {
+	case result := <-resultChan:
+		if result.event != "test_message" {
+			t.Errorf("Expected event 'test_message', got %s", result.event)
+		}
+		if result.payload["text"] != "Hello" {
+			t.Errorf("Expected payload text 'Hello', got %v", result.payload["text"])
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Timeout waiting for callback")
 	}
 }
 

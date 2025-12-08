@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,10 +27,13 @@ func TestIntegration_BasicFlow(t *testing.T) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	// Track connection state
+	// Track connection state with mutex protection
+	var connectionStateMu sync.RWMutex
 	var connectionState bool
 	unsubConnection := client.OnConnectionChange(func(connected bool) {
+		connectionStateMu.Lock()
 		connectionState = connected
+		connectionStateMu.Unlock()
 	})
 	defer unsubConnection()
 
@@ -41,7 +46,10 @@ func TestIntegration_BasicFlow(t *testing.T) {
 	// Wait for connection
 	time.Sleep(200 * time.Millisecond)
 
-	if !connectionState {
+	connectionStateMu.RLock()
+	connState := connectionState
+	connectionStateMu.RUnlock()
+	if !connState {
 		t.Error("Expected connection state to be true")
 	}
 
@@ -51,29 +59,40 @@ func TestIntegration_BasicFlow(t *testing.T) {
 		"name":    "Test User",
 	})
 
-	// Track channel state
+	// Track channel state with mutex protection
+	var channelStateMu sync.RWMutex
 	var channelState ChannelState
 	unsubChannelState := channel.OnChannelStateChange(func(state ChannelState) {
+		channelStateMu.Lock()
 		channelState = state
+		channelStateMu.Unlock()
 	})
 	defer unsubChannelState()
 
-	// Track messages
+	// Track messages with mutex protection
+	var receivedMessagesMu sync.Mutex
 	var receivedMessages []PondMessage
 	unsubMessages := channel.OnMessage(func(event string, payload PondMessage) {
+		receivedMessagesMu.Lock()
 		receivedMessages = append(receivedMessages, payload)
+		receivedMessagesMu.Unlock()
 	})
 	defer unsubMessages()
 
-	// Track presence
+	// Track presence with mutex protection
+	var currentUsersMu sync.Mutex
 	var currentUsers []PondPresence
 	unsubPresence := channel.OnUsersChange(func(users []PondPresence) {
+		currentUsersMu.Lock()
 		currentUsers = users
+		currentUsersMu.Unlock()
 	})
 	defer unsubPresence()
 
 	// Use currentUsers to avoid unused variable warning
+	currentUsersMu.Lock()
 	_ = currentUsers
+	currentUsersMu.Unlock()
 
 	// Join channel
 	channel.Join()
@@ -81,8 +100,11 @@ func TestIntegration_BasicFlow(t *testing.T) {
 	// Wait for join to complete
 	time.Sleep(300 * time.Millisecond)
 
-	if channelState != Joined {
-		t.Errorf("Expected channel state to be Joined, got %s", channelState)
+	channelStateMu.RLock()
+	chState := channelState
+	channelStateMu.RUnlock()
+	if chState != Joined {
+		t.Errorf("Expected channel state to be Joined, got %s", chState)
 	}
 
 	// Send a message
@@ -95,7 +117,10 @@ func TestIntegration_BasicFlow(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Should have received the echoed message
-	if len(receivedMessages) < 1 {
+	receivedMessagesMu.Lock()
+	msgCount := len(receivedMessages)
+	receivedMessagesMu.Unlock()
+	if msgCount < 1 {
 		t.Error("Expected to receive at least one message")
 	}
 
@@ -105,8 +130,11 @@ func TestIntegration_BasicFlow(t *testing.T) {
 	// Wait for leave to complete
 	time.Sleep(100 * time.Millisecond)
 
-	if channelState != Closed {
-		t.Errorf("Expected channel state to be Closed, got %s", channelState)
+	channelStateMu.RLock()
+	chState = channelState
+	channelStateMu.RUnlock()
+	if chState != Closed {
+		t.Errorf("Expected channel state to be Closed, got %s", chState)
 	}
 
 	// Disconnect
@@ -115,10 +143,16 @@ func TestIntegration_BasicFlow(t *testing.T) {
 		t.Fatalf("Failed to disconnect: %v", err)
 	}
 
+	// Allow goroutines to finish
+	time.Sleep(100 * time.Millisecond)
+
 	// Wait for disconnect
 	time.Sleep(100 * time.Millisecond)
 
-	if connectionState {
+	connectionStateMu.RLock()
+	finalConnState := connectionState
+	connectionStateMu.RUnlock()
+	if finalConnState {
 		t.Error("Expected connection state to be false after disconnect")
 	}
 }
@@ -199,7 +233,7 @@ channelsJoined:
 }
 
 func TestIntegration_ReconnectionFlow(t *testing.T) {
-	connectionCount := 0
+	var connectionCount int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -209,7 +243,7 @@ func TestIntegration_ReconnectionFlow(t *testing.T) {
 		}
 		defer conn.Close()
 
-		connectionCount++
+		currentCount := atomic.AddInt32(&connectionCount, 1)
 
 		// Send connection event
 		connEvent := ChannelEvent{
@@ -219,7 +253,7 @@ func TestIntegration_ReconnectionFlow(t *testing.T) {
 		conn.WriteJSON(connEvent)
 
 		// If this is the first connection, close immediately to trigger reconnection
-		if connectionCount == 1 {
+		if currentCount == 1 {
 			time.Sleep(100 * time.Millisecond)
 			return // Connection closes
 		}
@@ -241,17 +275,25 @@ func TestIntegration_ReconnectionFlow(t *testing.T) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
+	// Use mutex-protected slice for connection states
+	var connectionStatesMu sync.Mutex
 	connectionStates := make([]bool, 0)
 	client.OnConnectionChange(func(connected bool) {
+		connectionStatesMu.Lock()
 		connectionStates = append(connectionStates, connected)
+		connectionStatesMu.Unlock()
 	})
 
 	// Create channel before connecting
 	channel := client.CreateChannel("lobby", JoinParams{"user_id": "test"})
 
+	// Use mutex-protected slice for channel states
+	var channelStatesMu sync.Mutex
 	channelStates := make([]ChannelState, 0)
 	channel.OnChannelStateChange(func(state ChannelState) {
+		channelStatesMu.Lock()
 		channelStates = append(channelStates, state)
+		channelStatesMu.Unlock()
 	})
 
 	// Join channel (will be queued since not connected)
@@ -267,13 +309,17 @@ func TestIntegration_ReconnectionFlow(t *testing.T) {
 	time.Sleep(800 * time.Millisecond)
 
 	// Should have reconnected
-	if connectionCount < 2 {
-		t.Errorf("Expected at least 2 connections, got %d", connectionCount)
+	finalConnCount := atomic.LoadInt32(&connectionCount)
+	if finalConnCount < 2 {
+		t.Errorf("Expected at least 2 connections, got %d", finalConnCount)
 	}
 
 	// Should have multiple connection state changes
-	if len(connectionStates) < 2 {
-		t.Errorf("Expected at least 2 connection state changes, got %d", len(connectionStates))
+	connectionStatesMu.Lock()
+	stateCount := len(connectionStates)
+	connectionStatesMu.Unlock()
+	if stateCount < 2 {
+		t.Errorf("Expected at least 2 connection state changes, got %d", stateCount)
 	}
 
 	// Channel should eventually be in Joining state (since we don't simulate acknowledgment)
@@ -282,6 +328,9 @@ func TestIntegration_ReconnectionFlow(t *testing.T) {
 	}
 
 	client.Disconnect()
+
+	// Allow goroutines to finish
+	time.Sleep(100 * time.Millisecond)
 }
 
 // Helper function to create a mock PondSocket server

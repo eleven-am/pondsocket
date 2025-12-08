@@ -242,3 +242,93 @@ func TestEndpointConcurrentAccess(t *testing.T) {
 		t.Error("expected some connections to be stored")
 	}
 }
+
+func TestEndpointGetClients(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+	endpoint := newEndpoint(ctx, "/test", opts)
+
+	t.Run("returns empty list when no clients", func(t *testing.T) {
+		clients := endpoint.GetClients()
+		if len(clients) != 0 {
+			t.Errorf("expected 0 clients, got %d", len(clients))
+		}
+	})
+
+	t.Run("returns all connected clients", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			conn := &Conn{
+				ID:        fmt.Sprintf("client-%d", i),
+				ctx:       ctx,
+				closeChan: make(chan struct{}),
+				assigns:   map[string]interface{}{"name": fmt.Sprintf("user%d", i)},
+			}
+			endpoint.connections.Create(conn.ID, conn)
+		}
+
+		clients := endpoint.GetClients()
+		if len(clients) != 3 {
+			t.Errorf("expected 3 clients, got %d", len(clients))
+		}
+	})
+}
+
+func TestEndpointGetChannelByName(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+	endpoint := newEndpoint(ctx, "/test", opts)
+
+	t.Run("returns nil for non-existent channel", func(t *testing.T) {
+		channel, err := endpoint.GetChannelByName("nonexistent")
+		if err == nil {
+			t.Error("expected error for non-existent channel")
+		}
+		if channel != nil {
+			t.Error("expected nil channel")
+		}
+	})
+
+	t.Run("returns channel when exists", func(t *testing.T) {
+		endpoint.CreateChannel("test:*", func(ctx *JoinContext) error {
+			return ctx.Accept()
+		})
+
+		channelOpts := options{
+			Name:                 "test:room1",
+			Middleware:           newMiddleWare[*messageEvent, *Channel](),
+			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+			InternalQueueTimeout: 1 * time.Second,
+		}
+		channel := newChannel(ctx, channelOpts)
+		// Store directly in endpoint's channels store
+		endpoint.channels.Create("test:room1", channel)
+
+		found, err := endpoint.GetChannelByName("test:room1")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if found == nil {
+			t.Error("expected to find channel")
+		}
+	})
+}
+
+func TestEndpointCloseConnection(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+	endpoint := newEndpoint(ctx, "/test", opts)
+
+	t.Run("returns error for non-existent connection", func(t *testing.T) {
+		err := endpoint.CloseConnection("nonexistent")
+		if err == nil {
+			t.Error("expected error for non-existent connection")
+		}
+	})
+
+	t.Run("returns nil for empty ids", func(t *testing.T) {
+		err := endpoint.CloseConnection()
+		if err != nil {
+			t.Errorf("expected nil error for empty ids, got %v", err)
+		}
+	})
+}

@@ -354,3 +354,37 @@ func TestLobbyMiddlewareIntegration(t *testing.T) {
 		t.Error("expected leave handler to be called through channel")
 	}
 }
+
+func TestLobbyGetChannel(t *testing.T) {
+	ctx := context.Background()
+	endpoint := createTestEndpoint(ctx)
+	lobby := newLobby(endpoint)
+
+	t.Run("returns nil for non-existent channel", func(t *testing.T) {
+		channel, err := lobby.GetChannel("nonexistent")
+		if err == nil {
+			t.Error("expected error for non-existent channel")
+		}
+		if channel != nil {
+			t.Error("expected nil channel")
+		}
+	})
+
+	t.Run("returns channel when exists", func(t *testing.T) {
+		created, err := lobby.createChannel("test-channel")
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		found, err := lobby.GetChannel("test-channel")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if found == nil {
+			t.Error("expected to find channel")
+		}
+		if found != created {
+			t.Error("expected same channel instance")
+		}
+	})
+}

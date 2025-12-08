@@ -291,3 +291,40 @@ func TestManagerWebSocketUpgrade(t *testing.T) {
 		}
 	})
 }
+
+func TestManagerGetEndpoints(t *testing.T) {
+	t.Run("returns empty slice when no endpoints", func(t *testing.T) {
+		ctx := context.Background()
+		mgr := NewManager(ctx)
+
+		endpoints := mgr.GetEndpoints()
+
+		if endpoints == nil {
+			t.Error("expected non-nil slice")
+		}
+		if len(endpoints) != 0 {
+			t.Errorf("expected 0 endpoints, got %d", len(endpoints))
+		}
+	})
+
+	t.Run("returns all created endpoints", func(t *testing.T) {
+		ctx := context.Background()
+		mgr := NewManager(ctx)
+
+		mgr.CreateEndpoint("/ws1", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+		mgr.CreateEndpoint("/ws2", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+		mgr.CreateEndpoint("/ws3", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+
+		endpoints := mgr.GetEndpoints()
+
+		if len(endpoints) != 3 {
+			t.Errorf("expected 3 endpoints, got %d", len(endpoints))
+		}
+	})
+}

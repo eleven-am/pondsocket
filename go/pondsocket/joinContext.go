@@ -48,7 +48,6 @@ func (c *JoinContext) checkStateAndContext() bool {
 	select {
 	case <-c.ctx.Done():
 		c.err = c.ctx.Err()
-
 		return true
 	default:
 		return false
@@ -63,18 +62,19 @@ func (c *JoinContext) Accept() *JoinContext {
 	if c.checkStateAndContext() {
 		return c
 	}
+
 	if c.HasResponded {
 		c.err = badRequest(c.Channel.name, "Already responded to the join request")
-
 		return c
 	}
+
 	c.HasResponded = true
 	c.accepted = true
 	if err := c.Channel.addUser(c.conn); err != nil {
 		c.err = wrapF(err, "failed to add user %s to Channel %s", c.conn.ID, c.Channel.name)
-
 		return c
 	}
+
 	ackEvent := Event{
 		Action:      system,
 		ChannelName: c.Channel.name,
@@ -82,10 +82,12 @@ func (c *JoinContext) Accept() *JoinContext {
 		Event:       string(acknowledgeEvent),
 		Payload:     make(map[string]interface{}),
 	}
+
 	recp := recipients{userIds: []string{c.conn.ID}}
 	if err := c.Channel.sendMessage(string(channelEntity), recp, ackEvent); err != nil {
 		c.err = wrapF(err, "failed to send join acknowledgment for Channel %s", c.Channel.name)
 	}
+
 	return c
 }
 

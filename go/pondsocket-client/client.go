@@ -376,19 +376,22 @@ func (c *PondClient) readMessages() {
 
 // handleDisconnect handles disconnection and reconnection logic
 func (c *PondClient) handleDisconnect() {
+	c.connMu.Lock()
 	if c.disconnecting {
+		c.connMu.Unlock()
 		return
 	}
-
 	c.reconnectCount++
+	reconnectCount := c.reconnectCount
+	c.connMu.Unlock()
 
 	// Check if we should attempt reconnection
-	if c.config.MaxReconnectTries >= 0 && c.reconnectCount > c.config.MaxReconnectTries {
+	if c.config.MaxReconnectTries >= 0 && reconnectCount > c.config.MaxReconnectTries {
 		return
 	}
 
 	// Exponential backoff with jitter
-	backoff := time.Duration(c.reconnectCount) * c.config.ReconnectInterval
+	backoff := time.Duration(reconnectCount) * c.config.ReconnectInterval
 	if backoff > 30*time.Second {
 		backoff = 30 * time.Second
 	}

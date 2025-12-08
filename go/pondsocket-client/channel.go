@@ -283,20 +283,6 @@ func (c *Channel) init(eventChan <-chan ChannelEvent) {
 			}
 		}
 	}()
-
-	// Handle presence updates
-	go func() {
-		for event := range c.eventChan {
-			if event.Action == Presence {
-				payload, err := event.GetPresencePayload()
-				if err == nil {
-					c.mu.Lock()
-					c.presence = payload.Presence
-					c.mu.Unlock()
-				}
-			}
-		}
-	}()
 }
 
 // setState updates the channel state and notifies subscribers
@@ -375,6 +361,15 @@ func (c *Channel) dispatchEvents() {
 	for {
 		select {
 		case event := <-c.eventChan:
+			if event.Action == Presence {
+				payload, err := event.GetPresencePayload()
+				if err == nil {
+					c.mu.Lock()
+					c.presence = payload.Presence
+					c.mu.Unlock()
+				}
+			}
+
 			c.eventSubsMu.RLock()
 			subs := make([]chan ChannelEvent, 0, len(c.eventSubs))
 			for _, sub := range c.eventSubs {

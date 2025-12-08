@@ -7,21 +7,128 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
+
+// setupMiniredis creates a miniredis server and returns a Redis client connected to it.
+// The miniredis server is automatically cleaned up when the test completes.
+func setupMiniredis(t *testing.T) *redis.Client {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{
+		Addr: mr.Addr(),
+	})
+	return client
+}
+
+func TestConvertToRedisPattern(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"pondsocket:app:channel:.*", "pondsocket:app:channel:*"},
+		{"pondsocket:app:channel:event", "pondsocket:app:channel:event"},
+		{".*", ".*"},
+		{"test", "test"},
+		{"abc.*", "abc*"},
+		{"", ""},
+		{"a", "a"},
+		{"ab", "ab"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := convertToRedisPattern(tt.input)
+			if result != tt.expected {
+				t.Errorf("convertToRedisPattern(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestMatchPattern(t *testing.T) {
+	tests := []struct {
+		pattern  string
+		topic    string
+		expected bool
+	}{
+		{"pondsocket:app:channel:event", "pondsocket:app:channel:event", true},
+		{"pondsocket:app:channel:.*", "pondsocket:app:channel:event", true},
+		{"pondsocket:app:channel:.*", "pondsocket:app:channel:other", true},
+		{"pondsocket:app:channel:.*", "pondsocket:app:other:event", false},
+		{"pondsocket:app:channel:event", "pondsocket:app:channel:other", false},
+		{"abc.*", "abc:anything", true},
+		{"abc.*", "abcd", true},
+		{"abc.*", "xyz", false},
+		{"prefix:.*", "prefix:suffix", true},
+		{"prefix:.*", "other:suffix", false},
+		{"exact", "exact", true},
+		{"exact", "other", false},
+	}
+
+	for _, tt := range tests {
+		name := fmt.Sprintf("pattern=%q,topic=%q", tt.pattern, tt.topic)
+		t.Run(name, func(t *testing.T) {
+			result := matchPattern(tt.pattern, tt.topic)
+			if result != tt.expected {
+				t.Errorf("matchPattern(%q, %q) = %v, want %v", tt.pattern, tt.topic, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRedisPubSub_ClosedOperations(t *testing.T) {
+	ctx := context.Background()
+	client := setupMiniredis(t)
+
+	pubsub, err := NewRedisPubSub(ctx, client)
+	if err != nil {
+		t.Fatal("Failed to create RedisPubSub:", err)
+	}
+
+	err = pubsub.Close()
+	if err != nil {
+		t.Fatal("Close failed:", err)
+	}
+
+	err = pubsub.Close()
+	if err != nil {
+		t.Error("Second Close should not return error")
+	}
+
+	err = pubsub.Subscribe("test:.*", func(topic string, data []byte) {})
+	if err == nil {
+		t.Error("Subscribe on closed pubsub should return error")
+	}
+
+	err = pubsub.Unsubscribe("test:.*")
+	if err == nil {
+		t.Error("Unsubscribe on closed pubsub should return error")
+	}
+
+	err = pubsub.Publish("test:topic", []byte("data"))
+	if err == nil {
+		t.Error("Publish on closed pubsub should return error")
+	}
+}
+
+func TestNewRedisPubSub_ConnectionError(t *testing.T) {
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:9999",
+	})
+
+	_, err := NewRedisPubSub(ctx, client)
+	if err == nil {
+		t.Error("Expected error for invalid Redis connection")
+	}
+}
 
 // TestRedisPubSub_BasicFunctionality tests basic publish/subscribe operations.
 func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-
-	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skip("Redis not available:", err)
-	}
-
-	client.FlushDB(ctx)
+	client := setupMiniredis(t)
 
 	pubsub, err := NewRedisPubSub(ctx, client)
 	if err != nil {
@@ -147,15 +254,7 @@ func TestRedisPubSub_BasicFunctionality(t *testing.T) {
 // TestRedisPubSub_PatternMatching tests pattern matching functionality.
 func TestRedisPubSub_PatternMatching(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-
-	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skip("Redis not available:", err)
-	}
-
-	client.FlushDB(ctx)
+	client := setupMiniredis(t)
 
 	pubsub, err := NewRedisPubSub(ctx, client)
 	if err != nil {
@@ -214,15 +313,7 @@ func TestRedisPubSub_PatternMatching(t *testing.T) {
 // TestRedisPubSub_Concurrency tests concurrent operations.
 func TestRedisPubSub_Concurrency(t *testing.T) {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-
-	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skip("Redis not available:", err)
-	}
-
-	client.FlushDB(ctx)
+	client := setupMiniredis(t)
 
 	pubsub, err := NewRedisPubSub(ctx, client)
 	if err != nil {

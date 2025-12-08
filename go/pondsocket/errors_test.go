@@ -308,3 +308,114 @@ func TestErrorSerialization(t *testing.T) {
 		}
 	})
 }
+
+func TestErrorWithCause(t *testing.T) {
+	t.Run("withCause sets underlying cause", func(t *testing.T) {
+		originalErr := errors.New("original cause")
+		err := &Error{
+			Code:    StatusInternalServerError,
+			Message: "Something went wrong",
+		}
+
+		errWithCause := err.withCause(originalErr)
+
+		if errWithCause.Unwrap() != originalErr {
+			t.Error("expected cause to be set")
+		}
+	})
+}
+
+func TestErrorWithChannelName(t *testing.T) {
+	t.Run("withChannelName sets channel name", func(t *testing.T) {
+		err := &Error{
+			Code:    StatusBadRequest,
+			Message: "Invalid request",
+		}
+
+		errWithChannel := err.withChannelName("test-channel")
+
+		if errWithChannel.ChannelName != "test-channel" {
+			t.Errorf("expected channel name 'test-channel', got %s", errWithChannel.ChannelName)
+		}
+
+		// Test that error string includes channel name
+		errStr := errWithChannel.Error()
+		if !strings.Contains(errStr, "test-channel") {
+			t.Error("expected error string to contain channel name")
+		}
+	})
+}
+
+func TestTemporaryError(t *testing.T) {
+	t.Run("temporary creates temporary error with custom code", func(t *testing.T) {
+		err := temporary("test-channel", "Temporary failure", 503)
+
+		if err.Code != 503 {
+			t.Errorf("expected code 503, got %d", err.Code)
+		}
+		if err.ChannelName != "test-channel" {
+			t.Errorf("expected channel name 'test-channel', got %s", err.ChannelName)
+		}
+		if err.Message != "Temporary failure" {
+			t.Errorf("expected message 'Temporary failure', got %s", err.Message)
+		}
+		if !err.Temporary {
+			t.Error("expected error to be temporary")
+		}
+	})
+}
+
+func TestErrorEvent(t *testing.T) {
+	t.Run("errorEvent returns nil for nil error", func(t *testing.T) {
+		event := errorEvent(nil)
+
+		if event != nil {
+			t.Error("expected nil event for nil error")
+		}
+	})
+
+	t.Run("errorEvent creates event from Error type", func(t *testing.T) {
+		cause := errors.New("underlying cause")
+		err := &Error{
+			Code:        StatusBadRequest,
+			ChannelName: "test-channel",
+			Message:     "Bad request",
+			Details:     map[string]interface{}{"field": "name"},
+			Temporary:   false,
+		}
+		err.withCause(cause)
+
+		event := errorEvent(err)
+
+		if event == nil {
+			t.Fatal("expected event to be created")
+		}
+		if event.Event != string(internalErrorEvent) {
+			t.Errorf("expected event type %s, got %s", internalErrorEvent, event.Event)
+		}
+		if event.ChannelName != "test-channel" {
+			t.Errorf("expected channel name 'test-channel', got %s", event.ChannelName)
+		}
+
+		payload, ok := event.Payload.(map[string]interface{})
+		if !ok {
+			t.Fatal("expected payload to be a map")
+		}
+		if payload["code"] != StatusBadRequest {
+			t.Errorf("expected code %d in payload, got %v", StatusBadRequest, payload["code"])
+		}
+	})
+
+	t.Run("errorEvent handles standard error", func(t *testing.T) {
+		err := errors.New("standard error")
+
+		event := errorEvent(err)
+
+		if event == nil {
+			t.Fatal("expected event to be created")
+		}
+		if event.Event != string(internalErrorEvent) {
+			t.Errorf("expected event type %s, got %s", internalErrorEvent, event.Event)
+		}
+	})
+}

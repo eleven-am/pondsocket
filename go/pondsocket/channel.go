@@ -8,9 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type syncCoordinator struct {
@@ -73,6 +74,10 @@ func newChannel(ctx context.Context, options options) *Channel {
 	c.handleMessageEvents()
 
 	return &c
+}
+
+func (c *Channel) Name() string {
+	return c.name
 }
 
 // RemoveUser removes a user from the channel, cleaning up their presence and assigns data.
@@ -616,23 +621,26 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 	} else {
 		return nil
 	}
+
 	if targetUserIDs.length() == 0 {
 		return nil
 	}
+
 	internalEv := internalEvent{
 		Event:      event,
 		Recipients: targetUserIDs,
 	}
+
 	if c.pubsub != nil && c.endpointPath != "" {
 		cleanEndpoint := c.endpointPath
 		if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 			cleanEndpoint = cleanEndpoint[1:]
 		}
+
 		topic := formatTopic(cleanEndpoint, c.name, event.Event)
 
 		eventForPubSub := event
 		eventForPubSub.NodeID = c.nodeID
-
 		data, err := json.Marshal(eventForPubSub)
 
 		if err == nil {

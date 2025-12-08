@@ -259,7 +259,7 @@ func (c *Conn) handleMessages() {
 	}()
 }
 
-func (c *Conn) sendJSON(v interface{}) error {
+func (c *Conn) sendJSON(v interface{}) (err error) {
 	if !c.IsActive() {
 		return internal(string(gatewayEntity), "Connection with id "+c.ID+" is closing")
 	}
@@ -268,6 +268,14 @@ func (c *Conn) sendJSON(v interface{}) error {
 	if err != nil {
 		return wrapF(err, "failed to marshal JSON for connection %s", c.ID)
 	}
+
+	// Recover from panic if send channel is closed during send
+	defer func() {
+		if r := recover(); r != nil {
+			err = internal(string(gatewayEntity), "Connection with id "+c.ID+" is closing")
+		}
+	}()
+
 	select {
 	case <-c.closeChan:
 		return internal(string(gatewayEntity), "Connection with id "+c.ID+" is closing")
@@ -393,9 +401,11 @@ func (c *Conn) close(fromReader bool) {
 		if fromReader && conn != nil {
 			_ = conn.Close()
 		}
-		close(c.send)
-
-		close(c.receive)
+		// Note: We intentionally do NOT close c.send and c.receive channels here.
+		// The closeChan and ctx.Done() signals in the select statements will
+		// unblock any goroutines waiting on these channels. Closing them here
+		// would cause a race condition with goroutines that may still be sending.
+		// The channels will be garbage collected when the Conn is no longer referenced.
 	})
 }
 

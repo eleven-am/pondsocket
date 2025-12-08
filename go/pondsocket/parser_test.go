@@ -280,3 +280,114 @@ func TestSplitPath(t *testing.T) {
 		})
 	}
 }
+
+func TestRouteParam(t *testing.T) {
+	route := &Route{
+		params: map[string]string{
+			"id":   "123",
+			"name": "john",
+		},
+		query: map[string][]string{},
+	}
+
+	t.Run("returns param value when exists", func(t *testing.T) {
+		val := route.Param("id")
+		if val != "123" {
+			t.Errorf("expected '123', got '%s'", val)
+		}
+	})
+
+	t.Run("returns empty string when param doesn't exist", func(t *testing.T) {
+		val := route.Param("nonexistent")
+		if val != "" {
+			t.Errorf("expected empty string, got '%s'", val)
+		}
+	})
+}
+
+func TestRouteQueryParam(t *testing.T) {
+	route := &Route{
+		params: map[string]string{},
+		query: map[string][]string{
+			"page":   {"1"},
+			"filter": {"active", "pending"},
+		},
+	}
+
+	t.Run("returns query values when exists", func(t *testing.T) {
+		val := route.QueryParam("page")
+		if len(val) != 1 || val[0] != "1" {
+			t.Errorf("expected ['1'], got %v", val)
+		}
+	})
+
+	t.Run("returns all values when multiple exist", func(t *testing.T) {
+		val := route.QueryParam("filter")
+		if len(val) != 2 || val[0] != "active" {
+			t.Errorf("expected ['active', 'pending'], got %v", val)
+		}
+	})
+
+	t.Run("returns empty slice when query doesn't exist", func(t *testing.T) {
+		val := route.QueryParam("nonexistent")
+		if len(val) != 0 {
+			t.Errorf("expected empty slice, got %v", val)
+		}
+	})
+}
+
+func TestRouteParseQuery(t *testing.T) {
+	route := &Route{
+		params: map[string]string{},
+		query: map[string][]string{
+			"name": {"john"},
+			"age":  {"25"},
+		},
+	}
+
+	t.Run("parses query into struct", func(t *testing.T) {
+		var result struct {
+			Name []string `json:"name"`
+			Age  []string `json:"age"`
+		}
+
+		err := route.ParseQuery(&result)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if len(result.Name) != 1 || result.Name[0] != "john" {
+			t.Errorf("expected name ['john'], got %v", result.Name)
+		}
+		if len(result.Age) != 1 || result.Age[0] != "25" {
+			t.Errorf("expected age ['25'], got %v", result.Age)
+		}
+	})
+}
+
+func TestRouteParseParams(t *testing.T) {
+	route := &Route{
+		params: map[string]string{
+			"id":   "123",
+			"type": "user",
+		},
+		query: map[string][]string{},
+	}
+
+	t.Run("parses params into struct", func(t *testing.T) {
+		var result struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		}
+
+		err := route.ParseParams(&result)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if result.ID != "123" {
+			t.Errorf("expected ID '123', got '%s'", result.ID)
+		}
+		if result.Type != "user" {
+			t.Errorf("expected Type 'user', got '%s'", result.Type)
+		}
+	})
+}
