@@ -18,10 +18,10 @@ type OutgoingContext struct {
 	isBlocked      bool
 	Route          *Route
 	mutex          sync.RWMutex
-	conn           *Conn
+	conn           Transport
 }
 
-func newOutgoingContext(ctx context.Context, channel *Channel, event *Event, user *User, conn *Conn) *OutgoingContext {
+func newOutgoingContext(ctx context.Context, channel *Channel, event *Event, user *User, conn Transport) *OutgoingContext {
 	select {
 	case <-ctx.Done():
 		return &OutgoingContext{
@@ -177,7 +177,7 @@ func (c *OutgoingContext) sendMessage() error {
 		return nil
 	}
 	if c.conn != nil {
-		return c.conn.sendJSON(c.Event)
+		return c.conn.SendJSON(c.Event)
 	}
 	return internal(c.Channel.name, "Cannot send message: no connection available")
 }

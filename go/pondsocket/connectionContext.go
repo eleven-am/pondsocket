@@ -6,6 +6,7 @@ package pondsocket
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -24,6 +25,7 @@ type ConnectionContext struct {
 	managerCtx       context.Context
 	connectionCxt    context.Context
 	connectionCancel context.CancelFunc
+	sseConn          *SSEConn
 }
 
 type connectionOptions struct {
@@ -53,10 +55,6 @@ func newConnectionContext(options connectionOptions) *ConnectionContext {
 	}
 }
 
-// Accept upgrades the HTTP connection to a WebSocket connection and registers it with the endpoint.
-// This method must be called to establish the WebSocket connection.
-// Returns an error if the connection has already been responded to or if the upgrade fails.
-// After accepting, the connection is managed by the endpoint and can join channels.
 func (c *ConnectionContext) Accept() error {
 	if c.hasResponded {
 		c.connectionCancel()
@@ -66,6 +64,19 @@ func (c *ConnectionContext) Accept() error {
 	c.hasResponded = true
 	c.accepted = true
 
+	if isWebSocketRequest(c.request) {
+		return c.acceptWebSocket()
+	}
+
+	if isSSERequest(c.request) {
+		return c.acceptSSE()
+	}
+
+	c.connectionCancel()
+	return badRequest(string(gatewayEntity), "unsupported transport type")
+}
+
+func (c *ConnectionContext) acceptWebSocket() error {
 	wsConn, err := c.upgrader.Upgrade(*c.response, c.request, nil)
 
 	if err != nil {
@@ -87,6 +98,39 @@ func (c *ConnectionContext) Accept() error {
 	}
 
 	return nil
+}
+
+func (c *ConnectionContext) acceptSSE() error {
+	opts := sseOptions{
+		writer:    *c.response,
+		assigns:   c.assigns,
+		id:        c.userId,
+		options:   c.endpoint.options,
+		parentCtx: c.managerCtx,
+	}
+
+	sseConn, err := newSSEConn(opts)
+	if err != nil {
+		c.connectionCancel()
+		return wrapF(err, "failed to create SSE connection for %s", c.userId)
+	}
+
+	if err = c.endpoint.addConnection(sseConn); err != nil {
+		c.connectionCancel()
+		sseConn.Close()
+		return wrapF(err, "failed to add SSE connection %s to endpoint", c.userId)
+	}
+
+	c.sseConn = sseConn
+	return nil
+}
+
+func isWebSocketRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
+func isSSERequest(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 }
 
 // Decline rejects the WebSocket connection request with the specified HTTP status code and message.

@@ -2,13 +2,15 @@ package pondsocket
 
 import (
 	"context"
-	"github.com/gorilla/websocket"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestNewManager(t *testing.T) {
@@ -325,6 +327,181 @@ func TestManagerGetEndpoints(t *testing.T) {
 
 		if len(endpoints) != 3 {
 			t.Errorf("expected 3 endpoints, got %d", len(endpoints))
+		}
+	})
+}
+
+func TestManagerSSEConnection(t *testing.T) {
+	t.Run("accepts SSE connections", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		mgr := NewManager(ctx)
+
+		connectionAccepted := make(chan string, 1)
+
+		mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error {
+			err := ctx.Accept()
+			if err == nil {
+				connectionAccepted <- ctx.userId
+			}
+			return err
+		})
+
+		handler := mgr.HTTPHandler()
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer reqCancel()
+
+		req, _ := http.NewRequestWithContext(reqCtx, "GET", server.URL+"/events", nil)
+		req.Header.Set("Accept", "text/event-stream")
+
+		client := &http.Client{}
+
+		respChan := make(chan *http.Response, 1)
+		errChan := make(chan error, 1)
+
+		go func() {
+			resp, err := client.Do(req)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			respChan <- resp
+		}()
+
+		select {
+		case <-connectionAccepted:
+		case <-time.After(200 * time.Millisecond):
+			t.Error("timeout waiting for connection to be accepted")
+		}
+
+		select {
+		case resp := <-respChan:
+			defer resp.Body.Close()
+			if resp.Header.Get("Content-Type") != "text/event-stream" {
+				t.Errorf("expected Content-Type text/event-stream, got %s", resp.Header.Get("Content-Type"))
+			}
+		case err := <-errChan:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		case <-time.After(600 * time.Millisecond):
+		}
+
+		cancel()
+	})
+}
+
+func TestManagerSSEMessageHandler(t *testing.T) {
+	t.Run("returns error when X-Connection-ID header is missing", func(t *testing.T) {
+		ctx := context.Background()
+		mgr := NewManager(ctx)
+
+		mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+
+		handler := mgr.HTTPHandler()
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		req, _ := http.NewRequest("POST", server.URL+"/events", strings.NewReader(`{"action":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("expected status 400, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("returns error when connection not found", func(t *testing.T) {
+		ctx := context.Background()
+		mgr := NewManager(ctx)
+
+		mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+
+		handler := mgr.HTTPHandler()
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		req, _ := http.NewRequest("POST", server.URL+"/events", strings.NewReader(`{"action":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Connection-ID", "nonexistent-id")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status 404, got %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestManagerSSEDisconnectHandler(t *testing.T) {
+	t.Run("returns error when X-Connection-ID header is missing", func(t *testing.T) {
+		ctx := context.Background()
+		mgr := NewManager(ctx)
+
+		mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+
+		handler := mgr.HTTPHandler()
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		req, _ := http.NewRequest("DELETE", server.URL+"/events", nil)
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("expected status 400, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("returns error when connection not found", func(t *testing.T) {
+		ctx := context.Background()
+		mgr := NewManager(ctx)
+
+		mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+
+		handler := mgr.HTTPHandler()
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		req, _ := http.NewRequest("DELETE", server.URL+"/events", nil)
+		req.Header.Set("X-Connection-ID", "nonexistent-id")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status 404, got %d", resp.StatusCode)
 		}
 	})
 }

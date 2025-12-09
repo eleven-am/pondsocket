@@ -1,12 +1,13 @@
 package pondsocket
 
 import (
-	"github.com/gorilla/websocket"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestServerCreation(t *testing.T) {

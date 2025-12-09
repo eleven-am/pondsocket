@@ -69,8 +69,8 @@ type Hooks struct {
 	RateLimiter        RateLimiter
 	ChannelRateLimiter RateLimiter
 	Metrics            MetricsCollector
-	OnConnect          func(conn *Conn) error
-	OnDisconnect       func(conn *Conn)
+	OnConnect          func(conn Transport) error
+	OnDisconnect       func(conn Transport)
 
 	BeforeJoin func(user *User, channel string) error
 	AfterJoin  func(user *User, channel string)
@@ -82,12 +82,12 @@ type Hooks struct {
 // WithRateLimiter creates a middleware that enforces rate limiting on incoming messages.
 // The keyFunc extracts a rate limit key from the connection (e.g., user ID, IP address).
 // Messages that exceed the rate limit are rejected with a 429 status code.
-func WithRateLimiter(hooks *Hooks, keyFunc func(*Conn) string) handlerFunc[*Event, interface{}] {
+func WithRateLimiter(hooks *Hooks, keyFunc func(Transport) string) handlerFunc[*Event, interface{}] {
 	return func(ctx context.Context, event *Event, _ interface{}, next nextFunc) error {
 		if hooks == nil || hooks.RateLimiter == nil {
 			return next()
 		}
-		conn, ok := ctx.Value(connectionContextKey).(*Conn)
+		conn, ok := ctx.Value(connectionContextKey).(Transport)
 
 		if !ok {
 			return next()
@@ -131,8 +131,8 @@ func WithMetrics(hooks *Hooks) handlerFunc[*Event, interface{}] {
 
 		duration := time.Since(start)
 
-		if conn, ok := ctx.Value(connectionContextKey).(*Conn); ok {
-			hooks.Metrics.MessageReceived(conn.ID, event.ChannelName, event.Event, 0)
+		if conn, ok := ctx.Value(connectionContextKey).(Transport); ok {
+			hooks.Metrics.MessageReceived(conn.GetID(), event.ChannelName, event.Event, 0)
 
 			hooks.Metrics.HandlerDuration(event.Event, duration)
 

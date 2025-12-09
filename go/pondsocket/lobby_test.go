@@ -9,7 +9,7 @@ import (
 
 func createTestEndpoint(ctx context.Context) *Endpoint {
 	return &Endpoint{
-		connections: newStore[*Conn](),
+		connections: newStore[Transport](),
 		middleware:  newMiddleWare[joinEvent, interface{}](),
 		channels:    newStore[*Channel](),
 		options:     DefaultOptions(),

@@ -123,7 +123,7 @@ func (n *nonFlushingWriter) Write([]byte) (int, error)  { return 0, nil }
 func (n *nonFlushingWriter) WriteHeader(statusCode int) {}
 
 func TestSSEConnSendJSON(t *testing.T) {
-	t.Run("sends JSON in SSE format", func(t *testing.T) {
+	t.Run("sends JSON in SSE format with event field", func(t *testing.T) {
 		conn, writer := createTestSSEConn("test-id", nil)
 		defer conn.Close()
 
@@ -141,7 +141,12 @@ func TestSSEConnSendJSON(t *testing.T) {
 		}
 
 		body := writer.GetBody()
-		if !strings.HasPrefix(body, "data: ") {
+
+		if !strings.HasPrefix(body, "event: test-event\n") {
+			t.Errorf("expected SSE event field prefix, got %s", body)
+		}
+
+		if !strings.Contains(body, "data: ") {
 			t.Errorf("expected SSE data prefix, got %s", body)
 		}
 
@@ -149,8 +154,9 @@ func TestSSEConnSendJSON(t *testing.T) {
 			t.Errorf("expected SSE terminator, got %s", body)
 		}
 
-		jsonPart := strings.TrimPrefix(body, "data: ")
-		jsonPart = strings.TrimSuffix(jsonPart, "\n\n")
+		dataStart := strings.Index(body, "data: ") + 6
+		dataEnd := strings.LastIndex(body, "\n\n")
+		jsonPart := body[dataStart:dataEnd]
 
 		var received Event
 		if err := json.Unmarshal([]byte(jsonPart), &received); err != nil {
@@ -159,6 +165,56 @@ func TestSSEConnSendJSON(t *testing.T) {
 
 		if received.RequestId != "req-123" {
 			t.Errorf("expected request ID req-123, got %s", received.RequestId)
+		}
+	})
+
+	t.Run("omits event field for non-Event types", func(t *testing.T) {
+		conn, writer := createTestSSEConn("test-id", nil)
+		defer conn.Close()
+
+		testData := map[string]string{"key": "value"}
+
+		err := conn.SendJSON(testData)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		body := writer.GetBody()
+
+		if strings.HasPrefix(body, "event:") {
+			t.Errorf("expected no event field for non-Event type, got %s", body)
+		}
+
+		if !strings.HasPrefix(body, "data: ") {
+			t.Errorf("expected SSE data prefix, got %s", body)
+		}
+	})
+
+	t.Run("omits event field when Event.Event is empty", func(t *testing.T) {
+		conn, writer := createTestSSEConn("test-id", nil)
+		defer conn.Close()
+
+		testEvent := Event{
+			Action:      "test",
+			ChannelName: "test-channel",
+			RequestId:   "req-123",
+			Event:       "",
+			Payload:     "test-payload",
+		}
+
+		err := conn.SendJSON(testEvent)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		body := writer.GetBody()
+
+		if strings.HasPrefix(body, "event:") {
+			t.Errorf("expected no event field when Event.Event is empty, got %s", body)
+		}
+
+		if !strings.HasPrefix(body, "data: ") {
+			t.Errorf("expected SSE data prefix, got %s", body)
 		}
 	})
 
@@ -406,4 +462,212 @@ func TestSSEConnConcurrency(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestSSEConnCORSHeaders(t *testing.T) {
+	t.Run("sets CORS headers when configured", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.CORSAllowOrigin = "https://example.com"
+		opts.CORSAllowCredentials = true
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-cors",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		if writer.headers.Get("Access-Control-Allow-Origin") != "https://example.com" {
+			t.Errorf("expected Access-Control-Allow-Origin https://example.com, got %s", writer.headers.Get("Access-Control-Allow-Origin"))
+		}
+
+		if writer.headers.Get("Access-Control-Allow-Credentials") != "true" {
+			t.Errorf("expected Access-Control-Allow-Credentials true, got %s", writer.headers.Get("Access-Control-Allow-Credentials"))
+		}
+	})
+
+	t.Run("does not set CORS headers when not configured", func(t *testing.T) {
+		conn, writer := createTestSSEConn("test-no-cors", nil)
+		defer conn.Close()
+
+		if writer.headers.Get("Access-Control-Allow-Origin") != "" {
+			t.Errorf("expected no Access-Control-Allow-Origin header, got %s", writer.headers.Get("Access-Control-Allow-Origin"))
+		}
+	})
+
+	t.Run("sets origin without credentials when credentials disabled", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.CORSAllowOrigin = "*"
+		opts.CORSAllowCredentials = false
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-cors-no-creds",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		if writer.headers.Get("Access-Control-Allow-Origin") != "*" {
+			t.Errorf("expected Access-Control-Allow-Origin *, got %s", writer.headers.Get("Access-Control-Allow-Origin"))
+		}
+
+		if writer.headers.Get("Access-Control-Allow-Credentials") != "" {
+			t.Errorf("expected no Access-Control-Allow-Credentials header, got %s", writer.headers.Get("Access-Control-Allow-Credentials"))
+		}
+	})
+}
+
+func TestSSEConnGetAssignsReturnsClone(t *testing.T) {
+	conn, _ := createTestSSEConn("test-id", nil)
+	defer conn.Close()
+
+	conn.SetAssign("key1", "value1")
+	conn.SetAssign("key2", "value2")
+
+	assigns := conn.GetAssigns()
+
+	assigns["key1"] = "modified"
+	assigns["key3"] = "new"
+
+	if conn.GetAssign("key1") != "value1" {
+		t.Error("modifying returned map affected original assigns")
+	}
+
+	if conn.GetAssign("key3") != nil {
+		t.Error("adding to returned map affected original assigns")
+	}
+}
+
+func TestSSEConnSendTimeoutOption(t *testing.T) {
+	t.Run("uses configured SendTimeout", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.SendTimeout = 100 * time.Millisecond
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-timeout",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		if conn.options.SendTimeout != 100*time.Millisecond {
+			t.Errorf("expected SendTimeout 100ms, got %v", conn.options.SendTimeout)
+		}
+	})
+
+	t.Run("default SendTimeout is 5 seconds", func(t *testing.T) {
+		opts := DefaultOptions()
+		if opts.SendTimeout != 5*time.Second {
+			t.Errorf("expected default SendTimeout 5s, got %v", opts.SendTimeout)
+		}
+	})
+}
+
+func TestSSEConnWait(t *testing.T) {
+	t.Run("Wait blocks until Close is called", func(t *testing.T) {
+		conn, _ := createTestSSEConn("test-wait", nil)
+
+		waitDone := make(chan struct{})
+		go func() {
+			conn.Wait()
+			close(waitDone)
+		}()
+
+		select {
+		case <-waitDone:
+			t.Error("Wait should not return before Close")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		conn.Close()
+
+		select {
+		case <-waitDone:
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Wait should return after Close")
+		}
+	})
+
+	t.Run("Wait unblocks when context is cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		writer := newMockResponseWriter()
+		opts := DefaultOptions()
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-wait-ctx",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+
+		waitDone := make(chan struct{})
+		go func() {
+			conn.Wait()
+			close(waitDone)
+		}()
+
+		select {
+		case <-waitDone:
+			t.Error("Wait should not return before context cancel")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		cancel()
+
+		select {
+		case <-waitDone:
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Wait should return after context cancel")
+		}
+	})
+
+	t.Run("Wait returns immediately if already closed", func(t *testing.T) {
+		conn, _ := createTestSSEConn("test-wait-closed", nil)
+		conn.Close()
+
+		waitDone := make(chan struct{})
+		go func() {
+			conn.Wait()
+			close(waitDone)
+		}()
+
+		select {
+		case <-waitDone:
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Wait should return immediately for closed connection")
+		}
+	})
 }

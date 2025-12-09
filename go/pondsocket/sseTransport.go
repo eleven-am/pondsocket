@@ -69,6 +69,13 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 	opts.writer.Header().Set("Connection", "keep-alive")
 	opts.writer.Header().Set("X-Accel-Buffering", "no")
 
+	if opts.options != nil && opts.options.CORSAllowOrigin != "" {
+		opts.writer.Header().Set("Access-Control-Allow-Origin", opts.options.CORSAllowOrigin)
+		if opts.options.CORSAllowCredentials {
+			opts.writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+	}
+
 	go conn.keepAlive()
 
 	return conn, nil
@@ -131,6 +138,14 @@ func (s *SSEConn) SendJSON(v interface{}) error {
 	default:
 	}
 
+	if event, ok := v.(Event); ok && event.Event != "" {
+		_, err = s.writer.Write([]byte("event: " + event.Event + "\n"))
+		if err != nil {
+			go s.Close()
+			return wrapF(err, "failed to write SSE event field for connection %s", s.id)
+		}
+	}
+
 	_, err = s.writer.Write([]byte("data: "))
 	if err != nil {
 		go s.Close()
@@ -176,7 +191,11 @@ func (s *SSEConn) SetAssign(key string, value interface{}) {
 func (s *SSEConn) GetAssigns() map[string]interface{} {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
-	return s.assigns
+	cloned := make(map[string]interface{}, len(s.assigns))
+	for k, v := range s.assigns {
+		cloned[k] = v
+	}
+	return cloned
 }
 
 func (s *SSEConn) CloneAssigns() map[string]interface{} {
@@ -227,6 +246,13 @@ func (s *SSEConn) Close() {
 			s.reportError("sse_close_handlers", closeHandlerErrors)
 		}
 	})
+}
+
+func (s *SSEConn) Wait() {
+	select {
+	case <-s.closeChan:
+	case <-s.ctx.Done():
+	}
 }
 
 func (s *SSEConn) OnClose(callback func(Transport) error) {
@@ -311,7 +337,7 @@ func (s *SSEConn) PushMessage(data []byte) error {
 		return internal(string(gatewayEntity), "SSE connection "+s.id+" is closing")
 	case <-s.ctx.Done():
 		return internal(string(gatewayEntity), "SSE connection "+s.id+" context cancelled")
-	case <-time.After(5 * time.Second):
+	case <-time.After(s.getSendTimeout()):
 		return timeout(string(gatewayEntity), "timeout pushing message to SSE connection "+s.id)
 	}
 }
@@ -321,4 +347,11 @@ func (s *SSEConn) reportError(component string, err error) {
 		return
 	}
 	s.options.Hooks.Metrics.Error(component, err)
+}
+
+func (s *SSEConn) getSendTimeout() time.Duration {
+	if s.options != nil && s.options.SendTimeout > 0 {
+		return s.options.SendTimeout
+	}
+	return 5 * time.Second
 }

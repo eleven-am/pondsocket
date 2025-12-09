@@ -338,7 +338,6 @@ func TestErrorWithChannelName(t *testing.T) {
 			t.Errorf("expected channel name 'test-channel', got %s", errWithChannel.ChannelName)
 		}
 
-		// Test that error string includes channel name
 		errStr := errWithChannel.Error()
 		if !strings.Contains(errStr, "test-channel") {
 			t.Error("expected error string to contain channel name")

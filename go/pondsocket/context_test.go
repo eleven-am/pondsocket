@@ -1183,7 +1183,7 @@ func TestContextConcurrency(t *testing.T) {
 	ctx := context.Background()
 	channel := createContextTestChannel(ctx, "test-channel")
 	defer func() {
-		// Allow background goroutines to quiesce before closing
+
 		time.Sleep(50 * time.Millisecond)
 		channel.Close()
 	}()

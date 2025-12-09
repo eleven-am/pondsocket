@@ -13,7 +13,7 @@ import (
 
 type Endpoint struct {
 	path        string
-	connections *store[*Conn]
+	connections *store[Transport]
 	middleware  *middleware[joinEvent, interface{}]
 	channels    *store[*Channel]
 	options     *Options
@@ -22,7 +22,7 @@ type Endpoint struct {
 }
 
 type joinEvent struct {
-	user      *Conn
+	user      Transport
 	channel   string
 	requestId string
 	payload   interface{}
@@ -32,7 +32,7 @@ func newEndpoint(ctx context.Context, path string, options *Options) *Endpoint {
 	return &Endpoint{
 		path:        path,
 		options:     options,
-		connections: newStore[*Conn](),
+		connections: newStore[Transport](),
 		channels:    newStore[*Channel](),
 		middleware:  newMiddleWare[joinEvent, interface{}](),
 		ctx:         ctx,
@@ -115,10 +115,10 @@ func (e *Endpoint) CloseConnection(ids ...string) error {
 
 	connsToClose := e.connections.GetByKeys(ids...)
 
-	closeErr := mapToError(connsToClose, func(conn *Conn) error {
+	closeErr := mapToError(connsToClose, func(conn Transport) error {
 		conn.Close()
 
-		return e.connections.Delete(conn.ID)
+		return e.connections.Delete(conn.GetID())
 	})
 
 	errs = append(errs, closeErr)
@@ -130,9 +130,9 @@ func (e *Endpoint) CloseConnection(ids ...string) error {
 // If no IDs are provided, it returns all active connections.
 // If specific IDs are provided, it returns only the connections matching those IDs.
 // Non-existent IDs are silently ignored.
-func (e *Endpoint) GetClients(ids ...string) []*Conn {
+func (e *Endpoint) GetClients(ids ...string) []Transport {
 	if err := e.checkState(); err != nil {
-		return []*Conn{}
+		return []Transport{}
 	}
 	if len(ids) == 0 {
 		clients := e.connections.Values()
@@ -156,7 +156,7 @@ func (e *Endpoint) GetChannelByName(name string) (*Channel, error) {
 	return channel, err
 }
 
-func (e *Endpoint) joinChannel(ev *Event, user *Conn) error {
+func (e *Endpoint) joinChannel(ev *Event, user Transport) error {
 	if err := e.checkState(); err != nil {
 		return err
 	}
@@ -185,19 +185,19 @@ func (e *Endpoint) joinChannel(ev *Event, user *Conn) error {
 		if errors.As(err, &pondErr) {
 			errMsg.Payload = pondErr
 		}
-		_ = user.sendJSON(errMsg)
+		_ = user.SendJSON(errMsg)
 	}
 	return err
 }
 
-func (e *Endpoint) leaveChannel(ev *Event, user *Conn) error {
+func (e *Endpoint) leaveChannel(ev *Event, user Transport) error {
 	if err := e.checkState(); err != nil {
 		return err
 	}
 	currentChannel, err := e.channels.Read(ev.ChannelName)
 
 	if err != nil {
-		_ = user.sendJSON(Event{
+		_ = user.SendJSON(Event{
 			Action:      system,
 			ChannelName: ev.ChannelName,
 			RequestId:   ev.RequestId,
@@ -207,8 +207,8 @@ func (e *Endpoint) leaveChannel(ev *Event, user *Conn) error {
 
 		return err
 	}
-	if err = currentChannel.RemoveUser(user.ID, "explicit_leave"); err != nil {
-		_ = user.sendJSON(Event{
+	if err = currentChannel.RemoveUser(user.GetID(), "explicit_leave"); err != nil {
+		_ = user.SendJSON(Event{
 			Action:      system,
 			ChannelName: ev.ChannelName,
 			RequestId:   ev.RequestId,
@@ -218,7 +218,7 @@ func (e *Endpoint) leaveChannel(ev *Event, user *Conn) error {
 
 		return err
 	}
-	_ = user.sendJSON(Event{
+	_ = user.SendJSON(Event{
 		Action:      system,
 		ChannelName: ev.ChannelName,
 		RequestId:   ev.RequestId,
@@ -229,14 +229,14 @@ func (e *Endpoint) leaveChannel(ev *Event, user *Conn) error {
 	return nil
 }
 
-func (e *Endpoint) broadcastMessage(ev *Event, user *Conn) error {
+func (e *Endpoint) broadcastMessage(ev *Event, user Transport) error {
 	if err := e.checkState(); err != nil {
 		return err
 	}
 	currentChannel, err := e.channels.Read(ev.ChannelName)
 
 	if err != nil {
-		_ = user.sendJSON(Event{
+		_ = user.SendJSON(Event{
 			Action:      system,
 			ChannelName: ev.ChannelName,
 			RequestId:   ev.RequestId,
@@ -246,8 +246,8 @@ func (e *Endpoint) broadcastMessage(ev *Event, user *Conn) error {
 
 		return err
 	}
-	if err = currentChannel.broadcast(user.ID, ev); err != nil {
-		_ = user.sendJSON(Event{
+	if err = currentChannel.broadcast(user.GetID(), ev); err != nil {
+		_ = user.SendJSON(Event{
 			Action:      system,
 			ChannelName: ev.ChannelName,
 			RequestId:   ev.RequestId,
@@ -278,12 +278,12 @@ func (e *Endpoint) notFoundHandler(ctx context.Context, requestID string) FinalH
 			Event:       string(notFoundEvent),
 			Payload:     notFound(request.channel, "No channel handler found for this topic"),
 		}
-		return request.user.sendJSON(message)
+		return request.user.SendJSON(message)
 	}
 }
 
-func (e *Endpoint) handleMessage() eventHandler {
-	return func(ev Event, user *Conn) error {
+func (e *Endpoint) handleMessage() transportEventHandler {
+	return func(ev Event, user Transport) error {
 		if err := e.checkState(); err != nil {
 			return err
 		}
@@ -298,7 +298,7 @@ func (e *Endpoint) handleMessage() eventHandler {
 			return e.broadcastMessage(&ev, user)
 
 		default:
-			_ = user.sendJSON(Event{
+			_ = user.SendJSON(Event{
 				Action:      system,
 				ChannelName: ev.ChannelName,
 				RequestId:   ev.RequestId,
@@ -311,17 +311,17 @@ func (e *Endpoint) handleMessage() eventHandler {
 	}
 }
 
-func (e *Endpoint) handleClose(c *Conn) error {
+func (e *Endpoint) handleClose(c Transport) error {
 	if e.options.Hooks != nil && e.options.Hooks.OnDisconnect != nil {
 		e.options.Hooks.OnDisconnect(c)
 	}
 	if e.options.Hooks != nil && e.options.Hooks.Metrics != nil {
-		e.options.Hooks.Metrics.ConnectionClosed(c.ID, 0)
+		e.options.Hooks.Metrics.ConnectionClosed(c.GetID(), 0)
 	}
-	return e.connections.Delete(c.ID)
+	return e.connections.Delete(c.GetID())
 }
 
-func (e *Endpoint) addConnection(conn *Conn) error {
+func (e *Endpoint) addConnection(conn Transport) error {
 	if err := e.checkState(); err != nil {
 		conn.Close()
 
@@ -347,21 +347,21 @@ func (e *Endpoint) addConnection(conn *Conn) error {
 			return unavailable(string(gatewayEntity), "Maximum connections reached")
 		}
 	}
-	if err := e.connections.Create(conn.ID, conn); err != nil {
+	if err := e.connections.Create(conn.GetID(), conn); err != nil {
 		conn.Close()
 
-		return wrapF(err, "failed to store connection %s", conn.ID)
+		return wrapF(err, "failed to store connection %s", conn.GetID())
 	}
 	if e.options.Hooks != nil && e.options.Hooks.Metrics != nil {
-		e.options.Hooks.Metrics.ConnectionOpened(conn.ID, "endpoint")
+		e.options.Hooks.Metrics.ConnectionOpened(conn.GetID(), "endpoint")
 	}
-	conn.onMessage(e.handleMessage())
+	conn.OnMessage(e.handleMessage())
 
 	conn.OnClose(e.handleClose)
 
-	conn.handleMessages()
+	conn.HandleMessages()
 
-	err := conn.sendJSON(Event{
+	err := conn.SendJSON(Event{
 		Action:      connect,
 		ChannelName: string(gatewayEntity),
 		RequestId:   uuid.NewString(),
@@ -372,12 +372,12 @@ func (e *Endpoint) addConnection(conn *Conn) error {
 	if err != nil {
 		conn.Close()
 
-		_ = e.connections.Delete(conn.ID)
+		_ = e.connections.Delete(conn.GetID())
 
 		if e.options.Hooks != nil && e.options.Hooks.Metrics != nil {
-			e.options.Hooks.Metrics.ConnectionError(conn.ID, err)
+			e.options.Hooks.Metrics.ConnectionError(conn.GetID(), err)
 		}
-		return wrapF(err, "failed to send connection confirmation to %s", conn.ID)
+		return wrapF(err, "failed to send connection confirmation to %s", conn.GetID())
 	}
 	return nil
 }
@@ -388,7 +388,24 @@ func (e *Endpoint) sendMessage(userId string, event Event) error {
 	if err != nil {
 		return notFound(string(gatewayEntity), "User not found").withDetails(map[string]string{"userId": userId})
 	}
-	return userConn.sendJSON(event)
+	return userConn.SendJSON(event)
+}
+
+func (e *Endpoint) pushMessage(connID string, data []byte) error {
+	if err := e.checkState(); err != nil {
+		return err
+	}
+
+	conn, err := e.connections.Read(connID)
+	if err != nil {
+		return notFound(string(gatewayEntity), "Connection not found").withDetails(map[string]string{"connId": connID})
+	}
+
+	if conn.Type() != TransportSSE {
+		return badRequest(string(gatewayEntity), "PushMessage only supported for SSE connections")
+	}
+
+	return conn.PushMessage(data)
 }
 
 func (e *Endpoint) checkState() error {

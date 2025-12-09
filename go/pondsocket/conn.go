@@ -7,9 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/gorilla/websocket"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type eventHandler func(event Event, user *Conn) error
@@ -25,7 +26,7 @@ type Conn struct {
 	closeOnce     sync.Once
 	mutex         sync.RWMutex
 	isClosing     bool
-	closeHandlers *array[func(*Conn) error]
+	closeHandlers *array[func(Transport) error]
 	handler       *eventHandler
 	options       *Options
 	ctx           context.Context
@@ -45,7 +46,7 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 		readDone:      make(chan struct{}),
 		send:          make(chan []byte, options.SendChannelBuffer),
 		receive:       make(chan []byte, options.ReceiveChannelBuffer),
-		closeHandlers: newArray[func(*Conn) error](),
+		closeHandlers: newArray[func(Transport) error](),
 		options:       options,
 	}
 
@@ -112,7 +113,7 @@ func (c *Conn) readPump() {
 			}
 
 			if messageType != websocket.TextMessage {
-				_ = c.sendJSON(errorEvent(badRequest(string(gatewayEntity), "Unsupported message type; expected text frame")))
+				_ = c.SendJSON(errorEvent(badRequest(string(gatewayEntity), "Unsupported message type; expected text frame")))
 
 				continue
 			}
@@ -207,7 +208,7 @@ func (c *Conn) writePump() {
 	}
 }
 
-func (c *Conn) handleMessages() {
+func (c *Conn) HandleMessages() {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -224,7 +225,7 @@ func (c *Conn) handleMessages() {
 
 				var event Event
 				if err := json.Unmarshal(message, &event); err != nil {
-					_ = c.sendJSON(errorEvent(wrapF(err, "failed to unmarshal event from connection %s", c.ID)))
+					_ = c.SendJSON(errorEvent(wrapF(err, "failed to unmarshal event from connection %s", c.ID)))
 					continue
 				}
 
@@ -233,12 +234,12 @@ func (c *Conn) handleMessages() {
 				c.mutex.RUnlock()
 
 				if handler == nil {
-					_ = c.sendJSON(errorEvent(internal(string(gatewayEntity), "no handler registered for connection "+c.ID)))
+					_ = c.SendJSON(errorEvent(internal(string(gatewayEntity), "no handler registered for connection "+c.ID)))
 					continue
 				}
 
 				if !event.Validate() {
-					_ = c.sendJSON(errorEvent(internal(string(gatewayEntity), "invalid event received from connection "+c.ID)))
+					_ = c.SendJSON(errorEvent(internal(string(gatewayEntity), "invalid event received from connection "+c.ID)))
 					continue
 				}
 
@@ -246,7 +247,7 @@ func (c *Conn) handleMessages() {
 					c.reportError("connection_handler", err)
 
 					if ev := errorEvent(err); ev != nil {
-						_ = c.sendJSON(ev)
+						_ = c.SendJSON(ev)
 					}
 				}
 
@@ -259,7 +260,7 @@ func (c *Conn) handleMessages() {
 	}()
 }
 
-func (c *Conn) sendJSON(v interface{}) (err error) {
+func (c *Conn) SendJSON(v interface{}) (err error) {
 	if !c.IsActive() {
 		return internal(string(gatewayEntity), "Connection with id "+c.ID+" is closing")
 	}
@@ -269,7 +270,6 @@ func (c *Conn) sendJSON(v interface{}) (err error) {
 		return wrapF(err, "failed to marshal JSON for connection %s", c.ID)
 	}
 
-	// Recover from panic if send channel is closed during send
 	defer func() {
 		if r := recover(); r != nil {
 			err = internal(string(gatewayEntity), "Connection with id "+c.ID+" is closing")
@@ -285,22 +285,23 @@ func (c *Conn) sendJSON(v interface{}) (err error) {
 
 	case c.send <- data:
 		return nil
-	case <-time.After(5 * time.Second):
+	case <-time.After(c.getSendTimeout()):
 		go c.Close()
 
 		return internal(string(gatewayEntity), "send timeout, connection with id "+c.ID+" is closing")
 	}
 }
 
-func (c *Conn) onMessage(handler eventHandler) {
+func (c *Conn) OnMessage(handler func(Event, Transport) error) {
 	c.mutex.Lock()
-
 	defer c.mutex.Unlock()
-
-	c.handler = &handler
+	wrapped := eventHandler(func(event Event, conn *Conn) error {
+		return handler(event, conn)
+	})
+	c.handler = &wrapped
 }
 
-func (c *Conn) setAssign(key string, value interface{}) {
+func (c *Conn) SetAssign(key string, value interface{}) {
 	c.mutex.Lock()
 
 	defer c.mutex.Unlock()
@@ -328,7 +329,7 @@ func (c *Conn) GetAssign(key string) interface{} {
 // OnClose registers a callback to be executed when the connection closes.
 // Multiple callbacks can be registered and they will be called in the order
 // they were added. Callbacks are executed synchronously during connection cleanup.
-func (c *Conn) OnClose(callback func(conn *Conn) error) {
+func (c *Conn) OnClose(callback func(Transport) error) {
 	c.mutex.Lock()
 
 	defer c.mutex.Unlock()
@@ -365,7 +366,7 @@ func (c *Conn) close(fromReader bool) {
 		c.mutex.Lock()
 
 		c.isClosing = true
-		handlersToRun := make([]func(*Conn) error, len(c.closeHandlers.items))
+		handlersToRun := make([]func(Transport) error, len(c.closeHandlers.items))
 
 		copy(handlersToRun, c.closeHandlers.items)
 
@@ -401,11 +402,7 @@ func (c *Conn) close(fromReader bool) {
 		if fromReader && conn != nil {
 			_ = conn.Close()
 		}
-		// Note: We intentionally do NOT close c.send and c.receive channels here.
-		// The closeChan and ctx.Done() signals in the select statements will
-		// unblock any goroutines waiting on these channels. Closing them here
-		// would cause a race condition with goroutines that may still be sending.
-		// The channels will be garbage collected when the Conn is no longer referenced.
+
 	})
 }
 
@@ -416,7 +413,7 @@ func (c *Conn) reportError(component string, err error) {
 	c.options.Hooks.Metrics.Error(component, err)
 }
 
-func (c *Conn) cloneAssigns() map[string]interface{} {
+func (c *Conn) CloneAssigns() map[string]interface{} {
 	c.mutex.RLock()
 
 	defer c.mutex.RUnlock()
@@ -427,4 +424,33 @@ func (c *Conn) cloneAssigns() map[string]interface{} {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func (c *Conn) GetID() string {
+	return c.ID
+}
+
+func (c *Conn) GetAssigns() map[string]interface{} {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	cloned := make(map[string]interface{}, len(c.assigns))
+	for k, v := range c.assigns {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func (c *Conn) Type() TransportType {
+	return TransportWebSocket
+}
+
+func (c *Conn) PushMessage(_ []byte) error {
+	return badRequest(string(gatewayEntity), "PushMessage not supported for WebSocket transport")
+}
+
+func (c *Conn) getSendTimeout() time.Duration {
+	if c.options != nil && c.options.SendTimeout > 0 {
+		return c.options.SendTimeout
+	}
+	return 5 * time.Second
 }

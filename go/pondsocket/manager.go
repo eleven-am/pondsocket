@@ -6,11 +6,13 @@ package pondsocket
 import (
 	"context"
 	"errors"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
+	"io"
 	"net/http"
 	"regexp"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 type Manager struct {
@@ -36,6 +38,7 @@ func createOriginChecker(opts *Options) func(*http.Request) bool {
 			compiledRegexps = append(compiledRegexps, pattern)
 		}
 	}
+
 	return func(r *http.Request) bool {
 		if !opts.CheckOrigin {
 			return true
@@ -79,6 +82,7 @@ func DefaultOptions() *Options {
 		PingInterval:         30 * time.Second,
 		PongWait:             60 * time.Second,
 		WriteWait:            10 * time.Second,
+		SendTimeout:          5 * time.Second,
 		EnableCompression:    false,
 		SendChannelBuffer:    256,
 		ReceiveChannelBuffer: 256,
@@ -120,11 +124,6 @@ func NewManager(ctx context.Context, options ...Options) *Manager {
 	}
 }
 
-// CreateEndpoint registers a new WebSocket endpoint at the specified path pattern.
-// The path can include parameters (e.g., "/room/:id") and wildcards.
-// The handlerFunc is called for each new connection attempt, allowing custom
-// authentication, validation, and connection setup logic.
-// Returns the created Endpoint which can be used to configure channels and message handling.
 func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler) *Endpoint {
 	select {
 	case <-m.ctx.Done():
@@ -148,23 +147,87 @@ func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler
 		if err != nil {
 			return next()
 		}
-		userId := uuid.NewString()
 
-		connOpts := connectionOptions{
-			request:  request,
-			response: response,
-			endpoint: endpoint,
-			userId:   userId,
-			upgrader: m.upgrader,
-			route:    route,
-			connCtx:  ctx,
+		switch request.Method {
+		case http.MethodGet:
+			return m.handleConnection(ctx, request, response, endpoint, route, handlerFunc)
+
+		case http.MethodPost:
+			return m.handleSSEMessage(request, response, endpoint)
+
+		case http.MethodDelete:
+			return m.handleSSEDisconnect(request, response, endpoint)
+
+		default:
+			return next()
 		}
-		connCtx := newConnectionContext(connOpts)
-
-		return handlerFunc(connCtx)
 	})
 
 	return endpoint
+}
+
+func (m *Manager) handleConnection(ctx context.Context, request *http.Request, response *http.ResponseWriter, endpoint *Endpoint, route *Route, handlerFunc ConnectionEventHandler) error {
+	userId := uuid.NewString()
+
+	connOpts := connectionOptions{
+		request:  request,
+		response: response,
+		endpoint: endpoint,
+		userId:   userId,
+		upgrader: m.upgrader,
+		route:    route,
+		connCtx:  ctx,
+	}
+	connCtx := newConnectionContext(connOpts)
+
+	if err := handlerFunc(connCtx); err != nil {
+		return err
+	}
+
+	if connCtx.sseConn != nil {
+		connCtx.sseConn.Wait()
+	}
+
+	return nil
+}
+
+func (m *Manager) handleSSEMessage(request *http.Request, response *http.ResponseWriter, endpoint *Endpoint) error {
+	connID := request.Header.Get("X-Connection-ID")
+	if connID == "" {
+		http.Error(*response, "X-Connection-ID header required", http.StatusBadRequest)
+		return nil
+	}
+
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		http.Error(*response, "Failed to read request body", http.StatusBadRequest)
+		return nil
+	}
+	defer request.Body.Close()
+
+	if err := endpoint.pushMessage(connID, body); err != nil {
+		http.Error(*response, err.Error(), http.StatusNotFound)
+		return nil
+	}
+
+	(*response).WriteHeader(http.StatusAccepted)
+	return nil
+}
+
+func (m *Manager) handleSSEDisconnect(request *http.Request, response *http.ResponseWriter, endpoint *Endpoint) error {
+	connID := request.Header.Get("X-Connection-ID")
+	if connID == "" {
+		http.Error(*response, "X-Connection-ID header required", http.StatusBadRequest)
+		return nil
+	}
+
+	if err := endpoint.CloseConnection(connID); err != nil {
+		http.Error(*response, err.Error(), http.StatusNotFound)
+		return nil
+	}
+
+	(*response).WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 // HTTPHandler returns an http.HandlerFunc that processes incoming HTTP requests.

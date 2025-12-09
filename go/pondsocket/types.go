@@ -185,11 +185,14 @@ type Options struct {
 	PingInterval         time.Duration
 	PongWait             time.Duration
 	WriteWait            time.Duration
+	SendTimeout          time.Duration
 	EnableCompression    bool
 	MaxConnections       int
 	SendChannelBuffer    int
 	ReceiveChannelBuffer int
 	InternalQueueTimeout time.Duration
+	CORSAllowOrigin      string
+	CORSAllowCredentials bool
 	Hooks                *Hooks
 	PubSub               PubSub
 }

@@ -3,13 +3,14 @@ package pondsocket
 import (
 	"context"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestEndpointCreation(t *testing.T) {
@@ -300,7 +301,7 @@ func TestEndpointGetChannelByName(t *testing.T) {
 			InternalQueueTimeout: 1 * time.Second,
 		}
 		channel := newChannel(ctx, channelOpts)
-		// Store directly in endpoint's channels store
+
 		endpoint.channels.Create("test:room1", channel)
 
 		found, err := endpoint.GetChannelByName("test:room1")
@@ -332,3 +333,99 @@ func TestEndpointCloseConnection(t *testing.T) {
 		}
 	})
 }
+
+func TestEndpointPushMessage(t *testing.T) {
+	t.Run("returns error for non-existent connection", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		err := endpoint.pushMessage("nonexistent", []byte(`{"test": "data"}`))
+		if err == nil {
+			t.Error("expected error for non-existent connection")
+		}
+	})
+
+	t.Run("returns error for WebSocket connection", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		wsConn := &Conn{
+			ID:        "ws-conn",
+			ctx:       ctx,
+			closeChan: make(chan struct{}),
+		}
+		endpoint.connections.Create(wsConn.ID, wsConn)
+
+		err := endpoint.pushMessage("ws-conn", []byte(`{"test": "data"}`))
+		if err == nil {
+			t.Error("expected error for WebSocket connection")
+		}
+	})
+
+	t.Run("pushes message to SSE connection", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		writer := newMockResponseWriter()
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "sse-conn",
+			options:   opts,
+			parentCtx: ctx,
+		}
+		sseConn, _ := newSSEConn(sseOpts)
+		endpoint.connections.Create(sseConn.GetID(), sseConn)
+		defer sseConn.Close()
+
+		sseConn.HandleMessages()
+
+		err := endpoint.pushMessage("sse-conn", []byte(`{"action":"test"}`))
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("returns error when endpoint is shutting down", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		cancel()
+
+		err := endpoint.pushMessage("any-id", []byte(`{"test": "data"}`))
+		if err == nil {
+			t.Error("expected error when endpoint is shutting down")
+		}
+	})
+}
+
+type mockSSEWriter struct {
+	headers    http.Header
+	body       []byte
+	statusCode int
+}
+
+func newMockSSEWriter() *mockSSEWriter {
+	return &mockSSEWriter{
+		headers: make(http.Header),
+	}
+}
+
+func (m *mockSSEWriter) Header() http.Header {
+	return m.headers
+}
+
+func (m *mockSSEWriter) Write(data []byte) (int, error) {
+	m.body = append(m.body, data...)
+	return len(data), nil
+}
+
+func (m *mockSSEWriter) WriteHeader(statusCode int) {
+	m.statusCode = statusCode
+}
+
+func (m *mockSSEWriter) Flush() {}

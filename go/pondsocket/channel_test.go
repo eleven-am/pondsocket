@@ -18,7 +18,7 @@ func createTestConn(id string, assigns map[string]interface{}) *Conn {
 	c := &Conn{
 		ID:            id,
 		assigns:       assigns,
-		closeHandlers: newArray[func(*Conn) error](),
+		closeHandlers: newArray[func(Transport) error](),
 		send:          make(chan []byte, 10),
 		receive:       make(chan []byte, 10),
 		closeChan:     make(chan struct{}),
@@ -438,7 +438,7 @@ func TestChannelEvictUser(t *testing.T) {
 
 		if conn1 != nil {
 			select {
-			case msg := <-conn1.send:
+			case msg := <-conn1.(*Conn).send:
 				if !strings.Contains(string(msg), "evicted") {
 					t.Error("expected eviction message to evicted user")
 				}

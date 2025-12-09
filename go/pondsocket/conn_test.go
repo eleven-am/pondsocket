@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func mockWebSocketServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Server {
@@ -133,7 +134,7 @@ func TestConnSendJSON(t *testing.T) {
 			Event:       "test-event",
 			Payload:     "test-payload",
 		}
-		err := conn.sendJSON(testEvent)
+		err := conn.SendJSON(testEvent)
 
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)
@@ -171,7 +172,7 @@ func TestConnSendJSON(t *testing.T) {
 
 		conn.Close()
 
-		err := conn.sendJSON(Event{})
+		err := conn.SendJSON(Event{})
 
 		if err == nil {
 			t.Error("expected error when sending to closed connection")
@@ -199,9 +200,9 @@ func TestConnAssigns(t *testing.T) {
 	defer conn.Close()
 
 	t.Run("setAssign and GetAssign", func(t *testing.T) {
-		conn.setAssign("key1", "value1")
+		conn.SetAssign("key1", "value1")
 
-		conn.setAssign("key2", 42)
+		conn.SetAssign("key2", 42)
 
 		if conn.GetAssign("key1") != "value1" {
 			t.Errorf("expected value1, got %v", conn.GetAssign("key1"))
@@ -215,9 +216,9 @@ func TestConnAssigns(t *testing.T) {
 	})
 
 	t.Run("cloneAssigns", func(t *testing.T) {
-		conn.setAssign("key3", "value3")
+		conn.SetAssign("key3", "value3")
 
-		cloned := conn.cloneAssigns()
+		cloned := conn.CloneAssigns()
 
 		if cloned["key1"] != "value1" {
 			t.Errorf("expected value1 in clone, got %v", cloned["key1"])
@@ -225,6 +226,23 @@ func TestConnAssigns(t *testing.T) {
 		cloned["key1"] = "modified"
 		if conn.GetAssign("key1") != "value1" {
 			t.Error("modifying clone affected original")
+		}
+	})
+
+	t.Run("getAssigns returns clone not reference", func(t *testing.T) {
+		conn.SetAssign("cloneTest", "original")
+
+		assigns := conn.GetAssigns()
+
+		assigns["cloneTest"] = "modified"
+		assigns["newKey"] = "newValue"
+
+		if conn.GetAssign("cloneTest") != "original" {
+			t.Error("modifying returned map affected original assigns")
+		}
+
+		if conn.GetAssign("newKey") != nil {
+			t.Error("adding to returned map affected original assigns")
 		}
 	})
 }
@@ -261,12 +279,12 @@ func TestConnOnMessage(t *testing.T) {
 
 	defer testConn.Close()
 
-	testConn.onMessage(func(event Event, c *Conn) error {
+	testConn.OnMessage(func(event Event, c Transport) error {
 		messageReceived <- event
 		return nil
 	})
 
-	testConn.handleMessages()
+	testConn.HandleMessages()
 
 	select {
 	case event := <-messageReceived:
@@ -297,7 +315,7 @@ func TestConnOnClose(t *testing.T) {
 
 	testConn, _ := newConn(ctx, wsConn, nil, "test-id", opts)
 
-	testConn.OnClose(func(c *Conn) error {
+	testConn.OnClose(func(c Transport) error {
 		closeCalled <- true
 		return nil
 	})
@@ -339,7 +357,7 @@ func TestConnConcurrentAccess(t *testing.T) {
 
 			key := fmt.Sprintf("key%d", n)
 
-			conn.setAssign(key, n)
+			conn.SetAssign(key, n)
 		}(i)
 	}
 	for i := 0; i < 10; i++ {
@@ -472,7 +490,7 @@ func TestConnWritePump(t *testing.T) {
 			ctx:           ctx,
 			cancel:        func() {},
 			closeChan:     make(chan struct{}),
-			closeHandlers: newArray[func(*Conn) error](),
+			closeHandlers: newArray[func(Transport) error](),
 			options:       opts,
 			isClosing:     false,
 		}
@@ -543,6 +561,42 @@ func TestConnWritePump(t *testing.T) {
 		case <-pingReceived:
 		case <-time.After(200 * time.Millisecond):
 			t.Error("timeout waiting for ping message")
+		}
+	})
+}
+
+func TestConnSendTimeoutOption(t *testing.T) {
+	t.Run("uses configured SendTimeout", func(t *testing.T) {
+		server := mockWebSocketServer(t, func(serverConn *websocket.Conn) {
+			time.Sleep(100 * time.Millisecond)
+		})
+
+		defer server.Close()
+
+		wsConn := createClientConn(t, server.URL)
+
+		defer wsConn.Close()
+
+		ctx := context.Background()
+
+		opts := DefaultOptions()
+		opts.SendTimeout = 200 * time.Millisecond
+
+		conn, err := newConn(ctx, wsConn, nil, "test-id", opts)
+		if err != nil {
+			t.Fatalf("failed to create connection: %v", err)
+		}
+		defer conn.Close()
+
+		if conn.options.SendTimeout != 200*time.Millisecond {
+			t.Errorf("expected SendTimeout 200ms, got %v", conn.options.SendTimeout)
+		}
+	})
+
+	t.Run("default SendTimeout is 5 seconds", func(t *testing.T) {
+		opts := DefaultOptions()
+		if opts.SendTimeout != 5*time.Second {
+			t.Errorf("expected default SendTimeout 5s, got %v", opts.SendTimeout)
 		}
 	})
 }

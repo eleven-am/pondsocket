@@ -6,8 +6,9 @@ package pondsocket
 import (
 	"encoding/json"
 	"errors"
-	"github.com/google/uuid"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 type presenceClient struct {

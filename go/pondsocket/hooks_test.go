@@ -96,8 +96,8 @@ func TestWithRateLimiter(t *testing.T) {
 			RateLimiter: mockRL,
 		}
 
-		keyFunc := func(conn *Conn) string {
-			return conn.ID
+		keyFunc := func(conn Transport) string {
+			return conn.GetID()
 		}
 
 		middleware := WithRateLimiter(hooks, keyFunc)
@@ -145,8 +145,8 @@ func TestWithRateLimiter(t *testing.T) {
 			Metrics:     mockMetrics,
 		}
 
-		keyFunc := func(conn *Conn) string {
-			return conn.ID
+		keyFunc := func(conn Transport) string {
+			return conn.GetID()
 		}
 
 		middleware := WithRateLimiter(hooks, keyFunc)
@@ -205,8 +205,8 @@ func TestWithRateLimiter(t *testing.T) {
 			RateLimiter: mockRL,
 		}
 
-		keyFunc := func(conn *Conn) string {
-			return conn.ID
+		keyFunc := func(conn Transport) string {
+			return conn.GetID()
 		}
 
 		middleware := WithRateLimiter(hooks, keyFunc)
@@ -230,7 +230,7 @@ func TestWithRateLimiter(t *testing.T) {
 	})
 
 	t.Run("proceeds when no rate limiter configured", func(t *testing.T) {
-		middleware := WithRateLimiter(nil, func(conn *Conn) string { return conn.ID })
+		middleware := WithRateLimiter(nil, func(conn Transport) string { return conn.GetID() })
 
 		ctx := context.Background()
 		event := &Event{}
@@ -255,7 +255,7 @@ func TestWithRateLimiter(t *testing.T) {
 			RateLimiter: &mockRateLimiter{},
 		}
 
-		middleware := WithRateLimiter(hooks, func(conn *Conn) string { return conn.ID })
+		middleware := WithRateLimiter(hooks, func(conn Transport) string { return conn.GetID() })
 
 		ctx := context.Background()
 		event := &Event{}
@@ -439,11 +439,11 @@ func TestHooksStructure(t *testing.T) {
 			RateLimiter:        &mockRateLimiter{},
 			ChannelRateLimiter: &mockRateLimiter{},
 			Metrics:            &mockMetricsCollector{},
-			OnConnect: func(conn *Conn) error {
+			OnConnect: func(conn Transport) error {
 				connectCalled = true
 				return nil
 			},
-			OnDisconnect: func(conn *Conn) {
+			OnDisconnect: func(conn Transport) {
 				disconnectCalled = true
 			},
 			BeforeJoin: func(user *User, channel string) error {

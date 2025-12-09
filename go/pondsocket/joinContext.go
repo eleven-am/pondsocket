@@ -12,14 +12,14 @@ type JoinContext struct {
 	Channel      *Channel
 	Route        *Route
 	HasResponded bool
-	conn         *Conn
+	conn         Transport
 	event        *Event
 	ctx          context.Context
 	accepted     bool
 	err          error
 }
 
-func newJoinContext(ctx context.Context, channel *Channel, route *Route, user *Conn, ev *Event) *JoinContext {
+func newJoinContext(ctx context.Context, channel *Channel, route *Route, user Transport, ev *Event) *JoinContext {
 	select {
 	case <-ctx.Done():
 		return &JoinContext{
@@ -71,7 +71,7 @@ func (c *JoinContext) Accept() *JoinContext {
 	c.HasResponded = true
 	c.accepted = true
 	if err := c.Channel.addUser(c.conn); err != nil {
-		c.err = wrapF(err, "failed to add user %s to Channel %s", c.conn.ID, c.Channel.name)
+		c.err = wrapF(err, "failed to add user %s to Channel %s", c.conn.GetID(), c.Channel.name)
 		return c
 	}
 
@@ -83,7 +83,7 @@ func (c *JoinContext) Accept() *JoinContext {
 		Payload:     make(map[string]interface{}),
 	}
 
-	recp := recipients{userIds: []string{c.conn.ID}}
+	recp := recipients{userIds: []string{c.conn.GetID()}}
 	if err := c.Channel.sendMessage(string(channelEntity), recp, ackEvent); err != nil {
 		c.err = wrapF(err, "failed to send join acknowledgment for Channel %s", c.Channel.name)
 	}
@@ -114,7 +114,7 @@ func (c *JoinContext) Decline(statusCode int, message string) error {
 				"statusCode": statusCode,
 			}),
 	}
-	return c.conn.sendJSON(declineEvent)
+	return c.conn.SendJSON(declineEvent)
 }
 
 // Reply sends a system event to the joining user after accepting their join request.
@@ -139,7 +139,7 @@ func (c *JoinContext) Reply(e string, payload interface{}) *JoinContext {
 		Payload:     payload,
 	}
 
-	recp := recipients{userIds: []string{c.conn.ID}}
+	recp := recipients{userIds: []string{c.conn.GetID()}}
 	if err := c.Channel.sendMessage(string(channelEntity), recp, replyEvent); err != nil {
 		c.err = wrapF(err, "failed to send reply message '%s' for Channel %s", e, c.Channel.name)
 	}
@@ -157,12 +157,12 @@ func (c *JoinContext) SetAssigns(key string, value interface{}) *JoinContext {
 		return c
 	}
 	if !c.accepted {
-		c.conn.setAssign(key, value)
+		c.conn.SetAssign(key, value)
 	} else {
-		err := c.Channel.UpdateAssigns(c.conn.ID, key, value)
+		err := c.Channel.UpdateAssigns(c.conn.GetID(), key, value)
 
 		if err != nil {
-			c.err = wrapF(err, "error setting assign '%s' for user %s", key, c.conn.ID)
+			c.err = wrapF(err, "error setting assign '%s' for user %s", key, c.conn.GetID())
 		}
 	}
 	return c
@@ -205,12 +205,12 @@ func (c *JoinContext) GetAssigns(key string) interface{} {
 	if !c.accepted {
 		value = c.conn.GetAssign(key)
 	} else {
-		assignValue, err := c.Channel.getUserAssigns(c.conn.ID, key)
+		assignValue, err := c.Channel.getUserAssigns(c.conn.GetID(), key)
 
 		if err != nil {
 			var pondErr *Error
 			if !errors.As(err, &pondErr) || pondErr.Code != StatusNotFound {
-				c.err = wrapF(err, "failed to get assign '%s' for user %s", key, c.conn.ID)
+				c.err = wrapF(err, "failed to get assign '%s' for user %s", key, c.conn.GetID())
 			}
 		}
 		value = assignValue
@@ -269,8 +269,8 @@ func (c *JoinContext) BroadcastFrom(e string, payload interface{}) *JoinContext 
 
 		return c
 	}
-	if err := c.Channel.BroadcastFrom(e, payload, c.conn.ID); err != nil {
-		c.err = wrapF(err, "error broadcasting event %s to all users except %s", e, c.conn.ID)
+	if err := c.Channel.BroadcastFrom(e, payload, c.conn.GetID()); err != nil {
+		c.err = wrapF(err, "error broadcasting event %s to all users except %s", e, c.conn.GetID())
 	}
 	return c
 }
@@ -288,8 +288,8 @@ func (c *JoinContext) Track(presence interface{}) *JoinContext {
 
 		return c
 	}
-	if err := c.Channel.Track(c.conn.ID, presence); err != nil {
-		c.err = wrapF(err, "error tracking presence for user %s", c.conn.ID)
+	if err := c.Channel.Track(c.conn.GetID(), presence); err != nil {
+		c.err = wrapF(err, "error tracking presence for user %s", c.conn.GetID())
 	}
 	return c
 }
@@ -370,8 +370,8 @@ func (c *JoinContext) GetAllAssigns() map[string]map[string]interface{} {
 // If called after Accept, returns full user info including channel-specific data.
 func (c *JoinContext) GetUser() *User {
 	user := &User{
-		UserID:   c.conn.ID,
-		Assigns:  c.conn.assigns,
+		UserID:   c.conn.GetID(),
+		Assigns:  c.conn.GetAssigns(),
 		Presence: nil,
 	}
 
@@ -383,10 +383,10 @@ func (c *JoinContext) GetUser() *User {
 		return user
 	}
 
-	newUser, err := c.Channel.GetUser(c.conn.ID)
+	newUser, err := c.Channel.GetUser(c.conn.GetID())
 
 	if err != nil {
-		c.err = wrapF(err, "error getting user %s from Channel %s", c.conn.ID, c.Channel.name)
+		c.err = wrapF(err, "error getting user %s from Channel %s", c.conn.GetID(), c.Channel.name)
 
 		return user
 	}

@@ -31,7 +31,7 @@ type Channel struct {
 	leave                       *LeaveHandler
 	store                       *store[map[string]interface{}]
 	channel                     chan internalEvent
-	connections                 *store[*Conn]
+	connections                 *store[Transport]
 	middleware                  *middleware[*messageEvent, *Channel]
 	outgoing                    *middleware[*OutgoingContext, interface{}]
 	onDestroy                   func() error
@@ -55,7 +55,7 @@ func newChannel(ctx context.Context, options options) *Channel {
 		name:                    options.Name,
 		store:                   newStore[map[string]interface{}](),
 		outgoing:                options.Outgoing,
-		connections:             newStore[*Conn](),
+		connections:             newStore[Transport](),
 		channel:                 make(chan internalEvent, 128),
 		middleware:              options.Middleware,
 		leave:                   options.Leave,
@@ -531,7 +531,7 @@ func (c *Channel) Close() error {
 	return combine(errs...)
 }
 
-func (c *Channel) addUser(user *Conn) error {
+func (c *Channel) addUser(user Transport) error {
 	c.mutex.Lock()
 
 	defer c.mutex.Unlock()
@@ -539,23 +539,23 @@ func (c *Channel) addUser(user *Conn) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
-	assignsToAdd := user.cloneAssigns()
+	assignsToAdd := user.CloneAssigns()
 
 	if assignsToAdd == nil {
 		assignsToAdd = make(map[string]interface{})
 	}
-	errAssigns := c.store.Create(user.ID, assignsToAdd)
+	errAssigns := c.store.Create(user.GetID(), assignsToAdd)
 
-	errConn := c.connections.Create(user.ID, user)
+	errConn := c.connections.Create(user.GetID(), user)
 
 	combinedErr := combine(errAssigns, errConn)
 
 	if combinedErr != nil {
-		_ = c.store.Delete(user.ID)
+		_ = c.store.Delete(user.GetID())
 
-		_ = c.connections.Delete(user.ID)
+		_ = c.connections.Delete(user.GetID())
 
-		return wrapF(combinedErr, "failed to add user %s, already exists or other error", user.ID)
+		return wrapF(combinedErr, "failed to add user %s, already exists or other error", user.GetID())
 	}
 	user.OnClose(c.onConnectionClose)
 
@@ -697,7 +697,7 @@ func (c *Channel) onMessage(event *internalEvent) error {
 	}
 
 	var deliveryErrors error
-	connectionsToSend.forEach(func(conn *Conn) {
+	connectionsToSend.forEach(func(conn Transport) {
 		select {
 		case <-c.ctx.Done():
 			deliveryErrors = addError(deliveryErrors, c.ctx.Err())
@@ -742,11 +742,11 @@ func (c *Channel) getUserUnsafe(userID string) (*User, error) {
 	}, nil
 }
 
-func (c *Channel) onConnectionClose(user *Conn) error {
+func (c *Channel) onConnectionClose(user Transport) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
-	return c.RemoveUser(user.ID, "connection_closed")
+	return c.RemoveUser(user.GetID(), "connection_closed")
 }
 
 func (c *Channel) getUserAssigns(userID, key string) (interface{}, error) {
@@ -814,14 +814,14 @@ func (c *Channel) reportError(component string, err error) {
 	c.hooks.Metrics.Error(component, err)
 }
 
-func (c *Channel) processOutgoing(event *Event, conn *Conn) error {
+func (c *Channel) processOutgoing(event *Event, conn Transport) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
-	user, err := c.GetUser(conn.ID)
+	user, err := c.GetUser(conn.GetID())
 
 	if err != nil {
-		return wrapF(err, "failed to get user data for connection %s", conn.ID)
+		return wrapF(err, "failed to get user data for connection %s", conn.GetID())
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, c.internalQueueTimeout)
 
