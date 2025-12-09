@@ -18,7 +18,7 @@ import {
     uuid,
 } from '@eleven-am/pondsocket-common';
 
-import { ClientMessage, Publisher } from '../types';
+import { ClientMessage, ConnectionState, Publisher } from '../types';
 
 export class Channel<EventMap extends PondEventMap = PondEventMap> {
     readonly #name: string;
@@ -35,11 +35,11 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
 
     readonly #receiver: Subject<ChannelEvent>;
 
-    readonly #clientState: BehaviorSubject<boolean>;
+    readonly #clientState: BehaviorSubject<ConnectionState>;
 
     readonly #joinState: BehaviorSubject<ChannelState>;
 
-    constructor (publisher: Publisher, clientState: BehaviorSubject<boolean>, name: string, params: JoinParams) {
+    constructor (publisher: Publisher, clientState: BehaviorSubject<ConnectionState>, name: string, params: JoinParams) {
         this.#name = name;
         this.#queue = [];
         this.#presence = [];
@@ -94,11 +94,11 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
         }
 
         this.#joinState.publish(ChannelState.JOINING);
-        if (this.#clientState.value) {
+        if (this.#clientState.value === ConnectionState.CONNECTED) {
             this.#publisher(message);
         } else {
             const unsubscribe = this.#clientState.subscribe((state) => {
-                if (state) {
+                if (state === ConnectionState.CONNECTED) {
                     unsubscribe();
 
                     if (this.#joinState.value === ChannelState.JOINING) {
@@ -275,7 +275,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
         });
 
         const unsubStateChange = this.#clientState.subscribe((state) => {
-            if (state && this.#joinState.value === ChannelState.STALLED) {
+            if (state === ConnectionState.CONNECTED && this.#joinState.value === ChannelState.STALLED) {
                 const message: ClientMessage = {
                     action: ClientActions.JOIN_CHANNEL,
                     event: ClientActions.JOIN_CHANNEL,
@@ -285,7 +285,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
                 };
 
                 this.#publisher(message);
-            } else if (!state && this.#joinState.value === ChannelState.JOINED) {
+            } else if (state !== ConnectionState.CONNECTED && this.#joinState.value === ChannelState.JOINED) {
                 this.#joinState.publish(ChannelState.STALLED);
             }
         });

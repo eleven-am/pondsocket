@@ -1,11 +1,18 @@
 import { ChannelEvent, ClientActions, Events, ServerActions } from '@eleven-am/pondsocket-common';
 
 import { PondClient } from './client';
+import { ConnectionState } from '../types';
 
 class MockWebSocket {
+    static CONNECTING = 0;
+
+    static OPEN = 1;
+
     send: Function = jest.fn();
 
     close: Function = jest.fn();
+
+    readyState = MockWebSocket.CONNECTING;
 
     // eslint-disable-next-line no-useless-constructor
     constructor (readonly url: string) {}
@@ -76,13 +83,15 @@ describe('PondClient', () => {
     });
 
     test('socket should only pass to publish state when acknowledged event is received', () => {
-        pondClient.connect();
-        const mockWebSocket = pondClient['_socket'];
         const mockCallback = jest.fn();
 
         pondClient.onConnectionChange(mockCallback);
+        mockCallback.mockClear();
 
-        expect(mockCallback).not.toHaveBeenCalled();
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket'];
+
+        expect(mockCallback).toHaveBeenCalledWith(ConnectionState.CONNECTING);
 
         const acknowledgeEvent: ChannelEvent = {
             event: Events.CONNECTION,
@@ -93,7 +102,7 @@ describe('PondClient', () => {
         };
 
         mockWebSocket.onmessage({ data: JSON.stringify(acknowledgeEvent) });
-        expect(mockCallback).toHaveBeenCalledWith(true);
+        expect(mockCallback).toHaveBeenCalledWith(ConnectionState.CONNECTED);
     });
 
     test('createChannel method should create a new channel or return an existing one', () => {
@@ -109,13 +118,15 @@ describe('PondClient', () => {
         const mockCallback = jest.fn();
         const unsubscribe = pondClient.onConnectionChange(mockCallback);
 
-        pondClient['_connectionState'].publish(true);
+        mockCallback.mockClear();
 
-        expect(mockCallback).toHaveBeenCalledWith(true);
+        pondClient['_connectionState'].publish(ConnectionState.CONNECTED);
+
+        expect(mockCallback).toHaveBeenCalledWith(ConnectionState.CONNECTED);
 
         unsubscribe();
 
-        pondClient['_connectionState'].publish(false);
+        pondClient['_connectionState'].publish(ConnectionState.DISCONNECTED);
 
         // Should not be called again after unsubscribe
         expect(mockCallback).toHaveBeenCalledTimes(1);
@@ -124,13 +135,13 @@ describe('PondClient', () => {
     test('getState method should return the current state of the socket', () => {
         const initialState = pondClient.getState();
 
-        expect(initialState).toBe(false);
+        expect(initialState).toBe(ConnectionState.DISCONNECTED);
 
-        pondClient['_connectionState'].publish(true);
+        pondClient['_connectionState'].publish(ConnectionState.CONNECTED);
 
         const updatedState = pondClient.getState();
 
-        expect(updatedState).toBe(true);
+        expect(updatedState).toBe(ConnectionState.CONNECTED);
     });
 
     test('publish method should send a message to the server', () => {
@@ -166,7 +177,7 @@ describe('PondClient', () => {
         );
     });
 
-    it('onError method should reconnect to the server', async () => {
+    it('should reconnect with exponential backoff', async () => {
         const connectSpy = jest.spyOn(pondClient, 'connect');
 
         pondClient.connect();
@@ -185,5 +196,90 @@ describe('PondClient', () => {
 
         await new Promise((resolve) => setTimeout(resolve, 2000));
         expect(connectSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('onError method should subscribe to error events', () => {
+        const errorCallback = jest.fn();
+
+        pondClient.onError(errorCallback);
+        pondClient.connect();
+
+        const mockWebSocket = pondClient['_socket'];
+
+        mockWebSocket.onerror({ type: 'error' });
+
+        expect(errorCallback).toHaveBeenCalledTimes(1);
+        expect(errorCallback).toHaveBeenCalledWith(expect.any(Error));
+    });
+
+    test('connect should transition through connection states', () => {
+        const stateCallback = jest.fn();
+
+        pondClient.onConnectionChange(stateCallback);
+
+        expect(pondClient.getState()).toBe(ConnectionState.DISCONNECTED);
+
+        pondClient.connect();
+
+        expect(stateCallback).toHaveBeenCalledWith(ConnectionState.CONNECTING);
+    });
+
+    test('connection timeout should trigger error and close', async () => {
+        jest.useFakeTimers();
+        const clientWithTimeout = new PondClient('ws://example.com', {}, { connectionTimeout: 5000 });
+        const errorCallback = jest.fn();
+
+        clientWithTimeout.onError(errorCallback);
+        clientWithTimeout.connect();
+
+        const mockWebSocket = clientWithTimeout['_socket'];
+
+        mockWebSocket.readyState = MockWebSocket.CONNECTING;
+
+        jest.advanceTimersByTime(5000);
+
+        expect(errorCallback).toHaveBeenCalledWith(expect.objectContaining({ message: 'Connection timeout' }));
+        expect(mockWebSocket.close).toHaveBeenCalled();
+
+        jest.useRealTimers();
+    });
+
+    test('ping interval should send ping messages when connected', async () => {
+        jest.useFakeTimers();
+        const clientWithPing = new PondClient('ws://example.com', {}, { pingInterval: 1000 });
+
+        clientWithPing.connect();
+
+        const mockWebSocket = clientWithPing['_socket'];
+
+        mockWebSocket.readyState = MockWebSocket.OPEN;
+
+        mockWebSocket.onopen();
+
+        jest.advanceTimersByTime(1000);
+
+        expect(mockWebSocket.send).toHaveBeenCalledWith(JSON.stringify({ action: 'ping' }));
+
+        jest.advanceTimersByTime(1000);
+
+        expect(mockWebSocket.send).toHaveBeenCalledTimes(2);
+
+        jest.useRealTimers();
+    });
+
+    test('disconnect should clear timeouts and stop reconnection', () => {
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket'];
+
+        pondClient.disconnect();
+
+        expect(pondClient.getState()).toBe(ConnectionState.DISCONNECTED);
+        expect(mockWebSocket.close).toHaveBeenCalled();
+
+        const connectSpy = jest.spyOn(pondClient, 'connect');
+
+        mockWebSocket.onclose();
+
+        expect(connectSpy).not.toHaveBeenCalled();
     });
 });

@@ -10,11 +10,11 @@ import {
 } from '@eleven-am/pondsocket-common';
 
 import { Channel } from './channel';
-import { ClientMessage } from '../types';
+import { ClientMessage, ConnectionState } from '../types';
 
 const createChannel = (params: JoinParams = {}) => {
     const publisher = jest.fn();
-    const state = new BehaviorSubject<boolean>(true);
+    const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
     const receiver = new Subject<ChannelEvent>();
 
     const channel = new Channel(
@@ -40,14 +40,14 @@ describe('Channel', () => {
         expect(channel.channelState).toBe(ChannelState.IDLE);
 
         // if the socket is not connected the channel should not post a join message
-        state.publish(false);
+        state.publish(ConnectionState.DISCONNECTED);
         channel.join();
 
         expect(publisher).not.toHaveBeenCalled();
         expect(channel.channelState).toBe(ChannelState.JOINING);
 
         // once the socket is connected, the channel should attempt to join
-        state.publish(true);
+        state.publish(ConnectionState.CONNECTED);
         expect(channel.channelState).toBe(ChannelState.JOINING);
         expect(publisher).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -63,12 +63,12 @@ describe('Channel', () => {
         expect(channel.channelState).toBe(ChannelState.JOINED);
 
         // if the socket is disconnected, the channel should be stalled
-        state.publish(false);
+        state.publish(ConnectionState.DISCONNECTED);
         expect(channel.channelState).toBe(ChannelState.STALLED);
 
         // once the socket is reconnected, a join message should be sent
         publisher.mockClear();
-        state.publish(true);
+        state.publish(ConnectionState.CONNECTED);
         expect(channel.channelState).toBe(ChannelState.STALLED);
         expect(publisher).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -89,21 +89,21 @@ describe('Channel', () => {
         publisher.mockClear();
 
         // if the socket closes, while the channel is closed, the channel should not attempt to join when the socket reconnects
-        state.publish(false);
-        state.publish(true);
+        state.publish(ConnectionState.DISCONNECTED);
+        state.publish(ConnectionState.CONNECTED);
         expect(publisher).not.toHaveBeenCalled();
 
         // if the channel is closed, during a join process, the channel should not attempt to join when the socket reconnects
         const { channel: channel2, publisher: publisher2, state: state2 } = createChannel();
 
-        state2.publish(false);
+        state2.publish(ConnectionState.DISCONNECTED);
         channel2.join();
 
         expect(publisher2).not.toHaveBeenCalled();
         expect(channel2.channelState).toBe(ChannelState.JOINING);
 
         channel2.leave();
-        state2.publish(true);
+        state2.publish(ConnectionState.CONNECTED);
         expect(publisher2).not.toHaveBeenCalled();
 
         // if for some reason the server responds with an ack, the channel should still join, (The server is the source of truth)
@@ -127,7 +127,7 @@ describe('Channel', () => {
         channel.acknowledge(receiver);
         expect(stateListener).toHaveBeenCalledWith(ChannelState.JOINED);
 
-        state.publish(false);
+        state.publish(ConnectionState.DISCONNECTED);
         expect(stateListener).toHaveBeenCalledWith(ChannelState.STALLED);
 
         channel.leave();
@@ -166,8 +166,8 @@ describe('Channel', () => {
         publisher.mockClear();
 
         // if the channel stalls and rejoins the previous message should not be sent again
-        state.publish(false);
-        state.publish(true);
+        state.publish(ConnectionState.DISCONNECTED);
+        state.publish(ConnectionState.CONNECTED);
 
         // acknowledge the join
         channel.acknowledge(receiver);
@@ -186,14 +186,14 @@ describe('Channel', () => {
 
         publisher.mockClear();
         // if a message is sent while the channel is stalled, it should be queued
-        state.publish(false);
+        state.publish(ConnectionState.DISCONNECTED);
 
         channel.sendMessage('test', {
             test: 'test stalling',
         });
 
         expect(publisher).not.toHaveBeenCalled();
-        state.publish(true);
+        state.publish(ConnectionState.CONNECTED);
         publisher.mockClear(); // The join message
 
         // acknowledge the join
@@ -629,7 +629,7 @@ describe('Channel', () => {
 
         expect(presenceListener).not.toHaveBeenCalled();
         // if the channel is stalled, the presence event should not be sent to the listener
-        state.publish(false);
+        state.publish(ConnectionState.DISCONNECTED);
         expect(channel.channelState).toBe(ChannelState.STALLED);
 
         receiver.publish({
@@ -656,7 +656,7 @@ describe('Channel', () => {
         });
 
         expect(presenceListener).not.toHaveBeenCalled();
-        state.publish(true);
+        state.publish(ConnectionState.CONNECTED);
         expect(channel.channelState).toBe(ChannelState.STALLED);
 
         receiver.publish({
@@ -827,7 +827,7 @@ describe('Channel', () => {
     });
 
     it('should be able to wait for a message', async () => {
-        const state = new BehaviorSubject<boolean>(true);
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
         const receiver = new Subject<ChannelEvent>();
         const params = {};
 

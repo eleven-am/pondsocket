@@ -10,6 +10,22 @@ import {
     Unsubscribe,
 } from '@eleven-am/pondsocket-common';
 
+declare enum ConnectionState {
+    DISCONNECTED = 'DISCONNECTED',
+    CONNECTING = 'CONNECTING',
+    CONNECTED = 'CONNECTED',
+}
+
+interface ClientOptions {
+    connectionTimeout?: number;
+    maxReconnectDelay?: number;
+    pingInterval?: number;
+}
+
+interface SSEClientOptions extends ClientOptions {
+    withCredentials?: boolean;
+}
+
 declare class Channel<EventMap extends PondEventMap = PondEventMap, Presence extends PondPresence = PondPresence> {
     /**
      * @desc The current connection state of the channel.
@@ -90,7 +106,7 @@ declare class Channel<EventMap extends PondEventMap = PondEventMap, Presence ext
 }
 
 declare class PondClient {
-    constructor (endpoint: string, params?: Record<string, any>);
+    constructor (endpoint: string, params?: Record<string, any>, options?: ClientOptions);
 
     /**
      * @desc Connects to the server and returns the socket.
@@ -100,7 +116,7 @@ declare class PondClient {
     /**
      * @desc Returns the current state of the socket.
      */
-    getState (): boolean;
+    getState (): ConnectionState;
 
     /**
      * @desc Disconnects the socket.
@@ -118,5 +134,54 @@ declare class PondClient {
      * @desc Subscribes to the connection state.
      * @param callback - The callback to call when the state changes.
      */
-    onConnectionChange (callback: (state: boolean) => void): Unsubscribe;
+    onConnectionChange (callback: (state: ConnectionState) => void): Unsubscribe;
+
+    /**
+     * @desc Subscribes to error events.
+     * @param callback - The callback to call when an error occurs.
+     */
+    onError (callback: (error: Error) => void): Unsubscribe;
+}
+
+declare class SSEClient {
+    constructor (endpoint: string, params?: Record<string, any>, options?: SSEClientOptions);
+
+    /**
+     * @desc Connects to the server using Server-Sent Events.
+     */
+    connect (): void;
+
+    /**
+     * @desc Returns the current state of the connection.
+     */
+    getState (): ConnectionState;
+
+    /**
+     * @desc Returns the connection ID assigned by the server.
+     */
+    getConnectionId (): string | undefined;
+
+    /**
+     * @desc Disconnects the SSE connection.
+     */
+    disconnect (): void;
+
+    /**
+     * @desc Creates a channel with the given name and params.
+     * @param name - The name of the channel.
+     * @param params - The params to send to the server.
+     */
+    createChannel<EventType extends PondEventMap = PondEventMap, Presence extends PondPresence = PondPresence> (name: string, params?: JoinParams): Channel<EventType, Presence>;
+
+    /**
+     * @desc Subscribes to the connection state.
+     * @param callback - The callback to call when the state changes.
+     */
+    onConnectionChange (callback: (state: ConnectionState) => void): Unsubscribe;
+
+    /**
+     * @desc Subscribes to error events.
+     * @param callback - The callback to call when an error occurs.
+     */
+    onError (callback: (error: Error) => void): Unsubscribe;
 }

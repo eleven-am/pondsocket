@@ -366,7 +366,9 @@ func (e *Endpoint) addConnection(conn Transport) error {
 		ChannelName: string(gatewayEntity),
 		RequestId:   uuid.NewString(),
 		Event:       string(connectionEvent),
-		Payload:     make(map[string]interface{}),
+		Payload: map[string]interface{}{
+			"connectionId": conn.GetID(),
+		},
 	})
 
 	if err != nil {

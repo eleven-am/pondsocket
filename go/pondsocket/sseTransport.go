@@ -68,9 +68,11 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 	opts.writer.Header().Set("Cache-Control", "no-cache")
 	opts.writer.Header().Set("Connection", "keep-alive")
 	opts.writer.Header().Set("X-Accel-Buffering", "no")
+	opts.writer.Header().Set("X-Connection-ID", opts.id)
 
 	if opts.options != nil && opts.options.CORSAllowOrigin != "" {
 		opts.writer.Header().Set("Access-Control-Allow-Origin", opts.options.CORSAllowOrigin)
+		opts.writer.Header().Set("Access-Control-Expose-Headers", "X-Connection-ID")
 		if opts.options.CORSAllowCredentials {
 			opts.writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		}

@@ -16,20 +16,26 @@ import { ClientMessage, ClientOptions, ConnectionState } from '../types';
 const DEFAULT_CONNECTION_TIMEOUT = 10000;
 const DEFAULT_MAX_RECONNECT_DELAY = 30000;
 
-export class PondClient {
+export interface SSEClientOptions extends ClientOptions {
+    withCredentials?: boolean;
+}
+
+export class SSEClient {
     protected readonly _address: URL;
 
-    protected readonly _options: Required<Omit<ClientOptions, 'pingInterval'>> & Pick<ClientOptions, 'pingInterval'>;
+    protected readonly _postAddress: URL;
+
+    protected readonly _options: Required<Omit<SSEClientOptions, 'pingInterval' | 'withCredentials'>> & Pick<SSEClientOptions, 'pingInterval' | 'withCredentials'>;
 
     protected _disconnecting: boolean;
 
-    protected _socket: WebSocket | any | undefined;
+    protected _eventSource: EventSource | undefined;
+
+    protected _connectionId: string | undefined;
 
     protected _reconnectAttempts: number;
 
     protected _connectionTimeoutId: ReturnType<typeof setTimeout> | undefined;
-
-    protected _pingIntervalId: ReturnType<typeof setInterval> | undefined;
 
     protected readonly _broadcaster: Subject<ChannelEvent>;
 
@@ -39,7 +45,7 @@ export class PondClient {
 
     #channels: Map<string, Channel>;
 
-    constructor (endpoint: string, params: Record<string, any> = {}, options: ClientOptions = {}) {
+    constructor (endpoint: string, params: Record<string, any> = {}, options: SSEClientOptions = {}) {
         let address: URL;
 
         try {
@@ -54,17 +60,18 @@ export class PondClient {
         const query = new URLSearchParams(params);
 
         address.search = query.toString();
-        const protocol = address.protocol === 'https:' ? 'wss:' : 'ws:';
 
-        if (address.protocol !== 'wss:' && address.protocol !== 'ws:') {
-            address.protocol = protocol;
+        if (address.protocol !== 'https:' && address.protocol !== 'http:') {
+            address.protocol = window.location.protocol;
         }
 
         this._address = address;
+        this._postAddress = new URL(address.toString());
         this._options = {
             connectionTimeout: options.connectionTimeout ?? DEFAULT_CONNECTION_TIMEOUT,
             maxReconnectDelay: options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY,
             pingInterval: options.pingInterval,
+            withCredentials: options.withCredentials,
         };
         this.#channels = new Map();
 
@@ -74,59 +81,39 @@ export class PondClient {
         this.#init();
     }
 
-    /**
-     * @desc Connects to the server and returns the socket.
-     */
     public connect () {
         this._disconnecting = false;
         this._connectionState.publish(ConnectionState.CONNECTING);
 
-        const socket = new WebSocket(this._address.toString());
+        const eventSource = new EventSource(this._address.toString(), {
+            withCredentials: this._options.withCredentials ?? false,
+        });
 
         this._connectionTimeoutId = setTimeout(() => {
-            if (socket.readyState === WebSocket.CONNECTING) {
+            if (eventSource.readyState === EventSource.CONNECTING) {
                 const error = new Error('Connection timeout');
 
                 this._errorSubject.publish(error);
-                socket.close();
+                eventSource.close();
             }
         }, this._options.connectionTimeout);
 
-        socket.onopen = () => {
-            this.#clearTimeouts();
+        eventSource.onopen = () => {
+            this.#clearTimeout();
             this._reconnectAttempts = 0;
-
-            if (this._options.pingInterval) {
-                this._pingIntervalId = setInterval(() => {
-                    if (socket.readyState === WebSocket.OPEN) {
-                        socket.send(JSON.stringify({ action: 'ping' }));
-                    }
-                }, this._options.pingInterval);
-            }
         };
 
-        socket.onmessage = (message) => {
-            const lines = (message.data as string).trim().split('\n');
-
-            for (const line of lines) {
-                if (line.trim()) {
-                    const data = JSON.parse(line);
-                    const event = channelEventSchema.parse(data);
-
-                    this._broadcaster.publish(event);
-                }
-            }
+        eventSource.onmessage = (event) => {
+            this.#handleMessage(event.data);
         };
 
-        socket.onerror = (event) => {
-            const error = new Error('WebSocket error');
+        eventSource.onerror = () => {
+            const error = new Error('SSE connection error');
 
             this._errorSubject.publish(error);
-            socket.close();
-        };
+            eventSource.close();
 
-        socket.onclose = () => {
-            this.#clearTimeouts();
+            this.#clearTimeout();
             this._connectionState.publish(ConnectionState.DISCONNECTED);
 
             if (this._disconnecting) {
@@ -134,7 +121,7 @@ export class PondClient {
             }
 
             const delay = Math.min(
-                1000 * 2 ** this._reconnectAttempts,
+                1000 * Math.pow(2, this._reconnectAttempts),
                 this._options.maxReconnectDelay,
             );
 
@@ -145,44 +132,68 @@ export class PondClient {
             }, delay);
         };
 
-        this._socket = socket;
+        this._eventSource = eventSource;
     }
 
-    #clearTimeouts () {
+    #handleMessage (data: string) {
+        try {
+            const lines = data.trim().split('\n');
+
+            for (const line of lines) {
+                if (line.trim()) {
+                    const parsed = JSON.parse(line);
+                    const event = channelEventSchema.parse(parsed);
+
+                    if (event.event === Events.CONNECTION && event.action === ServerActions.CONNECT) {
+                        if (event.payload && typeof event.payload === 'object' && 'connectionId' in event.payload) {
+                            this._connectionId = event.payload.connectionId as string;
+                        }
+                    }
+
+                    this._broadcaster.publish(event);
+                }
+            }
+        } catch (e) {
+            this._errorSubject.publish(e instanceof Error ? e : new Error('Failed to parse SSE message'));
+        }
+    }
+
+    #clearTimeout () {
         if (this._connectionTimeoutId) {
             clearTimeout(this._connectionTimeoutId);
             this._connectionTimeoutId = undefined;
         }
-
-        if (this._pingIntervalId) {
-            clearInterval(this._pingIntervalId);
-            this._pingIntervalId = undefined;
-        }
     }
 
-    /**
-     * @desc Returns the current state of the socket.
-     */
     public getState () {
         return this._connectionState.value;
     }
 
-    /**
-     * @desc Disconnects the socket.
-     */
+    public getConnectionId () {
+        return this._connectionId;
+    }
+
     public disconnect () {
-        this.#clearTimeouts();
+        this.#clearTimeout();
         this._disconnecting = true;
         this._connectionState.publish(ConnectionState.DISCONNECTED);
-        this._socket?.close();
+
+        if (this._connectionId) {
+            fetch(this._postAddress.toString(), {
+                method: 'DELETE',
+                headers: {
+                    'X-Connection-ID': this._connectionId,
+                },
+                credentials: this._options.withCredentials ? 'include' : 'same-origin',
+            }).catch(() => {
+            });
+        }
+
+        this._eventSource?.close();
+        this._connectionId = undefined;
         this.#channels.clear();
     }
 
-    /**
-     * @desc Creates a channel with the given name and params.
-     * @param name - The name of the channel.
-     * @param params - The params to send to the server.
-     */
     public createChannel (name: string, params?: JoinParams) {
         const channel = this.#channels.get(name);
 
@@ -198,39 +209,32 @@ export class PondClient {
         return newChannel;
     }
 
-    /**
-     * @desc Subscribes to the connection state.
-     * @param callback - The callback to call when the state changes.
-     */
     public onConnectionChange (callback: (state: ConnectionState) => void) {
         return this._connectionState.subscribe(callback);
     }
 
-    /**
-     * @desc Subscribes to connection errors.
-     * @param callback - The callback to call when an error occurs.
-     */
     public onError (callback: (error: Error) => void): Unsubscribe {
         return this._errorSubject.subscribe(callback);
     }
 
-    /**
-     * @desc Returns a function that publishes a message to the socket.
-     * @private
-     */
     #createPublisher () {
         return (message: ClientMessage) => {
-            if (this._connectionState.value === ConnectionState.CONNECTED) {
-                this._socket.send(JSON.stringify(message));
+            if (this._connectionState.value === ConnectionState.CONNECTED && this._connectionId) {
+                fetch(this._postAddress.toString(), {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Connection-ID': this._connectionId,
+                    },
+                    body: JSON.stringify(message),
+                    credentials: this._options.withCredentials ? 'include' : 'same-origin',
+                }).catch((err) => {
+                    this._errorSubject.publish(err instanceof Error ? err : new Error('Failed to send message'));
+                });
             }
         };
     }
 
-    /**
-     * @desc Handles an acknowledge event. this event is sent when the server adds a client to a channel.
-     * @param message - The message to handle.
-     * @private
-     */
     #handleAcknowledge (message: ChannelEvent) {
         const channel = this.#channels.get(message.channelName) ?? new Channel(
             this.#createPublisher(),
@@ -243,10 +247,6 @@ export class PondClient {
         channel.acknowledge(this._broadcaster);
     }
 
-    /**
-     * @desc Initializes the client.
-     * @private
-     */
     #init () {
         this._broadcaster.subscribe((message) => {
             if (message.event === Events.ACKNOWLEDGE) {
