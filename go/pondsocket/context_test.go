@@ -154,7 +154,7 @@ func TestJoinContext(t *testing.T) {
 		}
 	})
 
-	t.Run("GetAssigns returns value", func(t *testing.T) {
+	t.Run("GetAssign returns value", func(t *testing.T) {
 		channel := createContextTestChannel(ctx, "test-channel")
 		defer channel.Close()
 
@@ -162,7 +162,7 @@ func TestJoinContext(t *testing.T) {
 		event := createTestEvent("req-1", "join", nil)
 
 		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
-		value := joinCtx.GetAssigns("existing")
+		value := joinCtx.GetAssign("existing")
 
 		if value != "value" {
 			t.Errorf("Expected 'value', got %v", value)
@@ -431,7 +431,7 @@ func TestLeaveContext(t *testing.T) {
 		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
 		leaveCtx := &LeaveContext{
 			Channel: nil,
-			User:    user,
+			user:    user,
 			ctx:     ctx,
 		}
 
@@ -444,7 +444,7 @@ func TestLeaveContext(t *testing.T) {
 		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
 		leaveCtx := &LeaveContext{
 			Channel: nil,
-			User:    user,
+			user:    user,
 			ctx:     ctx,
 		}
 
@@ -459,7 +459,7 @@ func TestLeaveContext(t *testing.T) {
 
 		leaveCtx := &LeaveContext{
 			Channel: channel,
-			User:    nil,
+			user:    nil,
 			ctx:     ctx,
 		}
 
@@ -477,7 +477,7 @@ func TestLeaveContext(t *testing.T) {
 
 		leaveCtx := &LeaveContext{
 			Channel: channel,
-			User:    nil,
+			user:    nil,
 			ctx:     ctx,
 		}
 
@@ -486,6 +486,64 @@ func TestLeaveContext(t *testing.T) {
 
 		if err == nil {
 			t.Error("Expected error for nil user")
+		}
+	})
+
+	t.Run("GetUser returns user", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{"role": "admin"}}
+		leaveCtx := newLeaveContext(ctx, channel, user, "leave")
+
+		result := leaveCtx.GetUser()
+		if result == nil {
+			t.Error("Expected user to be non-nil")
+		}
+		if result.UserID != "user1" {
+			t.Errorf("Expected UserID user1, got %s", result.UserID)
+		}
+	})
+
+	t.Run("GetAssign returns value for existing key", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{"role": "admin"}}
+		leaveCtx := newLeaveContext(ctx, channel, user, "leave")
+
+		value := leaveCtx.GetAssign("role")
+		if value != "admin" {
+			t.Errorf("Expected role admin, got %v", value)
+		}
+	})
+
+	t.Run("GetAssign returns nil for non-existent key", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{"role": "admin"}}
+		leaveCtx := newLeaveContext(ctx, channel, user, "leave")
+
+		value := leaveCtx.GetAssign("nonexistent")
+		if value != nil {
+			t.Errorf("Expected nil, got %v", value)
+		}
+	})
+
+	t.Run("GetAssign returns nil for nil user", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		leaveCtx := &LeaveContext{
+			Channel: channel,
+			user:    nil,
+			ctx:     ctx,
+		}
+
+		value := leaveCtx.GetAssign("role")
+		if value != nil {
+			t.Errorf("Expected nil, got %v", value)
 		}
 	})
 }
@@ -1051,7 +1109,7 @@ func TestConnectionContextIntegration(t *testing.T) {
 			connCtx := newConnectionContext(connOpts)
 
 			connCtx.SetAssigns("role", "member")
-			value := connCtx.GetAssigns("role")
+			value := connCtx.GetAssign("role")
 			if value != "member" {
 				t.Errorf("Expected role=member, got %v", value)
 			}

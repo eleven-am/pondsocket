@@ -248,17 +248,17 @@ func TestConnectionContextSetAndGetAssigns(t *testing.T) {
 		connCtx.SetAssigns("role", "admin")
 		connCtx.SetAssigns("userId", 123)
 
-		if connCtx.GetAssigns("role") != "admin" {
-			t.Errorf("expected role admin, got %v", connCtx.GetAssigns("role"))
+		if connCtx.GetAssign("role") != "admin" {
+			t.Errorf("expected role admin, got %v", connCtx.GetAssign("role"))
 		}
 
-		if connCtx.GetAssigns("userId") != 123 {
-			t.Errorf("expected userId 123, got %v", connCtx.GetAssigns("userId"))
+		if connCtx.GetAssign("userId") != 123 {
+			t.Errorf("expected userId 123, got %v", connCtx.GetAssign("userId"))
 		}
 	})
 
 	t.Run("returns nil for non-existent key", func(t *testing.T) {
-		if connCtx.GetAssigns("nonexistent") != nil {
+		if connCtx.GetAssign("nonexistent") != nil {
 			t.Error("expected nil for non-existent key")
 		}
 	})

@@ -189,10 +189,7 @@ func (c *ConnectionContext) SetAssigns(key string, value interface{}) *Connectio
 	return c
 }
 
-// GetAssigns retrieves a value from the connection's assigns map by key.
-// Returns nil if the key doesn't exist or if assigns haven't been initialized.
-// Assigns are server-side metadata that persist with the connection.
-func (c *ConnectionContext) GetAssigns(key string) interface{} {
+func (c *ConnectionContext) GetAssign(key string) interface{} {
 	if c.assigns == nil {
 		return nil
 	}

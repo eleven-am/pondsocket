@@ -11,7 +11,7 @@ import (
 type LeaveContext struct {
 	Channel      *Channel
 	Route        *Route
-	User         *User
+	user         *User
 	ctx          context.Context
 	err          error
 	mutex        sync.RWMutex
@@ -24,7 +24,7 @@ func newLeaveContext(ctx context.Context, channel *Channel, user *User, reason s
 	case <-ctx.Done():
 		return &LeaveContext{
 			Channel:     channel,
-			User:        user,
+			user:        user,
 			ctx:         ctx,
 			err:         ctx.Err(),
 			leaveReason: reason,
@@ -32,7 +32,7 @@ func newLeaveContext(ctx context.Context, channel *Channel, user *User, reason s
 	default:
 		return &LeaveContext{
 			Channel:     channel,
-			User:        user,
+			user:        user,
 			ctx:         ctx,
 			leaveReason: reason,
 		}
@@ -146,10 +146,10 @@ func (c *LeaveContext) ParseAssigns(v interface{}) error {
 	if c.checkStateAndContext() {
 		return c.err
 	}
-	if c.User == nil {
+	if c.user == nil {
 		return wrapF(nil, "user not found")
 	}
-	return parseAssigns(v, c.User.Assigns)
+	return parseAssigns(v, c.user.Assigns)
 }
 
 // ParsePresence unmarshals the leaving user's presence data into the provided struct.
@@ -159,14 +159,23 @@ func (c *LeaveContext) ParsePresence(v interface{}) error {
 	if c.checkStateAndContext() {
 		return c.err
 	}
-	if c.User == nil {
+	if c.user == nil {
 		return wrapF(nil, "user not found")
 	}
-	return parsePresence(v, c.User.Presence)
+	return parsePresence(v, c.user.Presence)
 }
 
-// Context returns the context for this leave operation.
-// The context is cancelled if the operation times out or the server shuts down.
+func (c *LeaveContext) GetUser() *User {
+	return c.user
+}
+
+func (c *LeaveContext) GetAssign(key string) interface{} {
+	if c.user == nil || c.user.Assigns == nil {
+		return nil
+	}
+	return c.user.Assigns[key]
+}
+
 func (c *LeaveContext) Context() context.Context {
 	return c.ctx
 }

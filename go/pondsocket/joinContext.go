@@ -192,11 +192,7 @@ func (c *JoinContext) Assigns(assigns interface{}) *JoinContext {
 	return c
 }
 
-// GetAssigns retrieves a value from the user's assigns by key.
-// If called before Accept, it reads from the connection's assigns.
-// If called after Accept, it reads from the user's channel assigns.
-// Returns nil if the key doesn't exist.
-func (c *JoinContext) GetAssigns(key string) interface{} {
+func (c *JoinContext) GetAssign(key string) interface{} {
 	if c.checkStateAndContext() {
 		return nil
 	}

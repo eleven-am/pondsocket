@@ -49,7 +49,7 @@ func TestLobbyOnLeave(t *testing.T) {
 	var leaveUser User
 	lobby.OnLeave(func(ctx *LeaveContext) {
 		leaveCalled = true
-		leaveUser = *ctx.User
+		leaveUser = *ctx.GetUser()
 	})
 
 	if lobby.leaveHandler == nil {
