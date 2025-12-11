@@ -24,6 +24,7 @@ export enum ChannelState {
     JOINED = 'JOINED',
     STALLED = 'STALLED',
     CLOSED = 'CLOSED',
+    DECLINED = 'DECLINED',
 }
 
 export enum ErrorTypes {
@@ -51,6 +52,7 @@ export enum ChannelReceiver {
 export enum Events {
     ACKNOWLEDGE = 'ACKNOWLEDGE',
     CONNECTION = 'CONNECTION',
+    UNAUTHORIZED = 'UNAUTHORIZED',
 }
 
 export enum PubSubEvents {

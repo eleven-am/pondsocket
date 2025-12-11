@@ -78,6 +78,15 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
     }
 
     /**
+     * @desc Marks the channel join as declined by the server.
+     * @param payload - The decline payload containing status code and message.
+     */
+    public decline (payload: { message?: string; statusCode?: number }) {
+        this.#joinState.publish(ChannelState.DECLINED);
+        this.#queue = [];
+    }
+
+    /**
      * @desc Connects to the channel.
      */
     public join () {

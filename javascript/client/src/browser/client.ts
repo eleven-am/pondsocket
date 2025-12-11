@@ -8,6 +8,7 @@ import {
     channelEventSchema,
     ChannelState,
     Unsubscribe,
+    PondMessage,
 } from '@eleven-am/pondsocket-common';
 
 import { Channel } from '../core/channel';
@@ -244,6 +245,21 @@ export class PondClient {
     }
 
     /**
+     * @desc Handles an unauthorized event. This event is sent when the server declines a channel join.
+     * @param message - The message to handle.
+     * @private
+     */
+    #handleUnauthorized (message: ChannelEvent) {
+        const channel = this.#channels.get(message.channelName);
+
+        if (channel) {
+            const payload = message.payload as { message?: string; statusCode?: number };
+
+            channel.decline(payload);
+        }
+    }
+
+    /**
      * @desc Initializes the client.
      * @private
      */
@@ -251,6 +267,8 @@ export class PondClient {
         this._broadcaster.subscribe((message) => {
             if (message.event === Events.ACKNOWLEDGE) {
                 this.#handleAcknowledge(message);
+            } else if (message.event === Events.UNAUTHORIZED) {
+                this.#handleUnauthorized(message);
             } else if (message.event === Events.CONNECTION && message.action === ServerActions.CONNECT) {
                 this._connectionState.publish(ConnectionState.CONNECTED);
             }

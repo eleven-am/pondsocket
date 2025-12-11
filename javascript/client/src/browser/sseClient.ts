@@ -247,10 +247,22 @@ export class SSEClient {
         channel.acknowledge(this._broadcaster);
     }
 
+    #handleUnauthorized (message: ChannelEvent) {
+        const channel = this.#channels.get(message.channelName);
+
+        if (channel) {
+            const payload = message.payload as { message?: string; statusCode?: number };
+
+            channel.decline(payload);
+        }
+    }
+
     #init () {
         this._broadcaster.subscribe((message) => {
             if (message.event === Events.ACKNOWLEDGE) {
                 this.#handleAcknowledge(message);
+            } else if (message.event === Events.UNAUTHORIZED) {
+                this.#handleUnauthorized(message);
             } else if (message.event === Events.CONNECTION && message.action === ServerActions.CONNECT) {
                 this._connectionState.publish(ConnectionState.CONNECTED);
             }
