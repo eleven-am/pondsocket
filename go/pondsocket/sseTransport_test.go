@@ -122,6 +122,34 @@ func (n *nonFlushingWriter) Header() http.Header        { return make(http.Heade
 func (n *nonFlushingWriter) Write([]byte) (int, error)  { return 0, nil }
 func (n *nonFlushingWriter) WriteHeader(statusCode int) {}
 
+type sseTestMetricsCollector struct {
+	errorChan chan string
+}
+
+func (m *sseTestMetricsCollector) ConnectionOpened(connID string, endpoint string)        {}
+func (m *sseTestMetricsCollector) ConnectionClosed(connID string, duration time.Duration) {}
+func (m *sseTestMetricsCollector) ConnectionError(connID string, err error)               {}
+func (m *sseTestMetricsCollector) MessageReceived(connID string, channel string, event string, size int) {
+}
+func (m *sseTestMetricsCollector) MessageSent(connID string, channel string, event string, size int) {
+}
+func (m *sseTestMetricsCollector) MessageBroadcast(channel string, event string, recipientCount int) {
+}
+func (m *sseTestMetricsCollector) ChannelJoined(userID string, channel string)            {}
+func (m *sseTestMetricsCollector) ChannelLeft(userID string, channel string)              {}
+func (m *sseTestMetricsCollector) ChannelCreated(channel string)                          {}
+func (m *sseTestMetricsCollector) ChannelDestroyed(channel string)                        {}
+func (m *sseTestMetricsCollector) HandlerDuration(handler string, duration time.Duration) {}
+func (m *sseTestMetricsCollector) QueueDepth(queue string, depth int)                     {}
+func (m *sseTestMetricsCollector) Error(component string, err error) {
+	if m.errorChan != nil {
+		select {
+		case m.errorChan <- component:
+		default:
+		}
+	}
+}
+
 func TestSSEConnSendJSON(t *testing.T) {
 	t.Run("sends JSON in SSE format with event field", func(t *testing.T) {
 		conn, writer := createTestSSEConn("test-id", nil)
@@ -535,6 +563,190 @@ func TestSSEConnCORSHeaders(t *testing.T) {
 	})
 }
 
+func TestSSEConnConcurrentHandleMessages(t *testing.T) {
+	t.Run("handles multiple messages concurrently", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.MaxConcurrentHandlers = 5
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-concurrent",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		var wg sync.WaitGroup
+		messageCount := 10
+		processed := make(chan string, messageCount)
+
+		conn.OnMessage(func(event Event, transport Transport) error {
+			time.Sleep(10 * time.Millisecond)
+			processed <- event.RequestId
+			return nil
+		})
+
+		conn.HandleMessages()
+
+		for i := 0; i < messageCount; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				testEvent := Event{
+					Action:      "test",
+					ChannelName: "test-channel",
+					RequestId:   "req-" + string(rune('0'+idx)),
+					Event:       "test-event",
+					Payload:     "test-payload",
+				}
+				data, _ := json.Marshal(testEvent)
+				conn.PushMessage(data)
+			}(i)
+		}
+
+		wg.Wait()
+
+		timeout := time.After(2 * time.Second)
+		receivedCount := 0
+		for receivedCount < messageCount {
+			select {
+			case <-processed:
+				receivedCount++
+			case <-timeout:
+				t.Errorf("timeout: expected %d messages, got %d", messageCount, receivedCount)
+				return
+			}
+		}
+
+		if receivedCount != messageCount {
+			t.Errorf("expected %d messages processed, got %d", messageCount, receivedCount)
+		}
+	})
+
+	t.Run("respects MaxConcurrentHandlers limit", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.MaxConcurrentHandlers = 2
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-limit",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		var concurrentCount int32
+		var maxConcurrent int32
+		var mu sync.Mutex
+
+		conn.OnMessage(func(event Event, transport Transport) error {
+			mu.Lock()
+			concurrentCount++
+			if concurrentCount > maxConcurrent {
+				maxConcurrent = concurrentCount
+			}
+			mu.Unlock()
+
+			time.Sleep(50 * time.Millisecond)
+
+			mu.Lock()
+			concurrentCount--
+			mu.Unlock()
+			return nil
+		})
+
+		conn.HandleMessages()
+
+		for i := 0; i < 6; i++ {
+			testEvent := Event{
+				Action:      "test",
+				ChannelName: "test-channel",
+				RequestId:   "req-limit",
+				Event:       "test-event",
+				Payload:     "test-payload",
+			}
+			data, _ := json.Marshal(testEvent)
+			conn.PushMessage(data)
+		}
+
+		time.Sleep(400 * time.Millisecond)
+
+		mu.Lock()
+		if maxConcurrent > 2 {
+			t.Errorf("expected max concurrent handlers to be 2, got %d", maxConcurrent)
+		}
+		mu.Unlock()
+	})
+
+	t.Run("handler errors are reported", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-error",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		errChan := make(chan bool, 1)
+
+		conn.OnMessage(func(event Event, transport Transport) error {
+			errChan <- true
+			return &Error{Code: StatusBadRequest, Message: "test error"}
+		})
+
+		conn.HandleMessages()
+
+		testEvent := Event{
+			Action:      "test",
+			ChannelName: "test-channel",
+			RequestId:   "req-123",
+			Event:       "test-event",
+			Payload:     "test-payload",
+		}
+		data, _ := json.Marshal(testEvent)
+		conn.PushMessage(data)
+
+		select {
+		case <-errChan:
+		case <-time.After(1 * time.Second):
+			t.Error("timeout waiting for error handler")
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		body := writer.GetBody()
+		if !strings.Contains(body, "error") {
+			t.Logf("body doesn't contain 'error', body: %s", body)
+		}
+	})
+}
+
 func TestSSEConnGetAssignsReturnsClone(t *testing.T) {
 	conn, _ := createTestSSEConn("test-id", nil)
 	defer conn.Close()
@@ -586,6 +798,568 @@ func TestSSEConnSendTimeoutOption(t *testing.T) {
 		opts := DefaultOptions()
 		if opts.SendTimeout != 5*time.Second {
 			t.Errorf("expected default SendTimeout 5s, got %v", opts.SendTimeout)
+		}
+	})
+}
+
+func TestSSEConnKeepAlive(t *testing.T) {
+	t.Run("sends keepalive on ticker", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.PingInterval = 50 * time.Millisecond
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-keepalive",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+
+		time.Sleep(120 * time.Millisecond)
+		conn.Close()
+
+		body := writer.GetBody()
+		if !strings.Contains(body, ": keepalive") {
+			t.Error("expected keepalive message to be written")
+		}
+	})
+
+	t.Run("stops when context cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		writer := newMockResponseWriter()
+		opts := DefaultOptions()
+		opts.PingInterval = 50 * time.Millisecond
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-keepalive-ctx",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+
+		if conn.IsActive() {
+			conn.Close()
+		}
+	})
+
+	t.Run("stops when connection closed", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.PingInterval = 200 * time.Millisecond
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-keepalive-close",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+
+		conn.Close()
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	t.Run("uses default interval when not configured", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.PingInterval = 0
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-keepalive-default",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+	})
+}
+
+func TestSSEConnPushMessageTimeout(t *testing.T) {
+	t.Run("returns timeout error when channel full", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.ReceiveChannelBuffer = 1
+		opts.SendTimeout = 10 * time.Millisecond
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-push-timeout",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		_ = conn.PushMessage([]byte(`{"first": "message"}`))
+
+		err = conn.PushMessage([]byte(`{"second": "message"}`))
+		if err == nil {
+			t.Error("expected timeout error when channel is full")
+		}
+	})
+
+	t.Run("returns error when context cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		writer := newMockResponseWriter()
+		opts := DefaultOptions()
+		opts.ReceiveChannelBuffer = 1
+		opts.SendTimeout = 500 * time.Millisecond
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-push-ctx",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+
+		_ = conn.PushMessage([]byte(`{"first": "message"}`))
+
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+		}()
+
+		err = conn.PushMessage([]byte(`{"second": "message"}`))
+		if err == nil {
+			t.Error("expected error when context cancelled")
+		}
+		conn.Close()
+	})
+}
+
+func TestSSEConnSendJSONErrors(t *testing.T) {
+	t.Run("returns error when closeChan closed during send", func(t *testing.T) {
+		conn, _ := createTestSSEConn("test-close-during-send", nil)
+
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			conn.Close()
+		}()
+
+		for i := 0; i < 100; i++ {
+			err := conn.SendJSON(map[string]string{"key": "value"})
+			if err != nil {
+				return
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	})
+
+	t.Run("returns error for invalid JSON", func(t *testing.T) {
+		conn, _ := createTestSSEConn("test-invalid-json", nil)
+		defer conn.Close()
+
+		err := conn.SendJSON(make(chan int))
+		if err == nil {
+			t.Error("expected error for non-serializable type")
+		}
+	})
+}
+
+func TestSSEConnHandleMessagesEdgeCases(t *testing.T) {
+	t.Run("sends error for invalid JSON", func(t *testing.T) {
+		conn, writer := createTestSSEConn("test-invalid-msg", nil)
+		defer conn.Close()
+
+		conn.OnMessage(func(event Event, transport Transport) error {
+			return nil
+		})
+
+		conn.HandleMessages()
+
+		conn.incoming <- []byte(`invalid json{`)
+
+		time.Sleep(100 * time.Millisecond)
+
+		body := writer.GetBody()
+		if !strings.Contains(body, "error") {
+			t.Logf("expected error response for invalid JSON, body: %s", body)
+		}
+	})
+
+	t.Run("sends error when no handler registered", func(t *testing.T) {
+		conn, writer := createTestSSEConn("test-no-handler", nil)
+		defer conn.Close()
+
+		conn.HandleMessages()
+
+		testEvent := Event{
+			Action:      "test",
+			ChannelName: "test-channel",
+			RequestId:   "req-123",
+			Event:       "test-event",
+			Payload:     "test-payload",
+		}
+		data, _ := json.Marshal(testEvent)
+		conn.incoming <- data
+
+		time.Sleep(100 * time.Millisecond)
+
+		body := writer.GetBody()
+		if !strings.Contains(body, "no handler") {
+			t.Logf("expected 'no handler' error, body: %s", body)
+		}
+	})
+
+	t.Run("sends error for invalid event", func(t *testing.T) {
+		conn, writer := createTestSSEConn("test-invalid-event", nil)
+		defer conn.Close()
+
+		conn.OnMessage(func(event Event, transport Transport) error {
+			return nil
+		})
+
+		conn.HandleMessages()
+
+		invalidEvent := Event{
+			Action:      "",
+			ChannelName: "",
+			RequestId:   "",
+			Event:       "",
+			Payload:     nil,
+		}
+		data, _ := json.Marshal(invalidEvent)
+		conn.incoming <- data
+
+		time.Sleep(100 * time.Millisecond)
+
+		body := writer.GetBody()
+		if !strings.Contains(body, "invalid") || !strings.Contains(body, "error") {
+			t.Logf("expected invalid event error, body: %s", body)
+		}
+	})
+
+	t.Run("stops when context cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		writer := newMockResponseWriter()
+		opts := DefaultOptions()
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-handle-ctx",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+
+		conn.OnMessage(func(event Event, transport Transport) error {
+			return nil
+		})
+
+		conn.HandleMessages()
+		cancel()
+
+		time.Sleep(50 * time.Millisecond)
+		conn.Close()
+	})
+
+	t.Run("stops when connection closed", func(t *testing.T) {
+		conn, _ := createTestSSEConn("test-handle-close", nil)
+
+		conn.OnMessage(func(event Event, transport Transport) error {
+			return nil
+		})
+
+		conn.HandleMessages()
+		conn.Close()
+
+		time.Sleep(50 * time.Millisecond)
+	})
+}
+
+func TestSSEConnReportError(t *testing.T) {
+	t.Run("does nothing when metrics is nil", func(t *testing.T) {
+		conn, _ := createTestSSEConn("test-report-nil", nil)
+		defer conn.Close()
+
+		conn.reportError("test", internal("test", "error"))
+	})
+
+	t.Run("does nothing when error is nil", func(t *testing.T) {
+		conn, _ := createTestSSEConn("test-report-nil-err", nil)
+		defer conn.Close()
+
+		conn.reportError("test", nil)
+	})
+
+	t.Run("does nothing when options is nil", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-report-no-opts",
+			options:   nil,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		conn.reportError("test", internal("test", "error"))
+	})
+
+	t.Run("calls metrics Error when configured", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		errorReceived := make(chan string, 1)
+		opts.Hooks = &Hooks{
+			Metrics: &sseTestMetricsCollector{errorChan: errorReceived},
+		}
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-report-metrics",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		conn.reportError("test-component", internal("test", "error message"))
+
+		select {
+		case component := <-errorReceived:
+			if component != "test-component" {
+				t.Errorf("expected component 'test-component', got %s", component)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("expected metrics Error to be called")
+		}
+	})
+}
+
+func TestSSEConnGetSendTimeout(t *testing.T) {
+	t.Run("returns configured timeout", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.SendTimeout = 10 * time.Second
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-get-timeout",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		timeout := conn.getSendTimeout()
+		if timeout != 10*time.Second {
+			t.Errorf("expected 10s, got %v", timeout)
+		}
+	})
+
+	t.Run("returns default 5s when not configured", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		opts.SendTimeout = 0
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-get-timeout-default",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		timeout := conn.getSendTimeout()
+		if timeout != 5*time.Second {
+			t.Errorf("expected 5s default, got %v", timeout)
+		}
+	})
+
+	t.Run("returns 5s when options is nil", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-get-timeout-nil",
+			options:   nil,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		timeout := conn.getSendTimeout()
+		if timeout != 5*time.Second {
+			t.Errorf("expected 5s default, got %v", timeout)
+		}
+	})
+}
+
+func TestSSEConnGetAssignNil(t *testing.T) {
+	t.Run("returns nil when assigns is nil", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-nil-assigns",
+			options:   nil,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		conn.mutex.Lock()
+		conn.assigns = nil
+		conn.mutex.Unlock()
+
+		val := conn.GetAssign("key")
+		if val != nil {
+			t.Error("expected nil for nil assigns map")
+		}
+	})
+}
+
+func TestSSEConnSetAssignNilAssigns(t *testing.T) {
+	t.Run("initializes assigns map when nil", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-set-nil-assigns",
+			options:   nil,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+		defer conn.Close()
+
+		conn.mutex.Lock()
+		conn.assigns = nil
+		conn.mutex.Unlock()
+
+		conn.SetAssign("key", "value")
+
+		if conn.GetAssign("key") != "value" {
+			t.Error("expected assigns to be initialized and value set")
+		}
+	})
+}
+
+func TestSSEConnCloseHandlerErrors(t *testing.T) {
+	t.Run("reports close handler errors", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		ctx := context.Background()
+		opts := DefaultOptions()
+		errorReceived := make(chan string, 1)
+		opts.Hooks = &Hooks{
+			Metrics: &sseTestMetricsCollector{errorChan: errorReceived},
+		}
+
+		sseOpts := sseOptions{
+			writer:    writer,
+			assigns:   nil,
+			id:        "test-close-error",
+			options:   opts,
+			parentCtx: ctx,
+		}
+
+		conn, err := newSSEConn(sseOpts)
+		if err != nil {
+			t.Fatalf("failed to create SSE connection: %v", err)
+		}
+
+		conn.OnClose(func(t Transport) error {
+			return internal("test", "close handler error")
+		})
+
+		conn.Close()
+
+		select {
+		case component := <-errorReceived:
+			if component != "sse_close_handlers" {
+				t.Errorf("expected component 'sse_close_handlers', got %s", component)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("expected close handler error to be reported")
 		}
 	})
 }

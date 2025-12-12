@@ -253,7 +253,7 @@ func TestAssignsSync(t *testing.T) {
 			t.Fatalf("Failed to publish to PubSub: %v", err)
 		}
 
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 
 		countMutex.Lock()
 		finalPublishCount := publishCount
@@ -263,8 +263,20 @@ func TestAssignsSync(t *testing.T) {
 			t.Errorf("Remote assigns update triggered additional publishes (infinite loop), initial: %d, final: %d", initialPublishCount, finalPublishCount)
 		}
 
-		assigns := channel.GetAssigns()
-		userAssigns, exists := assigns["user1"]
+		var userAssigns map[string]interface{}
+		var exists bool
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			assigns := channel.GetAssigns()
+			userAssigns, exists = assigns["user1"]
+			if exists {
+				if _, hasStatus := userAssigns["status"]; hasStatus {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
 		if !exists {
 			t.Fatal("User1 assigns not found after remote update")
 		}

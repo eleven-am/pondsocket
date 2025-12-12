@@ -1262,3 +1262,838 @@ func TestContextConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestEventContextParsePayload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParsePayload successfully unmarshals struct", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		channel.addUser(conn)
+
+		type MessagePayload struct {
+			Text   string `json:"text"`
+			Number int    `json:"number"`
+		}
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
+		payload := map[string]interface{}{"text": "hello", "number": float64(42)}
+		event := createTestEvent("req-1", "message", payload)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(ctx, channel, msgEvent, nil)
+		var result MessagePayload
+		err := eventCtx.ParsePayload(&result)
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if result.Text != "hello" {
+			t.Errorf("Expected text 'hello', got '%s'", result.Text)
+		}
+		if result.Number != 42 {
+			t.Errorf("Expected number 42, got %d", result.Number)
+		}
+	})
+
+	t.Run("ParsePayload with cancelled context returns error", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(cancelCtx, channel, msgEvent, nil)
+		var result map[string]interface{}
+		err := eventCtx.ParsePayload(&result)
+
+		if err == nil {
+			t.Error("Expected error for cancelled context")
+		}
+	})
+}
+
+func TestEventContextParseAssigns(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParseAssigns successfully unmarshals struct", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		type UserAssigns struct {
+			Role  string `json:"role"`
+			Level int    `json:"level"`
+		}
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "admin", "level": float64(5)})
+		channel.addUser(conn)
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{"role": "admin", "level": float64(5)}}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(ctx, channel, msgEvent, nil)
+		var result UserAssigns
+		err := eventCtx.ParseAssigns(&result)
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if result.Role != "admin" {
+			t.Errorf("Expected role 'admin', got '%s'", result.Role)
+		}
+	})
+
+	t.Run("ParseAssigns with cancelled context returns error", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(cancelCtx, channel, msgEvent, nil)
+
+		var result map[string]interface{}
+		err := eventCtx.ParseAssigns(&result)
+
+		if err == nil {
+			t.Error("Expected error for cancelled context")
+		}
+	})
+}
+
+func TestEventContextParsePresence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParsePresence successfully unmarshals struct", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		type PresenceData struct {
+			Status string `json:"status"`
+			Online bool   `json:"online"`
+		}
+
+		conn := createTestConn("user1", nil)
+		channel.addUser(conn)
+		channel.Track("user1", map[string]interface{}{"status": "active", "online": true})
+
+		time.Sleep(10 * time.Millisecond)
+
+		user := &User{
+			UserID:   "user1",
+			Assigns:  map[string]interface{}{},
+			Presence: map[string]interface{}{"status": "active", "online": true},
+		}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(ctx, channel, msgEvent, nil)
+		var result PresenceData
+		err := eventCtx.ParsePresence(&result)
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if result.Status != "active" {
+			t.Errorf("Expected status 'active', got '%s'", result.Status)
+		}
+	})
+
+	t.Run("ParsePresence returns error when user not in channel", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "nonexistent", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(ctx, channel, msgEvent, nil)
+
+		var result map[string]interface{}
+		err := eventCtx.ParsePresence(&result)
+
+		if err == nil {
+			t.Error("Expected error for user not in channel")
+		}
+	})
+}
+
+func TestEventContextGetAssign(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("GetAssign returns value for existing key", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "admin"})
+		channel.addUser(conn)
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{"role": "admin"}}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(ctx, channel, msgEvent, nil)
+		value, err := eventCtx.GetAssign("role")
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if value != "admin" {
+			t.Errorf("Expected 'admin', got %v", value)
+		}
+	})
+
+	t.Run("GetAssign returns error for non-existent key", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "admin"})
+		channel.addUser(conn)
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{"role": "admin"}}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(ctx, channel, msgEvent, nil)
+		value, err := eventCtx.GetAssign("nonexistent")
+
+		if err == nil {
+			t.Error("Expected error for non-existent key")
+		}
+		if value != nil {
+			t.Errorf("Expected nil value, got %v", value)
+		}
+	})
+
+	t.Run("GetAssign with cancelled context returns error", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+		msgEvent := &messageEvent{User: user, Event: event}
+
+		eventCtx := newEventContext(cancelCtx, channel, msgEvent, nil)
+		_, err := eventCtx.GetAssign("role")
+
+		if err == nil {
+			t.Error("Expected error for cancelled context")
+		}
+	})
+}
+
+func TestJoinContextBroadcastTo(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("BroadcastTo after accept succeeds", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn1 := createTestConn("user1", nil)
+		conn2 := createTestConn("user2", nil)
+		channel.addUser(conn2)
+		channel.connections.Update(conn2.ID, conn2)
+
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn1, event)
+		joinCtx.Accept()
+		joinCtx.BroadcastTo("user-joined", map[string]interface{}{"user": "user1"}, "user2")
+
+		if joinCtx.err != nil {
+			t.Errorf("Expected no error, got %v", joinCtx.err)
+		}
+	})
+
+	t.Run("BroadcastTo before accept fails", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.BroadcastTo("user-joined", nil, "user2")
+
+		if joinCtx.err == nil {
+			t.Error("Expected error when broadcasting before accept")
+		}
+	})
+}
+
+func TestJoinContextBroadcastFrom(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("BroadcastFrom after accept succeeds", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn1 := createTestConn("user1", nil)
+		conn2 := createTestConn("user2", nil)
+		channel.addUser(conn2)
+		channel.connections.Update(conn2.ID, conn2)
+
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn1, event)
+		joinCtx.Accept()
+		joinCtx.BroadcastFrom("user-joined", map[string]interface{}{"user": "user1"})
+
+		if joinCtx.err != nil {
+			t.Errorf("Expected no error, got %v", joinCtx.err)
+		}
+	})
+
+	t.Run("BroadcastFrom before accept fails", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.BroadcastFrom("user-joined", nil)
+
+		if joinCtx.err == nil {
+			t.Error("Expected error when broadcasting before accept")
+		}
+	})
+}
+
+func TestJoinContextReply(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Reply after accept succeeds", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		channel.connections.Update(conn.ID, conn)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.Accept()
+		joinCtx.Reply("welcome", map[string]interface{}{"message": "Hello!"})
+
+		if joinCtx.err != nil {
+			t.Errorf("Expected no error, got %v", joinCtx.err)
+		}
+	})
+
+	t.Run("Reply with cancelled context returns early", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(cancelCtx, channel, nil, conn, event)
+
+		if joinCtx.err == nil {
+			t.Error("Expected error for cancelled context")
+		}
+	})
+}
+
+func TestJoinContextParsePayload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParsePayload successfully unmarshals struct", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		type JoinPayload struct {
+			Token string `json:"token"`
+			Room  string `json:"room"`
+		}
+
+		conn := createTestConn("user1", nil)
+		payload := map[string]interface{}{"token": "abc123", "room": "general"}
+		event := createTestEvent("req-1", "join", payload)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		var result JoinPayload
+		err := joinCtx.ParsePayload(&result)
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if result.Token != "abc123" {
+			t.Errorf("Expected token 'abc123', got '%s'", result.Token)
+		}
+		if result.Room != "general" {
+			t.Errorf("Expected room 'general', got '%s'", result.Room)
+		}
+	})
+}
+
+func TestJoinContextParseAssigns(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParseAssigns before accept reads connection assigns", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		type UserAssigns struct {
+			Role string `json:"role"`
+		}
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "member"})
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		var result UserAssigns
+		err := joinCtx.ParseAssigns(&result)
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if result.Role != "member" {
+			t.Errorf("Expected role 'member', got '%s'", result.Role)
+		}
+	})
+}
+
+func TestJoinContextParsePresence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParsePresence returns error when not tracked", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		var result map[string]interface{}
+		err := joinCtx.ParsePresence(&result)
+
+		if err == nil {
+			t.Error("Expected error for user not tracked")
+		}
+	})
+}
+
+func TestLeaveContextParseAssignsSuccess(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParseAssigns successfully unmarshals struct", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		type UserAssigns struct {
+			Role  string `json:"role"`
+			Level int    `json:"level"`
+		}
+
+		user := &User{
+			UserID:  "user1",
+			Assigns: map[string]interface{}{"role": "admin", "level": float64(5)},
+		}
+		leaveCtx := newLeaveContext(ctx, channel, user, "leave")
+
+		var result UserAssigns
+		err := leaveCtx.ParseAssigns(&result)
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if result.Role != "admin" {
+			t.Errorf("Expected role 'admin', got '%s'", result.Role)
+		}
+	})
+}
+
+func TestLeaveContextParsePresenceSuccess(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ParsePresence successfully unmarshals struct", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		type PresenceData struct {
+			Status string `json:"status"`
+		}
+
+		user := &User{
+			UserID:   "user1",
+			Assigns:  map[string]interface{}{},
+			Presence: map[string]interface{}{"status": "offline"},
+		}
+		leaveCtx := newLeaveContext(ctx, channel, user, "leave")
+
+		var result PresenceData
+		err := leaveCtx.ParsePresence(&result)
+
+		if err != nil {
+			t.Errorf("Expected no error, got %v", err)
+		}
+		if result.Status != "offline" {
+			t.Errorf("Expected status 'offline', got '%s'", result.Status)
+		}
+	})
+}
+
+func TestOutgoingContextRefreshUser(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("refreshes user data successfully", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", map[string]interface{}{"key": "value"})
+		channel.addUser(conn)
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+
+		outCtx := newOutgoingContext(ctx, channel, event, user, conn)
+		result := outCtx.RefreshUser()
+
+		if result == nil {
+			t.Error("Expected RefreshUser to return context")
+		}
+		if outCtx.User == nil {
+			t.Error("Expected User to be set")
+		}
+	})
+
+	t.Run("handles user not found", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		user := &User{UserID: "nonexistent", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+
+		outCtx := newOutgoingContext(ctx, channel, event, user, nil)
+		result := outCtx.RefreshUser()
+
+		if result == nil {
+			t.Error("Expected RefreshUser to return context")
+		}
+	})
+
+	t.Run("handles closed channel", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		channel.Close()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+
+		outCtx := newOutgoingContext(ctx, channel, event, user, nil)
+		result := outCtx.RefreshUser()
+
+		if result == nil {
+			t.Error("Expected RefreshUser to return context even for closed channel")
+		}
+	})
+
+	t.Run("handles cancelled context", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		user := &User{UserID: "user1", Assigns: map[string]interface{}{}}
+		event := createTestEvent("req-1", "message", nil)
+
+		outCtx := newOutgoingContext(cancelledCtx, channel, event, user, nil)
+		result := outCtx.RefreshUser()
+
+		if result == nil {
+			t.Error("Expected RefreshUser to return context")
+		}
+	})
+}
+
+func TestJoinContextGetUserAfterAccept(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns user from channel after accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "member"})
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.Accept()
+
+		user := joinCtx.GetUser()
+
+		if user == nil {
+			t.Error("Expected user to be returned")
+		}
+		if user.UserID != "user1" {
+			t.Errorf("Expected userId user1, got %s", user.UserID)
+		}
+	})
+
+	t.Run("returns basic user before accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "member"})
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+
+		user := joinCtx.GetUser()
+
+		if user == nil {
+			t.Error("Expected user to be returned")
+		}
+	})
+
+	t.Run("returns user with cancelled context", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(cancelledCtx, channel, nil, conn, event)
+
+		user := joinCtx.GetUser()
+		if user == nil {
+			t.Error("Expected user to be returned even with cancelled context")
+		}
+	})
+}
+
+func TestJoinContextGetAssignAfterAccept(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("gets assign from channel after accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "admin"})
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.Accept()
+
+		value := joinCtx.GetAssign("role")
+		if value != "admin" {
+			t.Errorf("Expected role admin, got %v", value)
+		}
+	})
+
+	t.Run("gets assign from connection before accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", map[string]interface{}{"role": "member"})
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+
+		value := joinCtx.GetAssign("role")
+		if value != "member" {
+			t.Errorf("Expected role member, got %v", value)
+		}
+	})
+
+	t.Run("returns nil for non-existent key", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.Accept()
+
+		value := joinCtx.GetAssign("nonexistent")
+		if value != nil {
+			t.Error("Expected nil for non-existent key")
+		}
+	})
+}
+
+func TestJoinContextBroadcastAfterAccept(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("broadcasts successfully after accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		channel.connections.Update(conn.ID, conn)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.Accept()
+		result := joinCtx.Broadcast("notification", nil)
+
+		if result == nil {
+			t.Error("Expected result to be returned")
+		}
+	})
+
+	t.Run("returns error before accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		result := joinCtx.Broadcast("notification", nil)
+
+		if result.err == nil {
+			t.Error("Expected error when broadcasting before accept")
+		}
+	})
+}
+
+func TestJoinContextTrackAfterAccept(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("tracks successfully after accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		joinCtx.Accept()
+		result := joinCtx.Track(map[string]interface{}{"status": "online"})
+
+		if result == nil {
+			t.Error("Expected result to be returned")
+		}
+	})
+
+	t.Run("returns error before accept", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		result := joinCtx.Track(nil)
+
+		if result.err == nil {
+			t.Error("Expected error when tracking before accept")
+		}
+	})
+}
+
+func TestJoinContextCheckStateAndContext(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns true when context is cancelled", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(cancelledCtx, channel, nil, conn, event)
+		result := joinCtx.checkStateAndContext()
+
+		if !result {
+			t.Error("Expected true when context is cancelled")
+		}
+	})
+
+	t.Run("returns false when context is active", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		conn := createTestConn("user1", nil)
+		event := createTestEvent("req-1", "join", nil)
+
+		joinCtx := newJoinContext(ctx, channel, nil, conn, event)
+		result := joinCtx.checkStateAndContext()
+
+		if result {
+			t.Error("Expected false when context is active")
+		}
+	})
+}
+
+func TestChannelReportError(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("reports error when metrics configured", func(t *testing.T) {
+		opts := options{
+			Name:                 "test-channel",
+			Middleware:           newMiddleWare[*messageEvent, *Channel](),
+			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+			InternalQueueTimeout: 1 * time.Second,
+			Hooks: &Hooks{
+				Metrics: &mockMetricsCollector{},
+			},
+		}
+		channel := newChannel(ctx, opts)
+		defer channel.Close()
+
+		channel.reportError("test-component", context.Canceled)
+	})
+
+	t.Run("handles nil error", func(t *testing.T) {
+		opts := options{
+			Name:                 "test-channel",
+			Middleware:           newMiddleWare[*messageEvent, *Channel](),
+			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+			InternalQueueTimeout: 1 * time.Second,
+			Hooks: &Hooks{
+				Metrics: &mockMetricsCollector{},
+			},
+		}
+		channel := newChannel(ctx, opts)
+		defer channel.Close()
+
+		channel.reportError("test-component", nil)
+	})
+
+	t.Run("handles nil hooks", func(t *testing.T) {
+		channel := createContextTestChannel(ctx, "test-channel")
+		defer channel.Close()
+
+		channel.reportError("test-component", context.Canceled)
+	})
+
+	t.Run("handles nil metrics", func(t *testing.T) {
+		opts := options{
+			Name:                 "test-channel",
+			Middleware:           newMiddleWare[*messageEvent, *Channel](),
+			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+			InternalQueueTimeout: 1 * time.Second,
+			Hooks:                &Hooks{},
+		}
+		channel := newChannel(ctx, opts)
+		defer channel.Close()
+
+		channel.reportError("test-component", context.Canceled)
+	})
+}

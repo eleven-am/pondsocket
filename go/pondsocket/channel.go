@@ -46,6 +46,7 @@ type Channel struct {
 	assignsSyncCoordinatorMutex sync.RWMutex
 	internalQueueTimeout        time.Duration
 	hooks                       *Hooks
+	dispatchSem                 chan struct{}
 }
 
 func newChannel(ctx context.Context, options options) *Channel {
@@ -68,6 +69,7 @@ func newChannel(ctx context.Context, options options) *Channel {
 		syncCoordinators:        make(map[string]*syncCoordinator),
 		assignsSyncCoordinators: make(map[string]*syncCoordinator),
 		internalQueueTimeout:    options.InternalQueueTimeout,
+		dispatchSem:             make(chan struct{}, 32),
 	}
 	c.presence = newPresence(&c)
 
@@ -696,20 +698,30 @@ func (c *Channel) onMessage(event *internalEvent) error {
 		return nil
 	}
 
+	var wg sync.WaitGroup
+	var errMutex sync.Mutex
 	var deliveryErrors error
-	connectionsToSend.forEach(func(conn Transport) {
+
+	for _, conn := range connectionsToSend.items {
 		select {
 		case <-c.ctx.Done():
-			deliveryErrors = addError(deliveryErrors, c.ctx.Err())
-			return
+			return c.ctx.Err()
 		default:
 		}
-		eventCopy := newEvent
-		if err := c.processOutgoing(&eventCopy, conn); err != nil {
-			deliveryErrors = addError(deliveryErrors, err)
-		}
-	})
 
+		wg.Add(1)
+		go func(transport Transport, ev Event) {
+			defer wg.Done()
+			eventCopy := ev
+			if err := c.processOutgoing(&eventCopy, transport); err != nil {
+				errMutex.Lock()
+				deliveryErrors = addError(deliveryErrors, err)
+				errMutex.Unlock()
+			}
+		}(conn, newEvent)
+	}
+
+	wg.Wait()
 	return deliveryErrors
 }
 
@@ -783,13 +795,29 @@ func (c *Channel) handleMessageEvents() {
 				if !ok {
 					return
 				}
-				if err := c.onMessage(&ev); err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						return
-					}
 
-					c.reportError("channel_dispatch", err)
+				select {
+				case c.dispatchSem <- struct{}{}:
+				case <-c.ctx.Done():
+					return
 				}
+
+				go func(event internalEvent) {
+					defer func() {
+						<-c.dispatchSem
+						if r := recover(); r != nil {
+							c.reportError("channel_dispatch_panic", fmt.Errorf("panic recovered: %v", r))
+						}
+					}()
+
+					if err := c.onMessage(&event); err != nil {
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							return
+						}
+						c.reportError("channel_dispatch", err)
+					}
+				}(ev)
+
 			case <-c.ctx.Done():
 				return
 			}
@@ -1107,13 +1135,19 @@ func (c *syncCoordinator) complete() map[string]interface{} {
 		return nil
 	}
 	c.completed = true
-	aggregated := c.aggregateResponses()
+
+	merged := make(map[string]interface{})
+	for _, presenceData := range c.responses {
+		for userID, userData := range presenceData {
+			merged[userID] = userData
+		}
+	}
 
 	select {
-	case c.completeChan <- aggregated:
+	case c.completeChan <- merged:
 	default:
 	}
-	return aggregated
+	return merged
 }
 
 func (c *Channel) handleSyncTimeout(coordinator *syncCoordinator) {
@@ -1334,7 +1368,7 @@ func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
 		return
 	}
 
-	assignsData := c.GetAssigns()
+	assignsData := c.getLocalAssigns()
 	assignsSlice := make([]interface{}, 0, len(assignsData))
 
 	for userID, userAssigns := range assignsData {

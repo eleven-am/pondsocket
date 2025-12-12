@@ -206,6 +206,10 @@ func errorEvent(err error) *Event {
 
 	var e *Error
 	if errors.As(err, &e) {
+		message := e.Message
+		if e.cause != nil {
+			message = e.cause.Error()
+		}
 		return &Event{
 			Action:      system,
 			ChannelName: e.ChannelName,
@@ -215,7 +219,7 @@ func errorEvent(err error) *Event {
 				"code":      e.Code,
 				"details":   e.Details,
 				"temporary": e.Temporary,
-				"message":   e.cause.Error(),
+				"message":   message,
 			},
 		}
 	}

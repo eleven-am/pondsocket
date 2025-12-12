@@ -31,10 +31,16 @@ type Conn struct {
 	options       *Options
 	ctx           context.Context
 	cancel        context.CancelFunc
+	handlerSem    chan struct{}
 }
 
 func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]interface{}, id string, options *Options) (*Conn, error) {
 	ctx, cancel := context.WithCancel(mCtx)
+
+	maxHandlers := options.MaxConcurrentHandlers
+	if maxHandlers <= 0 {
+		maxHandlers = 10
+	}
 
 	c := &Conn{
 		ID:            id,
@@ -48,6 +54,7 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 		receive:       make(chan []byte, options.ReceiveChannelBuffer),
 		closeHandlers: newArray[func(Transport) error](),
 		options:       options,
+		handlerSem:    make(chan struct{}, maxHandlers),
 	}
 
 	wsConn.SetReadLimit(options.MaxMessageSize)
@@ -243,13 +250,29 @@ func (c *Conn) HandleMessages() {
 					continue
 				}
 
-				if err := (*handler)(event, c); err != nil {
-					c.reportError("connection_handler", err)
-
-					if ev := errorEvent(err); ev != nil {
-						_ = c.SendJSON(ev)
-					}
+				select {
+				case c.handlerSem <- struct{}{}:
+				case <-c.ctx.Done():
+					return
+				case <-c.closeChan:
+					return
 				}
+
+				go func(ev Event, h *eventHandler) {
+					defer func() {
+						<-c.handlerSem
+						if r := recover(); r != nil {
+							c.reportError("connection_handler_panic", internal(string(gatewayEntity), "handler panic recovered"))
+						}
+					}()
+
+					if err := (*h)(ev, c); err != nil {
+						c.reportError("connection_handler", err)
+						if errEv := errorEvent(err); errEv != nil {
+							_ = c.SendJSON(errEv)
+						}
+					}
+				}(event, handler)
 
 			case <-c.ctx.Done():
 				return

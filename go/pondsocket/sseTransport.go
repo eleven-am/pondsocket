@@ -23,6 +23,7 @@ type SSEConn struct {
 	options       *Options
 	ctx           context.Context
 	cancel        context.CancelFunc
+	handlerSem    chan struct{}
 }
 
 type sseOptions struct {
@@ -51,6 +52,11 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 		bufferSize = opts.options.ReceiveChannelBuffer
 	}
 
+	maxHandlers := 10
+	if opts.options != nil && opts.options.MaxConcurrentHandlers > 0 {
+		maxHandlers = opts.options.MaxConcurrentHandlers
+	}
+
 	conn := &SSEConn{
 		id:            opts.id,
 		writer:        opts.writer,
@@ -62,6 +68,7 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 		options:       opts.options,
 		ctx:           ctx,
 		cancel:        cancel,
+		handlerSem:    make(chan struct{}, maxHandlers),
 	}
 
 	opts.writer.Header().Set("Content-Type", "text/event-stream")
@@ -307,12 +314,29 @@ func (s *SSEConn) HandleMessages() {
 					continue
 				}
 
-				if err := (*handler)(event, s); err != nil {
-					s.reportError("sse_handler", err)
-					if ev := errorEvent(err); ev != nil {
-						_ = s.SendJSON(ev)
-					}
+				select {
+				case s.handlerSem <- struct{}{}:
+				case <-s.ctx.Done():
+					return
+				case <-s.closeChan:
+					return
 				}
+
+				go func(ev Event, h *transportEventHandler) {
+					defer func() {
+						<-s.handlerSem
+						if r := recover(); r != nil {
+							s.reportError("sse_handler_panic", internal(string(gatewayEntity), "handler panic recovered"))
+						}
+					}()
+
+					if err := (*h)(ev, s); err != nil {
+						s.reportError("sse_handler", err)
+						if errEv := errorEvent(err); errEv != nil {
+							_ = s.SendJSON(errEv)
+						}
+					}
+				}(event, handler)
 
 			case <-s.ctx.Done():
 				return

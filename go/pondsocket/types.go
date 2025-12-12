@@ -176,25 +176,26 @@ type LeaveEventHandler HandlerFunc[LeaveContext]
 // It includes settings for origin checking, buffer sizes, timeouts, connection limits,
 // hooks for extensibility, and PubSub for distributed deployments.
 type Options struct {
-	CheckOrigin          bool
-	AllowedOrigins       []string
-	AllowedOriginRegexps []*regexp.Regexp
-	ReadBufferSize       int
-	WriteBufferSize      int
-	MaxMessageSize       int64
-	PingInterval         time.Duration
-	PongWait             time.Duration
-	WriteWait            time.Duration
-	SendTimeout          time.Duration
-	EnableCompression    bool
-	MaxConnections       int
-	SendChannelBuffer    int
-	ReceiveChannelBuffer int
-	InternalQueueTimeout time.Duration
-	CORSAllowOrigin      string
-	CORSAllowCredentials bool
-	Hooks                *Hooks
-	PubSub               PubSub
+	CheckOrigin           bool
+	AllowedOrigins        []string
+	AllowedOriginRegexps  []*regexp.Regexp
+	ReadBufferSize        int
+	WriteBufferSize       int
+	MaxMessageSize        int64
+	PingInterval          time.Duration
+	PongWait              time.Duration
+	WriteWait             time.Duration
+	SendTimeout           time.Duration
+	EnableCompression     bool
+	MaxConnections        int
+	SendChannelBuffer     int
+	ReceiveChannelBuffer  int
+	InternalQueueTimeout  time.Duration
+	CORSAllowOrigin       string
+	CORSAllowCredentials  bool
+	MaxConcurrentHandlers int
+	Hooks                 *Hooks
+	PubSub                PubSub
 }
 
 // ServerOptions configures the HTTP server that hosts the WebSocket endpoints.

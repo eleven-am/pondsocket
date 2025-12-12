@@ -73,20 +73,22 @@ func createOriginChecker(opts *Options) func(*http.Request) bool {
 // - 30s ping interval, 60s pong wait
 // - Compression disabled
 // - 256 buffer size for send/receive channels
+// - 10 max concurrent handlers per connection
 func DefaultOptions() *Options {
 	return &Options{
-		CheckOrigin:          false,
-		ReadBufferSize:       1024,
-		WriteBufferSize:      1024,
-		MaxMessageSize:       512 * 1024,
-		PingInterval:         30 * time.Second,
-		PongWait:             60 * time.Second,
-		WriteWait:            10 * time.Second,
-		SendTimeout:          5 * time.Second,
-		EnableCompression:    false,
-		SendChannelBuffer:    256,
-		ReceiveChannelBuffer: 256,
-		InternalQueueTimeout: 1 * time.Second,
+		CheckOrigin:           false,
+		ReadBufferSize:        1024,
+		WriteBufferSize:       1024,
+		MaxMessageSize:        512 * 1024,
+		PingInterval:          30 * time.Second,
+		PongWait:              60 * time.Second,
+		WriteWait:             10 * time.Second,
+		SendTimeout:           5 * time.Second,
+		EnableCompression:     false,
+		SendChannelBuffer:     256,
+		ReceiveChannelBuffer:  256,
+		InternalQueueTimeout:  1 * time.Second,
+		MaxConcurrentHandlers: 10,
 	}
 }
 
@@ -178,8 +180,8 @@ func (m *Manager) handleConnection(ctx context.Context, request *http.Request, r
 		route:    route,
 		connCtx:  ctx,
 	}
-	connCtx := newConnectionContext(connOpts)
 
+	connCtx := newConnectionContext(connOpts)
 	if err := handlerFunc(connCtx); err != nil {
 		return err
 	}

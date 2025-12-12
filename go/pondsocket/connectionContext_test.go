@@ -360,3 +360,167 @@ func TestConnectionContextContext(t *testing.T) {
 		t.Error("expected non-nil context")
 	}
 }
+
+func TestConnectionContextReply(t *testing.T) {
+	t.Run("replies successfully after accept", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Accept", "text/event-stream")
+
+		var writer http.ResponseWriter = recorder
+
+		connOpts := connectionOptions{
+			request:  req,
+			response: &writer,
+			endpoint: endpoint,
+			userId:   "test-reply-id",
+			upgrader: websocket.Upgrader{},
+			route:    &Route{},
+			connCtx:  ctx,
+		}
+		connCtx := newConnectionContext(connOpts)
+
+		err := connCtx.Reply("welcome", map[string]interface{}{"message": "hello"})
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		conn, _ := endpoint.connections.Read("test-reply-id")
+		if conn != nil {
+			conn.Close()
+		}
+	})
+
+	t.Run("returns error when accept fails", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+
+		var writer http.ResponseWriter = recorder
+
+		connOpts := connectionOptions{
+			request:  req,
+			response: &writer,
+			endpoint: endpoint,
+			userId:   "test-id",
+			upgrader: websocket.Upgrader{},
+			route:    &Route{},
+			connCtx:  ctx,
+		}
+		connCtx := newConnectionContext(connOpts)
+
+		err := connCtx.Reply("welcome", nil)
+
+		if err == nil {
+			t.Error("expected error when accept fails")
+		}
+	})
+}
+
+func TestConnectionContextParseAssigns(t *testing.T) {
+	type testAssigns struct {
+		Role   string `mapstructure:"role"`
+		UserID int    `mapstructure:"userId"`
+	}
+
+	t.Run("parses assigns successfully", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+
+		var writer http.ResponseWriter = recorder
+
+		connOpts := connectionOptions{
+			request:  req,
+			response: &writer,
+			endpoint: endpoint,
+			userId:   "test-id",
+			upgrader: websocket.Upgrader{},
+			route:    &Route{},
+			connCtx:  ctx,
+		}
+		connCtx := newConnectionContext(connOpts)
+		connCtx.SetAssigns("role", "admin")
+		connCtx.SetAssigns("userId", 123)
+
+		var result testAssigns
+		err := connCtx.ParseAssigns(&result)
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if result.Role != "admin" {
+			t.Errorf("expected role admin, got %s", result.Role)
+		}
+		if result.UserID != 123 {
+			t.Errorf("expected userId 123, got %d", result.UserID)
+		}
+	})
+
+	t.Run("handles nil assigns", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+
+		var writer http.ResponseWriter = recorder
+
+		connOpts := connectionOptions{
+			request:  req,
+			response: &writer,
+			endpoint: endpoint,
+			userId:   "test-id",
+			upgrader: websocket.Upgrader{},
+			route:    &Route{},
+			connCtx:  ctx,
+		}
+		connCtx := newConnectionContext(connOpts)
+
+		var result testAssigns
+		err := connCtx.ParseAssigns(&result)
+
+		if err != nil {
+			t.Errorf("expected no error for nil assigns, got %v", err)
+		}
+	})
+
+	t.Run("returns nil for nil assigns map", func(t *testing.T) {
+		ctx := context.Background()
+		opts := DefaultOptions()
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+
+		var writer http.ResponseWriter = recorder
+
+		connOpts := connectionOptions{
+			request:  req,
+			response: &writer,
+			endpoint: endpoint,
+			userId:   "test-id",
+			upgrader: websocket.Upgrader{},
+			route:    &Route{},
+			connCtx:  ctx,
+		}
+		connCtx := newConnectionContext(connOpts)
+
+		val := connCtx.GetAssign("anything")
+		if val != nil {
+			t.Error("expected nil for unset assigns")
+		}
+	})
+}

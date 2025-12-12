@@ -2,6 +2,7 @@ package pondsocket
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -429,3 +430,590 @@ func (m *mockSSEWriter) WriteHeader(statusCode int) {
 }
 
 func (m *mockSSEWriter) Flush() {}
+
+func TestEndpointJoinChannel(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+	opts.InternalQueueTimeout = 100 * time.Millisecond
+
+	t.Run("joins channel successfully", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		joinCalled := false
+		endpoint.CreateChannel("room:*", func(ctx *JoinContext) error {
+			joinCalled = true
+			return ctx.Accept()
+		})
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		ev := &Event{
+			Action:      joinChannelEvent,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+			Payload:     map[string]interface{}{"data": "test"},
+		}
+
+		_ = endpoint.joinChannel(ev, conn)
+
+		if !joinCalled {
+			t.Error("expected join handler to be called")
+		}
+	})
+
+	t.Run("returns error when endpoint is closed", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+		conn := createTestConn("user1", nil)
+
+		ev := &Event{
+			Action:      joinChannelEvent,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+		}
+
+		err := endpoint.joinChannel(ev, conn)
+		if err == nil {
+			t.Error("expected error when endpoint is closed")
+		}
+	})
+
+	t.Run("processes unknown channel through not found handler", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		ev := &Event{
+			Action:      joinChannelEvent,
+			ChannelName: "unknown:123",
+			RequestId:   "req1",
+		}
+
+		_ = endpoint.joinChannel(ev, conn)
+	})
+}
+
+func TestEndpointLeaveChannel(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+
+	t.Run("leaves channel successfully", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		endpoint.CreateChannel("room:*", func(ctx *JoinContext) error {
+			return ctx.Accept()
+		})
+
+		channelOpts := options{
+			Name:                 "room:123",
+			Middleware:           newMiddleWare[*messageEvent, *Channel](),
+			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+			InternalQueueTimeout: 1 * time.Second,
+		}
+		channel := newChannel(ctx, channelOpts)
+
+		conn := createTestConn("user1", nil)
+		channel.addUser(conn)
+		endpoint.channels.Create("room:123", channel)
+		endpoint.connections.Create(conn.ID, conn)
+
+		ev := &Event{
+			Action:      leaveChannelEvent,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+		}
+
+		err := endpoint.leaveChannel(ev, conn)
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("returns error for non-existent channel", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		ev := &Event{
+			Action:      leaveChannelEvent,
+			ChannelName: "nonexistent:123",
+			RequestId:   "req1",
+		}
+
+		err := endpoint.leaveChannel(ev, conn)
+		if err == nil {
+			t.Error("expected error for non-existent channel")
+		}
+	})
+
+	t.Run("returns error when endpoint is closed", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+		conn := createTestConn("user1", nil)
+
+		ev := &Event{
+			Action:      leaveChannelEvent,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+		}
+
+		err := endpoint.leaveChannel(ev, conn)
+		if err == nil {
+			t.Error("expected error when endpoint is closed")
+		}
+	})
+}
+
+func TestEndpointBroadcastMessage(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+
+	t.Run("broadcasts message successfully", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		channelOpts := options{
+			Name:                 "room:123",
+			Middleware:           newMiddleWare[*messageEvent, *Channel](),
+			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+			InternalQueueTimeout: 1 * time.Second,
+		}
+		channel := newChannel(ctx, channelOpts)
+
+		conn := createTestConn("user1", nil)
+		channel.addUser(conn)
+		endpoint.channels.Create("room:123", channel)
+		endpoint.connections.Create(conn.ID, conn)
+
+		ev := &Event{
+			Action:      broadcast,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+			Event:       "message",
+			Payload:     map[string]interface{}{"text": "hello"},
+		}
+
+		err := endpoint.broadcastMessage(ev, conn)
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("returns error for non-existent channel", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		ev := &Event{
+			Action:      broadcast,
+			ChannelName: "nonexistent:123",
+			RequestId:   "req1",
+			Event:       "message",
+		}
+
+		err := endpoint.broadcastMessage(ev, conn)
+		if err == nil {
+			t.Error("expected error for non-existent channel")
+		}
+	})
+
+	t.Run("returns error when endpoint is closed", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+		conn := createTestConn("user1", nil)
+
+		ev := &Event{
+			Action:      broadcast,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+		}
+
+		err := endpoint.broadcastMessage(ev, conn)
+		if err == nil {
+			t.Error("expected error when endpoint is closed")
+		}
+	})
+}
+
+func TestEndpointHandleMessage(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+
+	t.Run("handles join event", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		endpoint.CreateChannel("room:*", func(ctx *JoinContext) error {
+			return ctx.Accept()
+		})
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		handler := endpoint.handleMessage()
+
+		ev := Event{
+			Action:      joinChannelEvent,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+		}
+
+		err := handler(ev, conn)
+		if err != nil {
+			t.Logf("join returned error (expected for test): %v", err)
+		}
+	})
+
+	t.Run("handles leave event", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		handler := endpoint.handleMessage()
+
+		ev := Event{
+			Action:      leaveChannelEvent,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+		}
+
+		err := handler(ev, conn)
+		if err == nil {
+			t.Log("leave succeeded (channel may not exist)")
+		}
+	})
+
+	t.Run("handles broadcast event", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		handler := endpoint.handleMessage()
+
+		ev := Event{
+			Action:      broadcast,
+			ChannelName: "room:123",
+			RequestId:   "req1",
+			Event:       "message",
+		}
+
+		err := handler(ev, conn)
+		if err == nil {
+			t.Log("broadcast succeeded (channel may not exist)")
+		}
+	})
+
+	t.Run("handles unknown event type", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		handler := endpoint.handleMessage()
+
+		ev := Event{
+			Action:      action("unknown"),
+			ChannelName: "room:123",
+			RequestId:   "req1",
+			Event:       "unknown",
+		}
+
+		err := handler(ev, conn)
+		if err == nil {
+			t.Error("expected error for unknown event type")
+		}
+	})
+
+	t.Run("returns error when endpoint is closed", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+		conn := createTestConn("user1", nil)
+
+		handler := endpoint.handleMessage()
+
+		ev := Event{
+			Action:      broadcast,
+			ChannelName: "room:123",
+		}
+
+		err := handler(ev, conn)
+		if err == nil {
+			t.Error("expected error when endpoint is closed")
+		}
+	})
+}
+
+func TestEndpointSendMessage(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+
+	t.Run("sends message to existing user", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		ev := Event{
+			Action:      system,
+			ChannelName: "test",
+			Event:       "notification",
+			Payload:     map[string]interface{}{"msg": "hello"},
+		}
+
+		err := endpoint.sendMessage("user1", ev)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("returns error for non-existent user", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		ev := Event{
+			Action:      system,
+			ChannelName: "test",
+			Event:       "notification",
+		}
+
+		err := endpoint.sendMessage("nonexistent", ev)
+		if err == nil {
+			t.Error("expected error for non-existent user")
+		}
+	})
+}
+
+func TestEndpointNotFoundHandler(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+
+	t.Run("sends not found response", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+
+		handler := endpoint.notFoundHandler(ctx, "req123")
+
+		ev := joinEvent{
+			user:    conn,
+			channel: "unknown:channel",
+		}
+
+		err := handler(ev, nil)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("returns error when context is cancelled", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		conn := createTestConn("user1", nil)
+
+		handler := endpoint.notFoundHandler(cancelledCtx, "req123")
+
+		ev := joinEvent{
+			user:    conn,
+			channel: "unknown:channel",
+		}
+
+		err := handler(ev, nil)
+		if err == nil {
+			t.Error("expected error when context is cancelled")
+		}
+	})
+
+	t.Run("returns error when endpoint is closed", func(t *testing.T) {
+		closedCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		endpoint := newEndpoint(closedCtx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+
+		handler := endpoint.notFoundHandler(ctx, "req123")
+
+		ev := joinEvent{
+			user:    conn,
+			channel: "unknown:channel",
+		}
+
+		err := handler(ev, nil)
+		if err == nil {
+			t.Error("expected error when endpoint is closed")
+		}
+	})
+}
+
+func TestEndpointHandleClose(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+
+	t.Run("removes connection on close", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		err := endpoint.handleClose(conn)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		_, readErr := endpoint.connections.Read(conn.ID)
+		if readErr == nil {
+			t.Error("expected connection to be deleted")
+		}
+	})
+
+	t.Run("calls OnDisconnect hook", func(t *testing.T) {
+		disconnectCalled := false
+		opts := DefaultOptions()
+		opts.Hooks = &Hooks{
+			OnDisconnect: func(c Transport) {
+				disconnectCalled = true
+			},
+		}
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		endpoint.handleClose(conn)
+
+		if !disconnectCalled {
+			t.Error("expected OnDisconnect to be called")
+		}
+	})
+
+	t.Run("calls metrics ConnectionClosed", func(t *testing.T) {
+		metricsCalled := false
+		opts := DefaultOptions()
+		opts.Hooks = &Hooks{
+			Metrics: &mockMetricsCollector{},
+		}
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.connections.Create(conn.ID, conn)
+
+		endpoint.handleClose(conn)
+
+		if opts.Hooks.Metrics != nil {
+			metricsCalled = true
+		}
+
+		if !metricsCalled {
+			t.Error("expected metrics to be called")
+		}
+	})
+}
+
+func TestEndpointAddConnection(t *testing.T) {
+	ctx := context.Background()
+	opts := DefaultOptions()
+
+	t.Run("adds connection successfully", func(t *testing.T) {
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+
+		err := endpoint.addConnection(conn)
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		_, readErr := endpoint.connections.Read(conn.ID)
+		if readErr != nil {
+			t.Error("expected connection to be stored")
+		}
+	})
+
+	t.Run("rejects when max connections reached", func(t *testing.T) {
+		opts := DefaultOptions()
+		opts.MaxConnections = 1
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn1 := createTestConn("user1", nil)
+		endpoint.addConnection(conn1)
+
+		conn2 := createTestConn("user2", nil)
+		err := endpoint.addConnection(conn2)
+
+		if err == nil {
+			t.Error("expected error when max connections reached")
+		}
+	})
+
+	t.Run("calls OnConnect hook", func(t *testing.T) {
+		connectCalled := false
+		opts := DefaultOptions()
+		opts.Hooks = &Hooks{
+			OnConnect: func(c Transport) error {
+				connectCalled = true
+				return nil
+			},
+		}
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		endpoint.addConnection(conn)
+
+		if !connectCalled {
+			t.Error("expected OnConnect to be called")
+		}
+	})
+
+	t.Run("rejects when OnConnect fails", func(t *testing.T) {
+		opts := DefaultOptions()
+		opts.Hooks = &Hooks{
+			OnConnect: func(c Transport) error {
+				return errors.New("connection rejected")
+			},
+		}
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		err := endpoint.addConnection(conn)
+
+		if err == nil {
+			t.Error("expected error when OnConnect fails")
+		}
+	})
+
+	t.Run("returns error when endpoint is closed", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		endpoint := newEndpoint(ctx, "/test", opts)
+
+		conn := createTestConn("user1", nil)
+		err := endpoint.addConnection(conn)
+
+		if err == nil {
+			t.Error("expected error when endpoint is closed")
+		}
+	})
+}

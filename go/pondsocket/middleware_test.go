@@ -187,6 +187,127 @@ func TestMiddleware(t *testing.T) {
 	})
 }
 
+func TestMiddlewareCompose(t *testing.T) {
+	t.Run("composes multiple middlewares", func(t *testing.T) {
+		mw1 := newMiddleWare[string, string]()
+		mw2 := newMiddleWare[string, string]()
+
+		order := make([]int, 0)
+
+		mw1.Use(func(ctx context.Context, req string, res string, next nextFunc) error {
+			order = append(order, 1)
+			return next()
+		})
+
+		mw2.Use(func(ctx context.Context, req string, res string, next nextFunc) error {
+			order = append(order, 2)
+			return next()
+		})
+
+		composed := mw1.Compose(mw2)
+
+		err := composed.Handle(context.Background(), "test", "response", func(req string, res string) error {
+			order = append(order, 3)
+			return nil
+		})
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		expectedOrder := []int{1, 2, 3}
+		if len(order) != len(expectedOrder) {
+			t.Fatalf("expected order length %d, got %d", len(expectedOrder), len(order))
+		}
+		for i, v := range order {
+			if v != expectedOrder[i] {
+				t.Errorf("expected order[%d] = %d, got %d", i, expectedOrder[i], v)
+			}
+		}
+	})
+
+	t.Run("composes empty middlewares", func(t *testing.T) {
+		mw1 := newMiddleWare[string, string]()
+		mw2 := newMiddleWare[string, string]()
+
+		composed := mw1.Compose(mw2)
+
+		called := false
+		err := composed.Handle(context.Background(), "test", "response", func(req string, res string) error {
+			called = true
+			return nil
+		})
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if !called {
+			t.Error("expected final handler to be called")
+		}
+	})
+
+	t.Run("composes three middlewares", func(t *testing.T) {
+		mw1 := newMiddleWare[int, int]()
+		mw2 := newMiddleWare[int, int]()
+		mw3 := newMiddleWare[int, int]()
+
+		order := make([]int, 0)
+
+		mw1.Use(func(ctx context.Context, req int, res int, next nextFunc) error {
+			order = append(order, 1)
+			return next()
+		})
+
+		mw2.Use(func(ctx context.Context, req int, res int, next nextFunc) error {
+			order = append(order, 2)
+			return next()
+		})
+
+		mw3.Use(func(ctx context.Context, req int, res int, next nextFunc) error {
+			order = append(order, 3)
+			return next()
+		})
+
+		composed := mw1.Compose(mw2, mw3)
+
+		err := composed.Handle(context.Background(), 42, 0, func(req int, res int) error {
+			order = append(order, 4)
+			return nil
+		})
+
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		expectedOrder := []int{1, 2, 3, 4}
+		if len(order) != len(expectedOrder) {
+			t.Fatalf("expected order length %d, got %d", len(expectedOrder), len(order))
+		}
+	})
+
+	t.Run("composed middleware is independent", func(t *testing.T) {
+		mw1 := newMiddleWare[string, string]()
+
+		mw1.Use(func(ctx context.Context, req string, res string, next nextFunc) error {
+			return next()
+		})
+
+		composed := mw1.Compose()
+
+		mw1.Use(func(ctx context.Context, req string, res string, next nextFunc) error {
+			return errors.New("should not be called")
+		})
+
+		err := composed.Handle(context.Background(), "test", "response", func(req string, res string) error {
+			return nil
+		})
+
+		if err != nil {
+			t.Errorf("expected no error from composed, got %v", err)
+		}
+	})
+}
+
 func TestMiddlewareWithComplexTypes(t *testing.T) {
 
 	type Request struct {

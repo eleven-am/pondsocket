@@ -142,6 +142,8 @@ func TestLocalPubSub(t *testing.T) {
 			t.Fatalf("Unsubscribe failed: %v", err)
 		}
 
+		time.Sleep(10 * time.Millisecond)
+
 		pubsub.Publish("unsub.topic", []byte("msg2"))
 
 		select {
@@ -183,6 +185,36 @@ func TestLocalPubSub(t *testing.T) {
 		err = ps.Close()
 		if err != nil {
 			t.Errorf("Second close returned error: %v", err)
+		}
+	})
+}
+
+func TestPubSubClosedError(t *testing.T) {
+	t.Run("error message", func(t *testing.T) {
+		err := &pubsubClosedError{}
+		expected := "pubsub: closed"
+		if err.Error() != expected {
+			t.Errorf("expected %q, got %q", expected, err.Error())
+		}
+	})
+
+	t.Run("isPubSubClosed returns true", func(t *testing.T) {
+		err := &pubsubClosedError{}
+		if !isPubSubClosed(err) {
+			t.Error("expected isPubSubClosed to return true")
+		}
+	})
+
+	t.Run("isPubSubClosed returns false for other errors", func(t *testing.T) {
+		err := context.Canceled
+		if isPubSubClosed(err) {
+			t.Error("expected isPubSubClosed to return false for context.Canceled")
+		}
+	})
+
+	t.Run("isPubSubClosed returns false for nil", func(t *testing.T) {
+		if isPubSubClosed(nil) {
+			t.Error("expected isPubSubClosed to return false for nil")
 		}
 	})
 }
