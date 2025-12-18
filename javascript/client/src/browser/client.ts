@@ -48,6 +48,7 @@ export class PondClient {
         } catch (e) {
             address = new URL(window.location.toString());
             address.pathname = endpoint;
+            address.hash = '';
         }
 
         this._disconnecting = false;
