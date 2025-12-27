@@ -99,24 +99,28 @@ func (l *Lobby) OnOutgoing(event Path, handler OutgoingEventHandler) {
 	})
 }
 
-// GetChannel retrieves a channel by name.
-// If the channel does not exist, it returns an error with StatusNotFound.
+// HasChannel returns true if a channel with the given name exists in this lobby.
+// This method is safe to call concurrently.
+func (l *Lobby) HasChannel(name string) bool {
+	if err := l.endpoint.checkState(); err != nil {
+		return false
+	}
+
+	ch, err := l.channels.Read(name)
+	return err == nil && ch != nil
+}
+
+// GetChannel retrieves a channel by name, creating it if it doesn't exist.
+// This is useful for distributed setups where you need to interact with a channel
+// that may not have any local users. The created channel will subscribe to PubSub
+// and can receive/send messages to users on other nodes.
 // This method is safe to call concurrently.
 func (l *Lobby) GetChannel(name string) (*Channel, error) {
 	if err := l.endpoint.checkState(); err != nil {
 		return nil, err
 	}
 
-	ch, err := l.channels.Read(name)
-	if err != nil {
-		return nil, err
-	}
-
-	if ch == nil {
-		return nil, &Error{Code: StatusNotFound, Message: "channel not found"}
-	}
-
-	return ch, nil
+	return l.createChannel(name)
 }
 
 func (l *Lobby) createChannel(name string) (*Channel, error) {

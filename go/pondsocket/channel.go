@@ -42,8 +42,10 @@ type Channel struct {
 	mutex                       sync.RWMutex
 	syncCoordinators            map[string]*syncCoordinator
 	assignsSyncCoordinators     map[string]*syncCoordinator
+	userGetCoordinators         map[string]chan *User
 	syncCoordinatorMutex        sync.RWMutex
 	assignsSyncCoordinatorMutex sync.RWMutex
+	userGetCoordinatorMutex     sync.RWMutex
 	internalQueueTimeout        time.Duration
 	hooks                       *Hooks
 	dispatchSem                 chan struct{}
@@ -68,6 +70,7 @@ func newChannel(ctx context.Context, options options) *Channel {
 		cancel:                  cancel,
 		syncCoordinators:        make(map[string]*syncCoordinator),
 		assignsSyncCoordinators: make(map[string]*syncCoordinator),
+		userGetCoordinators:     make(map[string]chan *User),
 		internalQueueTimeout:    options.InternalQueueTimeout,
 		dispatchSem:             make(chan struct{}, 32),
 	}
@@ -87,22 +90,34 @@ func (c *Channel) Name() string {
 // The reason parameter describes why the user is leaving (e.g., "disconnect", "evicted", "explicit_leave").
 // If a leave handler is configured, it will be called asynchronously after removal.
 // If this was the last user in the channel and an onDestroy handler is set, the channel will be destroyed.
+// In distributed setups, if the user is not on this node, the remove command
+// is published via PubSub for the node hosting the user to handle.
 func (c *Channel) RemoveUser(userID string, reason string) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
 
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	if err := c.checkState(); err != nil {
+		c.mutex.Unlock()
 		return err
 	}
 
 	user, userErr := c.getUserUnsafe(userID)
 	if userErr != nil {
+		c.mutex.Unlock()
+		if c.pubsub != nil && c.endpointPath != "" {
+			return c.publishUserCommand(userRemoveCommand, userID, reason)
+		}
 		return userErr
 	}
 
+	err := c.removeUserLocal(user, userID, reason)
+	c.mutex.Unlock()
+	return err
+}
+
+func (c *Channel) removeUserLocal(user *User, userID, reason string) error {
 	storeErr := c.store.Delete(userID)
 	presenceErr := c.presence.UnTrack(userID)
 	connectionErr := c.connections.Delete(userID)
@@ -138,25 +153,34 @@ func (c *Channel) RemoveUser(userID string, reason string) error {
 // GetUser retrieves a user's information including their assigns and presence data.
 // Returns a User struct containing the user's ID, assigns (server-side metadata),
 // and presence data if the user is being tracked.
-// Returns an error if the user is not found in the channel.
+// In distributed setups, if the user is not found locally, a sync request is sent
+// to other nodes to locate the user.
+// Returns an error if the user is not found in the channel on any node.
 func (c *Channel) GetUser(userID string) (*User, error) {
 	if err := c.checkState(); err != nil {
 		return nil, err
 	}
 	c.mutex.RLock()
+	user, err := c.getUserUnsafe(userID)
+	c.mutex.RUnlock()
 
-	defer c.mutex.RUnlock()
+	if err == nil {
+		return user, nil
+	}
 
-	if err := c.checkState(); err != nil {
+	if c.pubsub == nil || c.endpointPath == "" {
 		return nil, err
 	}
-	return c.getUserUnsafe(userID)
+
+	return c.requestRemoteUser(userID)
 }
 
 // EvictUser forcefully removes a user from the channel and notifies all other users.
 // The evicted user receives an "evicted" system event with the reason,
 // and all other users receive a "user_evicted" broadcast event.
 // After eviction, the user is removed from the channel.
+// In distributed setups, if the user is not on this node, the eviction command
+// is published via PubSub for the node hosting the user to handle.
 func (c *Channel) EvictUser(userID, reason string) error {
 	if err := c.checkState(); err != nil {
 		return err
@@ -164,9 +188,16 @@ func (c *Channel) EvictUser(userID, reason string) error {
 
 	_, err := c.GetUser(userID)
 	if err != nil {
+		if c.pubsub != nil && c.endpointPath != "" {
+			return c.publishUserCommand(userEvictCommand, userID, reason)
+		}
 		return err
 	}
 
+	return c.evictUserLocal(userID, reason)
+}
+
+func (c *Channel) evictUserLocal(userID, reason string) error {
 	evictionPayload := map[string]interface{}{
 		"reason": reason,
 		"userId": userID,
@@ -188,15 +219,15 @@ func (c *Channel) EvictUser(userID, reason string) error {
 		Payload:     evictionPayload,
 	}
 
-	if err = c.sendMessage(string(channelEntity), recipients{userIds: []string{userID}}, systemEvent); err != nil {
+	if err := c.sendMessage(string(channelEntity), recipients{userIds: []string{userID}}, systemEvent); err != nil {
 		return wrapF(err, "failed to send eviction system message to user %s", userID)
 	}
 
-	if err = c.RemoveUser(userID, "evicted:"+reason); err != nil {
+	if err := c.RemoveUser(userID, "evicted:"+reason); err != nil {
 		return wrapF(err, "failed to remove user %s during eviction", userID)
 	}
 
-	if err = c.checkState(); err != nil {
+	if err := c.checkState(); err != nil {
 		return nil
 	}
 
@@ -361,7 +392,8 @@ func (c *Channel) UpdatePresence(userID string, presenceData interface{}) error 
 // UpdateAssigns updates a specific assign key-value pair for a user.
 // Assigns are server-side metadata that are never automatically sent to clients.
 // In distributed setups, the update is synchronized across nodes via PubSub.
-// Returns an error if the user does not exist in the channel.
+// If the user is not on this node, the update is published via PubSub for the
+// node hosting the user to handle.
 func (c *Channel) UpdateAssigns(userID string, key string, value interface{}) error {
 	if err := c.checkState(); err != nil {
 		return err
@@ -376,6 +408,10 @@ func (c *Channel) UpdateAssigns(userID string, key string, value interface{}) er
 	assigns, err := c.store.Read(userID)
 
 	if err != nil {
+		if c.pubsub != nil && c.endpointPath != "" {
+			go c.broadcastAssignsUpdate(userID, key, value)
+			return nil
+		}
 		return notFound(c.name, "User does not exist in channel to update assigns")
 	}
 
@@ -614,23 +650,9 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 			return specifiedIDs.some(func(targetId string) bool { return targetId == connId })
 		})
 
-		if targetUserIDs.length() < specifiedIDs.length() {
-			return notFound(c.name, "Some specified recipients not found").withDetails(map[string]interface{}{
-				"specifiedIds": specifiedIDs.items,
-				"foundIds":     targetUserIDs.items,
-			})
-		}
+		event.Recipients = recipients.userIds
 	} else {
 		return nil
-	}
-
-	if targetUserIDs.length() == 0 {
-		return nil
-	}
-
-	internalEv := internalEvent{
-		Event:      event,
-		Recipients: targetUserIDs,
 	}
 
 	if c.pubsub != nil && c.endpointPath != "" {
@@ -653,6 +675,16 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 			}()
 		}
 	}
+
+	if targetUserIDs == nil || targetUserIDs.length() == 0 {
+		return nil
+	}
+
+	internalEv := internalEvent{
+		Event:      event,
+		Recipients: targetUserIDs,
+	}
+
 	select {
 	case c.channel <- internalEv:
 		return nil
@@ -896,7 +928,11 @@ func (c *Channel) subscribeToPubSub() {
 		}
 		if event.Action == assigns {
 			c.handleRemoteAssignsEvent(&event)
+			return
+		}
 
+		if event.Action == userCommand {
+			c.handleRemoteUserCommand(&event)
 			return
 		}
 
@@ -918,9 +954,19 @@ func (c *Channel) subscribeToPubSub() {
 				})
 			})
 		} else {
-			recipientIDs = c.connections.Keys()
+			connectedUsers := c.connections.Keys()
+			if len(event.Recipients) > 0 {
+				specifiedIDs := fromSlice(event.Recipients)
+				recipientIDs = connectedUsers.filter(func(connID string) bool {
+					return specifiedIDs.some(func(targetID string) bool {
+						return targetID == connID
+					})
+				})
+			} else {
+				recipientIDs = connectedUsers
+			}
 		}
-		if recipientIDs.length() == 0 {
+		if recipientIDs == nil || recipientIDs.length() == 0 {
 			return
 		}
 		internalEv := internalEvent{
@@ -1009,6 +1055,93 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 	}
 	if err := c.pubsub.Publish(topic, data); err != nil {
 		c.reportError("pubsub_publish", err)
+	}
+}
+
+func (c *Channel) publishUserCommand(commandType userCommandType, userID string, reason string) error {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return notFound(c.name, "PubSub not configured for remote user command")
+	}
+
+	cleanEndpoint := c.endpointPath
+	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
+		cleanEndpoint = cleanEndpoint[1:]
+	}
+
+	payload := map[string]interface{}{
+		"userID": userID,
+		"reason": reason,
+	}
+
+	event := Event{
+		Action:      userCommand,
+		ChannelName: c.name,
+		RequestId:   uuid.NewString(),
+		Event:       string(commandType),
+		Payload:     payload,
+		NodeID:      c.nodeID,
+	}
+
+	topic := formatTopic(cleanEndpoint, c.name, string(commandType))
+
+	data, err := json.Marshal(event)
+	if err != nil {
+		return wrapF(err, "failed to marshal user command event")
+	}
+
+	if err := c.pubsub.Publish(topic, data); err != nil {
+		c.reportError("pubsub_publish", err)
+		return wrapF(err, "failed to publish user command")
+	}
+
+	return nil
+}
+
+func (c *Channel) handleRemoteUserCommand(event *Event) {
+	payload, ok := event.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	userID, _ := payload["userID"].(string)
+	reason, _ := payload["reason"].(string)
+
+	switch userCommandType(event.Event) {
+	case userGetRequest:
+		go c.handleUserGetRequest(event, userID)
+		return
+	case userGetResponse:
+		c.handleUserGetResponse(event)
+		return
+	}
+
+	if userID == "" {
+		return
+	}
+
+	c.mutex.RLock()
+	_, err := c.getUserUnsafe(userID)
+	c.mutex.RUnlock()
+	if err != nil {
+		return
+	}
+
+	switch userCommandType(event.Event) {
+	case userEvictCommand:
+		if err := c.evictUserLocal(userID, reason); err != nil {
+			c.reportError("remote_evict_user", err)
+		}
+	case userRemoveCommand:
+		c.mutex.Lock()
+		user, userErr := c.getUserUnsafe(userID)
+		if userErr != nil {
+			c.mutex.Unlock()
+			return
+		}
+		if err := c.removeUserLocal(user, userID, reason); err != nil {
+			c.reportError("remote_remove_user", err)
+		}
+		c.mutex.Unlock()
 	}
 }
 
@@ -1480,6 +1613,172 @@ func (c *Channel) sendAssignsSyncComplete(requestID, requesterUserID string, agg
 	select {
 	case c.channel <- internalEv:
 	case <-c.ctx.Done():
+	default:
+	}
+}
+
+func (c *Channel) requestRemoteUser(userID string) (*User, error) {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return nil, notFound(c.name, "User not found in channel")
+	}
+
+	cleanEndpoint := c.endpointPath
+	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
+		cleanEndpoint = cleanEndpoint[1:]
+	}
+
+	requestID := uuid.NewString()
+	responseChan := make(chan *User, 1)
+
+	c.userGetCoordinatorMutex.Lock()
+	c.userGetCoordinators[requestID] = responseChan
+	c.userGetCoordinatorMutex.Unlock()
+
+	defer func() {
+		c.userGetCoordinatorMutex.Lock()
+		delete(c.userGetCoordinators, requestID)
+		c.userGetCoordinatorMutex.Unlock()
+	}()
+
+	payload := map[string]interface{}{
+		"userID":    userID,
+		"requestID": requestID,
+	}
+
+	event := Event{
+		Action:      userCommand,
+		ChannelName: c.name,
+		RequestId:   requestID,
+		Event:       string(userGetRequest),
+		Payload:     payload,
+		NodeID:      c.nodeID,
+	}
+
+	topic := formatTopic(cleanEndpoint, c.name, string(userGetRequest))
+	data, err := json.Marshal(event)
+	if err != nil {
+		return nil, wrapF(err, "failed to marshal user get request")
+	}
+
+	if err := c.pubsub.Publish(topic, data); err != nil {
+		return nil, wrapF(err, "failed to publish user get request")
+	}
+
+	select {
+	case user := <-responseChan:
+		if user == nil {
+			return nil, notFound(c.name, "User not found in channel")
+		}
+		return user, nil
+	case <-time.After(500 * time.Millisecond):
+		return nil, notFound(c.name, "User not found in channel")
+	case <-c.ctx.Done():
+		return nil, wrapF(c.ctx.Err(), "channel closed while waiting for user")
+	}
+}
+
+func (c *Channel) handleUserGetRequest(event *Event, userID string) {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+
+	payload, ok := event.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	requestID, _ := payload["requestID"].(string)
+	if requestID == "" {
+		return
+	}
+
+	c.mutex.RLock()
+	user, err := c.getUserUnsafe(userID)
+	c.mutex.RUnlock()
+
+	if err != nil {
+		return
+	}
+
+	cleanEndpoint := c.endpointPath
+	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
+		cleanEndpoint = cleanEndpoint[1:]
+	}
+
+	var presenceData interface{}
+	if user.Presence != nil {
+		presenceData = user.Presence
+	}
+
+	responsePayload := map[string]interface{}{
+		"requestID": requestID,
+		"userID":    user.UserID,
+		"assigns":   user.Assigns,
+		"presence":  presenceData,
+		"found":     true,
+	}
+
+	responseEvent := Event{
+		Action:      userCommand,
+		ChannelName: c.name,
+		RequestId:   uuid.NewString(),
+		Event:       string(userGetResponse),
+		Payload:     responsePayload,
+		NodeID:      c.nodeID,
+	}
+
+	topic := formatTopic(cleanEndpoint, c.name, string(userGetResponse))
+	data, err := json.Marshal(responseEvent)
+	if err != nil {
+		return
+	}
+
+	if err := c.pubsub.Publish(topic, data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
+}
+
+func (c *Channel) handleUserGetResponse(event *Event) {
+	payload, ok := event.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	requestID, _ := payload["requestID"].(string)
+	if requestID == "" {
+		return
+	}
+
+	c.userGetCoordinatorMutex.RLock()
+	responseChan, exists := c.userGetCoordinators[requestID]
+	c.userGetCoordinatorMutex.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	found, _ := payload["found"].(bool)
+	if !found {
+		return
+	}
+
+	userID, _ := payload["userID"].(string)
+	assignsRaw := payload["assigns"]
+	presenceRaw := payload["presence"]
+
+	var assigns map[string]interface{}
+	if assignsMap, ok := assignsRaw.(map[string]interface{}); ok {
+		assigns = assignsMap
+	}
+
+	user := &User{
+		UserID:   userID,
+		Assigns:  assigns,
+		Presence: presenceRaw,
+	}
+
+	select {
+	case responseChan <- user:
 	default:
 	}
 }

@@ -20,6 +20,7 @@ type Event struct {
 	Payload     interface{} `json:"payload"`
 	Event       string      `json:"event"`
 	NodeID      string      `json:"nodeId,omitempty"`
+	Recipients  []string    `json:"recipients,omitempty"`
 }
 
 type internalEvent struct {
@@ -35,6 +36,8 @@ type messageEvent struct {
 type presenceEventType string
 
 type assignsEventType string
+
+type userCommandType string
 
 // Validate checks if the Event has all required fields populated.
 // Returns true if Action, ChannelName, Event, and RequestId are all non-empty,
@@ -86,6 +89,10 @@ const (
 	assignsSyncRequest   assignsEventType  = "assigns:sync_request"
 	assignsSyncResponse  assignsEventType  = "assigns:sync_response"
 	assignsSyncComplete  assignsEventType  = "assigns:sync_complete"
+	userEvictCommand     userCommandType   = "user:evict"
+	userRemoveCommand    userCommandType   = "user:remove"
+	userGetRequest       userCommandType   = "user:get_request"
+	userGetResponse      userCommandType   = "user:get_response"
 	all                  recipient         = "all"
 	allExceptSender      recipient         = "all_except_sender"
 	presence             action            = "PRESENCE"
@@ -93,6 +100,7 @@ const (
 	system               action            = "SYSTEM"
 	connect              action            = "CONNECT"
 	broadcast            action            = "BROADCAST"
+	userCommand          action            = "USER_COMMAND"
 	joinChannelEvent     action            = "JOIN_CHANNEL"
 	leaveChannelEvent    action            = "LEAVE_CHANNEL"
 	acknowledgeEvent     eventType         = "ACKNOWLEDGE"

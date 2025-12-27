@@ -245,7 +245,7 @@ func TestLobbyChannelCreationRaceCondition(t *testing.T) {
 		go func(index int) {
 			defer wg.Done()
 
-			ch, err := lobby.getOrCreateChannel("concurrent-channel")
+			ch, err := lobby.GetChannel("concurrent-channel")
 
 			channels[index] = ch
 			errors[index] = err
@@ -309,8 +309,8 @@ func TestLobbyWithCancelledContext(t *testing.T) {
 
 	cancel()
 
-	t.Run("getOrCreateChannel returns error", func(t *testing.T) {
-		_, err := lobby.getOrCreateChannel("test-channel")
+	t.Run("GetChannel returns error", func(t *testing.T) {
+		_, err := lobby.GetChannel("test-channel")
 
 		if err == nil {
 			t.Error("expected error when context is cancelled")
@@ -360,31 +360,146 @@ func TestLobbyGetChannel(t *testing.T) {
 	endpoint := createTestEndpoint(ctx)
 	lobby := newLobby(endpoint)
 
-	t.Run("returns nil for non-existent channel", func(t *testing.T) {
-		channel, err := lobby.GetChannel("nonexistent")
-		if err == nil {
-			t.Error("expected error for non-existent channel")
+	t.Run("creates channel when doesn't exist", func(t *testing.T) {
+		channel, err := lobby.GetChannel("new-channel")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
 		}
-		if channel != nil {
-			t.Error("expected nil channel")
+		if channel == nil {
+			t.Fatal("expected channel to be created")
+		}
+		if channel.name != "new-channel" {
+			t.Errorf("expected channel name 'new-channel', got %s", channel.name)
+		}
+
+		storedChannel, err := lobby.channels.Read("new-channel")
+		if err != nil {
+			t.Errorf("expected channel to be stored in lobby, got error: %v", err)
+		}
+		if storedChannel != channel {
+			t.Error("expected stored channel to match created channel")
 		}
 	})
 
-	t.Run("returns channel when exists", func(t *testing.T) {
-		created, err := lobby.createChannel("test-channel")
+	t.Run("returns existing channel when exists", func(t *testing.T) {
+		channel1, err := lobby.GetChannel("existing-channel")
+		if err != nil {
+			t.Fatalf("expected no error on first call, got %v", err)
+		}
+
+		channel2, err := lobby.GetChannel("existing-channel")
+		if err != nil {
+			t.Fatalf("expected no error on second call, got %v", err)
+		}
+
+		if channel1 != channel2 {
+			t.Error("expected same channel instance to be returned")
+		}
+	})
+
+	t.Run("returns error when endpoint context is cancelled", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancelledEndpoint := createTestEndpoint(cancelCtx)
+		cancelledLobby := newLobby(cancelledEndpoint)
+
+		cancel()
+
+		_, err := cancelledLobby.GetChannel("test-channel")
+		if err == nil {
+			t.Error("expected error when endpoint context is cancelled")
+		}
+	})
+
+	t.Run("channel can broadcast without local users", func(t *testing.T) {
+		sharedPubSub := NewLocalPubSub(ctx, 100)
+		endpoint.options.PubSub = sharedPubSub
+
+		channel, err := lobby.GetChannel("broadcast-channel")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		channel.endpointPath = "/socket"
+		channel.subscribeToPubSub()
+		defer channel.Close()
+
+		err = channel.Broadcast("test-event", map[string]string{"message": "hello"})
+		if err != nil {
+			t.Errorf("expected no error when broadcasting, got: %v", err)
+		}
+	})
+}
+
+func TestLobbyGetChannelConcurrency(t *testing.T) {
+	ctx := context.Background()
+	endpoint := createTestEndpoint(ctx)
+	lobby := newLobby(endpoint)
+
+	var wg sync.WaitGroup
+	channels := make([]*Channel, 20)
+	errors := make([]error, 20)
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			ch, err := lobby.GetChannel("concurrent-channel")
+			channels[index] = ch
+			errors[index] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errors {
+		if err != nil {
+			t.Errorf("goroutine %d got error: %v", i, err)
+		}
+	}
+
+	firstChannel := channels[0]
+	for i, ch := range channels {
+		if ch != firstChannel {
+			t.Errorf("goroutine %d got different channel instance", i)
+		}
+	}
+
+	if lobby.channels.Len() < 1 {
+		t.Error("expected at least 1 channel to be created")
+	}
+}
+
+func TestLobbyHasChannel(t *testing.T) {
+	ctx := context.Background()
+	endpoint := createTestEndpoint(ctx)
+	lobby := newLobby(endpoint)
+
+	t.Run("returns false for non-existent channel", func(t *testing.T) {
+		if lobby.HasChannel("nonexistent") {
+			t.Error("expected false for non-existent channel")
+		}
+	})
+
+	t.Run("returns true for existing channel", func(t *testing.T) {
+		_, err := lobby.createChannel("existing-channel")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
 
-		found, err := lobby.GetChannel("test-channel")
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
+		if !lobby.HasChannel("existing-channel") {
+			t.Error("expected true for existing channel")
 		}
-		if found == nil {
-			t.Error("expected to find channel")
-		}
-		if found != created {
-			t.Error("expected same channel instance")
+	})
+
+	t.Run("returns false when endpoint context is cancelled", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancelledEndpoint := createTestEndpoint(cancelCtx)
+		cancelledLobby := newLobby(cancelledEndpoint)
+
+		_, _ = cancelledLobby.createChannel("test-channel")
+		cancel()
+
+		if cancelledLobby.HasChannel("test-channel") {
+			t.Error("expected false when endpoint context is cancelled")
 		}
 	})
 }
+
