@@ -4,3 +4,5 @@ javascript/*/dist
 javascript/*/coverage
 /.idea
 /.claude
+node_modules
+dist
