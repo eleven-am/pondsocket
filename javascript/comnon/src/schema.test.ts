@@ -221,6 +221,232 @@ describe('Schema Validation', () => {
         });
     });
 
+    describe('clientMessageSchema - missing fields', () => {
+        it('should throw for missing requestId', () => {
+            const msg = {
+                event: 'test',
+                channelName: 'channel',
+                payload: {},
+                action: ClientActions.BROADCAST,
+            };
+
+            expect(() => clientMessageSchema.parse(msg)).toThrow('requestId: Missing required field');
+        });
+
+        it('should throw for missing channelName', () => {
+            const msg = {
+                event: 'test',
+                requestId: '123',
+                payload: {},
+                action: ClientActions.BROADCAST,
+            };
+
+            expect(() => clientMessageSchema.parse(msg)).toThrow('channelName: Missing required field');
+        });
+
+        it('should throw for missing payload', () => {
+            const msg = {
+                event: 'test',
+                requestId: '123',
+                channelName: 'channel',
+                action: ClientActions.BROADCAST,
+            };
+
+            expect(() => clientMessageSchema.parse(msg)).toThrow('payload: Missing required field');
+        });
+
+        it('should throw for missing action', () => {
+            const msg = {
+                event: 'test',
+                requestId: '123',
+                channelName: 'channel',
+                payload: {},
+            };
+
+            expect(() => clientMessageSchema.parse(msg)).toThrow('action: Missing required field');
+        });
+
+        it('should throw for non-string event', () => {
+            const msg = {
+                event: 123,
+                requestId: '123',
+                channelName: 'channel',
+                payload: {},
+                action: ClientActions.BROADCAST,
+            };
+
+            expect(() => clientMessageSchema.parse(msg)).toThrow('event: Expected string');
+        });
+
+        it('should throw when data is not an object', () => {
+            expect(() => clientMessageSchema.parse('not an object')).toThrow('clientMessage: Expected object');
+            expect(() => clientMessageSchema.parse(null)).toThrow('clientMessage: Expected object');
+            expect(() => clientMessageSchema.parse([])).toThrow('clientMessage: Expected object');
+        });
+    });
+
+    describe('serverMessageSchema - missing fields', () => {
+        it('should throw for missing event', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                payload: {},
+                action: ServerActions.BROADCAST,
+            };
+
+            expect(() => serverMessageSchema.parse(msg)).toThrow('event: Missing required field');
+        });
+
+        it('should throw for missing requestId', () => {
+            const msg = {
+                event: 'test',
+                channelName: 'channel',
+                payload: {},
+                action: ServerActions.BROADCAST,
+            };
+
+            expect(() => serverMessageSchema.parse(msg)).toThrow('requestId: Missing required field');
+        });
+
+        it('should throw for missing channelName', () => {
+            const msg = {
+                event: 'test',
+                requestId: '123',
+                payload: {},
+                action: ServerActions.BROADCAST,
+            };
+
+            expect(() => serverMessageSchema.parse(msg)).toThrow('channelName: Missing required field');
+        });
+
+        it('should throw for missing payload', () => {
+            const msg = {
+                event: 'test',
+                requestId: '123',
+                channelName: 'channel',
+                action: ServerActions.BROADCAST,
+            };
+
+            expect(() => serverMessageSchema.parse(msg)).toThrow('payload: Missing required field');
+        });
+
+        it('should throw for missing action', () => {
+            const msg = {
+                event: 'test',
+                requestId: '123',
+                channelName: 'channel',
+                payload: {},
+            };
+
+            expect(() => serverMessageSchema.parse(msg)).toThrow('action: Missing required field');
+        });
+    });
+
+    describe('presenceMessageSchema - missing fields', () => {
+        it('should throw for missing requestId', () => {
+            const msg = {
+                channelName: 'channel',
+                event: PresenceEventTypes.JOIN,
+                action: ServerActions.PRESENCE,
+                payload: { presence: [], changed: {} },
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('requestId: Missing required field');
+        });
+
+        it('should throw for missing channelName', () => {
+            const msg = {
+                requestId: '123',
+                event: PresenceEventTypes.JOIN,
+                action: ServerActions.PRESENCE,
+                payload: { presence: [], changed: {} },
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('channelName: Missing required field');
+        });
+
+        it('should throw for missing event', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                action: ServerActions.PRESENCE,
+                payload: { presence: [], changed: {} },
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('event: Missing required field');
+        });
+
+        it('should throw for missing action', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                event: PresenceEventTypes.JOIN,
+                payload: { presence: [], changed: {} },
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('action: Missing required field');
+        });
+
+        it('should throw for missing payload', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                event: PresenceEventTypes.JOIN,
+                action: ServerActions.PRESENCE,
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('payload: Missing required field');
+        });
+
+        it('should throw for missing payload.changed', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                event: PresenceEventTypes.JOIN,
+                action: ServerActions.PRESENCE,
+                payload: { presence: [] },
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('payload.changed: Missing required field');
+        });
+
+        it('should throw for non-object payload', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                event: PresenceEventTypes.JOIN,
+                action: ServerActions.PRESENCE,
+                payload: 'not an object',
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('payload: Expected object');
+        });
+
+        it('should throw for non-array presence', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                event: PresenceEventTypes.JOIN,
+                action: ServerActions.PRESENCE,
+                payload: { presence: 'not an array', changed: {} },
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('payload.presence: Expected array');
+        });
+
+        it('should throw for non-record changed', () => {
+            const msg = {
+                requestId: '123',
+                channelName: 'channel',
+                event: PresenceEventTypes.JOIN,
+                action: ServerActions.PRESENCE,
+                payload: { presence: [], changed: 'not an object' },
+            };
+
+            expect(() => presenceMessageSchema.parse(msg)).toThrow('payload.changed: Expected record');
+        });
+    });
+
     describe('ValidationError', () => {
         it('should include path in error message', () => {
             const error = new ValidationError('Test error', 'field.path');

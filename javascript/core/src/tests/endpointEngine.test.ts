@@ -250,7 +250,6 @@ describe('EndpointEngine', () => {
         });
     });
 
-    // Test for private method behavior
     describe('handleSocketClose', () => {
         it('should remove the socket from managed sockets and call all subscriptions', () => {
             const mockSocket = new MockWebSocket();
@@ -264,11 +263,225 @@ describe('EndpointEngine', () => {
 
             endpointEngine.manageSocket(socketCache);
 
-            // Simulate socket close event
-            mockSocket.on.mock.calls.find((call) => call[0] === 'close')[1]();
+            const closeHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'close')[1];
+
+            closeHandler();
 
             expect(() => endpointEngine.getUser('1')).toThrow();
             expect(mockUnsubscribe).toHaveBeenCalled();
+        });
+
+        it('should register error handler without removing socket (close event handles cleanup)', () => {
+            const mockSocket = new MockWebSocket();
+            const socketCache: SocketCache = {
+                clientId: '1',
+                socket: mockSocket as any,
+                assigns: {},
+                subscriptions: new Set(),
+            };
+
+            endpointEngine.manageSocket(socketCache);
+
+            const errorHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'error')[1];
+
+            errorHandler();
+
+            expect(endpointEngine.getUser('1')).toEqual(socketCache);
+        });
+    });
+
+    describe('message size limits', () => {
+        it('should reject messages exceeding maxMessageSize', () => {
+            const engine = new EndpointEngine('/test', null, 100);
+            const mockSocket = new MockWebSocket();
+            const socketCache: SocketCache = {
+                clientId: '1',
+                socket: mockSocket as any,
+                assigns: {},
+                subscriptions: new Set(),
+            };
+
+            engine.manageSocket(socketCache);
+
+            const messageHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'message')[1];
+            const longMessage = 'x'.repeat(200);
+
+            messageHandler(longMessage);
+
+            expect(mockSocket.send).toHaveBeenCalledTimes(2);
+
+            const lastCall = mockSocket.send.mock.calls[1][0];
+            const parsed = JSON.parse(lastCall);
+
+            expect(parsed.action).toBe(ServerActions.ERROR);
+            expect(parsed.payload.error.status).toBe(413);
+        });
+    });
+
+    describe('invalid JSON messages', () => {
+        it('should send error response for malformed JSON', () => {
+            const mockSocket = new MockWebSocket();
+            const socketCache: SocketCache = {
+                clientId: '1',
+                socket: mockSocket as any,
+                assigns: {},
+                subscriptions: new Set(),
+            };
+
+            endpointEngine.manageSocket(socketCache);
+
+            const messageHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'message')[1];
+
+            messageHandler('not valid json');
+
+            expect(mockSocket.send).toHaveBeenCalledTimes(2);
+
+            const lastCall = mockSocket.send.mock.calls[1][0];
+            const parsed = JSON.parse(lastCall);
+
+            expect(parsed.action).toBe(ServerActions.ERROR);
+            expect(parsed.event).toBe('INVALID_MESSAGE');
+        });
+    });
+
+    describe('invalid client message schema', () => {
+        it('should send error response for messages failing schema validation', () => {
+            const mockSocket = new MockWebSocket();
+            const socketCache: SocketCache = {
+                clientId: '1',
+                socket: mockSocket as any,
+                assigns: {},
+                subscriptions: new Set(),
+            };
+
+            endpointEngine.manageSocket(socketCache);
+
+            const messageHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'message')[1];
+
+            messageHandler(JSON.stringify({ invalid: 'data' }));
+
+            expect(mockSocket.send).toHaveBeenCalledTimes(2);
+
+            const lastCall = mockSocket.send.mock.calls[1][0];
+            const parsed = JSON.parse(lastCall);
+
+            expect(parsed.action).toBe(ServerActions.ERROR);
+        });
+    });
+
+    describe('leave channel', () => {
+        it('should handle LEAVE_CHANNEL action', () => {
+            const path = '/test-channel' as PondPath<'/test-channel'>;
+            const handler = jest.fn((ctx: JoinContext<any>) => {
+                ctx.accept();
+            });
+
+            endpointEngine.createChannel(path, handler);
+
+            const mockSocket = new MockWebSocket();
+            const socketCache: SocketCache = {
+                clientId: 'client1',
+                socket: mockSocket as any,
+                assigns: {},
+                subscriptions: new Set(),
+            };
+
+            endpointEngine.manageSocket(socketCache);
+
+            const messageHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'message')[1];
+
+            const joinMessage: ClientMessage = {
+                event: 'join',
+                action: ClientActions.JOIN_CHANNEL,
+                channelName: '/test-channel',
+                requestId: '123',
+                payload: {},
+            };
+
+            messageHandler(JSON.stringify(joinMessage));
+
+            const leaveMessage: ClientMessage = {
+                event: 'leave',
+                action: ClientActions.LEAVE_CHANNEL,
+                channelName: '/test-channel',
+                requestId: '456',
+                payload: {},
+            };
+
+            messageHandler(JSON.stringify(leaveMessage));
+        });
+    });
+
+    describe('broadcast message', () => {
+        it('should handle BROADCAST action', () => {
+            const path = '/test-channel' as PondPath<'/test-channel'>;
+
+            endpointEngine.createChannel(path, (ctx: JoinContext<any>) => {
+                ctx.accept();
+            });
+
+            const mockSocket = new MockWebSocket();
+            const socketCache: SocketCache = {
+                clientId: 'client1',
+                socket: mockSocket as any,
+                assigns: {},
+                subscriptions: new Set(),
+            };
+
+            endpointEngine.manageSocket(socketCache);
+
+            const messageHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'message')[1];
+
+            const joinMessage: ClientMessage = {
+                event: 'join',
+                action: ClientActions.JOIN_CHANNEL,
+                channelName: '/test-channel',
+                requestId: '123',
+                payload: {},
+            };
+
+            messageHandler(JSON.stringify(joinMessage));
+
+            const broadcastMessage: ClientMessage = {
+                event: 'hello',
+                action: ClientActions.BROADCAST,
+                channelName: '/test-channel',
+                requestId: '789',
+                payload: { text: 'hi' },
+            };
+
+            messageHandler(JSON.stringify(broadcastMessage));
+        });
+    });
+
+    describe('join non-existent channel', () => {
+        it('should send error when joining a channel with no matching pattern', () => {
+            const mockSocket = new MockWebSocket();
+            const socketCache: SocketCache = {
+                clientId: 'client1',
+                socket: mockSocket as any,
+                assigns: {},
+                subscriptions: new Set(),
+            };
+
+            endpointEngine.manageSocket(socketCache);
+
+            const messageHandler = mockSocket.on.mock.calls.find((call) => call[0] === 'message')[1];
+
+            const joinMessage: ClientMessage = {
+                event: 'join',
+                action: ClientActions.JOIN_CHANNEL,
+                channelName: '/nonexistent',
+                requestId: '123',
+                payload: {},
+            };
+
+            messageHandler(JSON.stringify(joinMessage));
+
+            const calls = mockSocket.send.mock.calls;
+            const lastCall = JSON.parse(calls[calls.length - 1][0]);
+
+            expect(lastCall.action).toBe(ServerActions.ERROR);
         });
     });
 });

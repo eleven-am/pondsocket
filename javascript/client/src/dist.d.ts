@@ -102,7 +102,7 @@ declare class Channel<EventMap extends PondEventMap = PondEventMap, Presence ext
      * @param sentEvent - The event to send.
      * @param payload - The message to send.
      */
-    sendForResponse<Event extends EventWithResponse<EventMap>> (sentEvent: Event, payload: PayloadForResponse<EventMap, Event>): Promise<ResponseForEvent<EventMap, Event>>;
+    sendForResponse<Event extends EventWithResponse<EventMap>> (sentEvent: Event, payload: PayloadForResponse<EventMap, Event>, timeoutMs?: number): Promise<ResponseForEvent<EventMap, Event>>;
 }
 
 declare class PondClient {

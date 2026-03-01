@@ -1,17 +1,12 @@
 import { Subject, Unsubscribe } from '@eleven-am/pondsocket-common';
 import { createClient, RedisClientType } from 'redis';
 
-import { DistributedChannelMessage, IDistributedBackend } from '../types';
-import { DistributedMessageType } from './types';
-
-interface RedisDistributedBackendOptions {
-    host?: string;
-    port?: number;
-    password?: string;
-    database?: number;
-    url?: string;
-    keyPrefix?: string;
-}
+import {
+    DistributedChannelMessage,
+    DistributedMessageType,
+    IDistributedBackend,
+    RedisDistributedBackendOptions,
+} from '../types';
 
 export class RedisDistributedBackend implements IDistributedBackend {
     readonly #publishClient: RedisClientType;
@@ -20,11 +15,27 @@ export class RedisDistributedBackend implements IDistributedBackend {
 
     readonly #keyPrefix: string;
 
-    readonly #subject: Subject<DistributedChannelMessage>;
+    readonly #heartbeatSubject: Subject<string>;
 
     readonly #nodeId: string;
 
+    readonly #heartbeatIntervalMs: number;
+
+    readonly #heartbeatTimeoutMs: number;
+
+    readonly #onError: ((error: Error) => void) | null;
+
     #isConnected: boolean = false;
+
+    #heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    get nodeId (): string {
+        return this.#nodeId;
+    }
+
+    get heartbeatTimeoutMs (): number {
+        return this.#heartbeatTimeoutMs;
+    }
 
     constructor (options: RedisDistributedBackendOptions = {}) {
         const {
@@ -34,48 +45,73 @@ export class RedisDistributedBackend implements IDistributedBackend {
             database = 0,
             url,
             keyPrefix = 'pondsocket',
+            heartbeatIntervalMs = 30_000,
+            heartbeatTimeoutMs = 90_000,
+            onError = null,
         } = options;
 
         this.#keyPrefix = keyPrefix;
+        this.#heartbeatIntervalMs = heartbeatIntervalMs;
+        this.#heartbeatTimeoutMs = heartbeatTimeoutMs;
+        this.#onError = onError;
         this.#nodeId = Math.random().toString(36)
             .substring(2, 15);
-        this.#subject = new Subject<DistributedChannelMessage & { nodeId: string }>();
+        this.#heartbeatSubject = new Subject<string>();
 
-        // Create Redis clients
+        const reconnectStrategy = (retries: number) => {
+            const delay = Math.min(retries * 100, 5000);
+
+            return delay;
+        };
+
         const clientConfig = url
-            ? { url }
-            : { socket: { host,
-                port },
-            password,
-            database };
+            ? { url,
+                socket: { reconnectStrategy } }
+            : {
+                socket: { host,
+                    port,
+                    reconnectStrategy },
+                password,
+                database,
+            };
 
         this.#publishClient = createClient(clientConfig);
         this.#subscribeClient = this.#publishClient.duplicate();
 
-        void this.#initialize();
+        this.#attachEventHandlers(this.#publishClient, 'publish');
+        this.#attachEventHandlers(this.#subscribeClient, 'subscribe');
     }
 
-    /**
-     * Gets the subject for subscribing to distributed messages
-     */
-    get subject (): Subject<DistributedChannelMessage & { nodeId: string }> {
-        return this.#subject as Subject<DistributedChannelMessage & { nodeId: string }>;
-    }
+    async subscribeToChannel (endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Promise<Unsubscribe> {
+        const key = this.#buildKey(endpointName, channelName);
 
-    /**
-     * Subscribe to messages for a specific endpoint and channel
-     */
-    subscribe (endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Unsubscribe {
-        return this.subject.subscribe((message) => {
-            if (message.endpointName === endpointName && message.channelName === channelName && message.nodeId !== this.#nodeId) {
-                handler(message);
+        const listener = (message: string) => {
+            try {
+                const parsedMessage: DistributedChannelMessage & { nodeId: string } = JSON.parse(message);
+
+                if (!this.#isValidMessage(parsedMessage)) {
+                    return;
+                }
+
+                if (parsedMessage.nodeId !== this.#nodeId) {
+                    handler(parsedMessage);
+                }
+            } catch (_) {
+                void 0;
             }
-        });
+        };
+
+        await this.#subscribeClient.subscribe(key, listener);
+
+        return () => {
+            this.#subscribeClient.unsubscribe(key).catch(() => {});
+        };
     }
 
-    /**
-     * Broadcasts a message to all nodes for a specific endpoint and channel
-     */
+    subscribeToHeartbeats (handler: (nodeId: string) => void): Unsubscribe {
+        return this.#heartbeatSubject.subscribe(handler);
+    }
+
     async broadcast (endpointName: string, channelName: string, message: DistributedChannelMessage): Promise<void> {
         if (!this.#isConnected) {
             throw new Error('Redis backend is not connected');
@@ -85,6 +121,7 @@ export class RedisDistributedBackend implements IDistributedBackend {
         const distributedMessage = {
             ...message,
             nodeId: this.#nodeId,
+            sourceNodeId: this.#nodeId,
         };
 
         const serializedMessage = JSON.stringify(distributedMessage);
@@ -92,11 +129,13 @@ export class RedisDistributedBackend implements IDistributedBackend {
         await this.#publishClient.publish(key, serializedMessage);
     }
 
-    /**
-     * Cleanup and close all Redis connections
-     */
     async cleanup (): Promise<void> {
-        this.subject.close();
+        if (this.#heartbeatTimer) {
+            clearInterval(this.#heartbeatTimer);
+            this.#heartbeatTimer = null;
+        }
+
+        this.#heartbeatSubject.close();
 
         if (this.#subscribeClient.isOpen) {
             await this.#subscribeClient.quit();
@@ -109,42 +148,82 @@ export class RedisDistributedBackend implements IDistributedBackend {
         this.#isConnected = false;
     }
 
-    /**
-     * Initialize Redis connections and setup subscription
-     */
-    async #initialize (): Promise<void> {
+    async initialize (): Promise<void> {
         await Promise.all([
             this.#publishClient.connect(),
             this.#subscribeClient.connect(),
         ]);
 
-        const pattern = `${this.#keyPrefix}:*`;
+        const heartbeatKey = this.#buildKey('__heartbeat__', '__heartbeat__');
 
-        await this.#subscribeClient.pSubscribe(pattern, (message) => {
-            this.#handleRedisMessage(message);
+        await this.#subscribeClient.subscribe(heartbeatKey, (message) => {
+            this.#handleHeartbeatMessage(message);
         });
 
         this.#isConnected = true;
+        this.#startHeartbeat();
     }
 
-    /**
-     * Handle incoming Redis messages and publish to subject
-     */
-    #handleRedisMessage (message: string): void {
-        try {
-            const parsedMessage: DistributedChannelMessage & { nodeId: string } = JSON.parse(message);
-
-            if (this.#isValidMessage(parsedMessage)) {
-                this.subject.publish(parsedMessage);
+    #attachEventHandlers (client: RedisClientType, label: string): void {
+        client.on('error', (err: Error) => {
+            this.#isConnected = false;
+            if (this.#onError) {
+                this.#onError(new Error(`Redis ${label} client error: ${err.message}`));
             }
-        } catch {
-            // Silently ignore invalid messages
+        });
+
+        client.on('ready', () => {
+            if (this.#publishClient.isReady && this.#subscribeClient.isReady) {
+                this.#isConnected = true;
+            }
+        });
+
+        client.on('end', () => {
+            this.#isConnected = false;
+        });
+    }
+
+    #startHeartbeat (): void {
+        this.#publishHeartbeat();
+
+        this.#heartbeatTimer = setInterval(() => {
+            this.#publishHeartbeat();
+        }, this.#heartbeatIntervalMs);
+    }
+
+    #publishHeartbeat (): void {
+        if (!this.#isConnected) {
+            return;
+        }
+
+        const heartbeatMessage = {
+            type: DistributedMessageType.NODE_HEARTBEAT,
+            endpointName: '__heartbeat__',
+            channelName: '__heartbeat__',
+            nodeId: this.#nodeId,
+        };
+
+        const key = this.#buildKey('__heartbeat__', '__heartbeat__');
+
+        this.#publishClient.publish(key, JSON.stringify(heartbeatMessage)).catch((err: Error) => {
+            if (this.#onError) {
+                this.#onError(new Error(`Failed to publish heartbeat: ${err.message}`));
+            }
+        });
+    }
+
+    #handleHeartbeatMessage (message: string): void {
+        try {
+            const parsedMessage = JSON.parse(message);
+
+            if (parsedMessage.type === DistributedMessageType.NODE_HEARTBEAT && parsedMessage.nodeId !== this.#nodeId) {
+                this.#heartbeatSubject.publish(parsedMessage.nodeId);
+            }
+        } catch (_) {
+            void 0;
         }
     }
 
-    /**
-     * Validate that a message has the required structure
-     */
     #isValidMessage (message: any): message is DistributedChannelMessage {
         return (
             typeof message === 'object' &&
@@ -155,11 +234,7 @@ export class RedisDistributedBackend implements IDistributedBackend {
         );
     }
 
-    /**
-     * Build the Redis key for endpoint and channel
-     */
     #buildKey (endpointName: string, channelName: string): string {
         return `${this.#keyPrefix}:${endpointName}:${channelName}`;
     }
 }
-

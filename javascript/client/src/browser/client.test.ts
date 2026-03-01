@@ -14,11 +14,9 @@ class MockWebSocket {
 
     readyState = MockWebSocket.CONNECTING;
 
-    // eslint-disable-next-line no-useless-constructor
     constructor (readonly url: string) {}
 }
 
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-expect-error
 global.WebSocket = MockWebSocket;
 
@@ -35,7 +33,7 @@ describe('PondClient', () => {
 
     test('connect method should set up WebSocket events', () => {
         pondClient.connect();
-        const mockWebSocket = pondClient['_socket'];
+        const mockWebSocket = pondClient['_socket']!;
 
         expect(mockWebSocket.onmessage).toBeInstanceOf(Function);
         expect(mockWebSocket.onclose).toBeInstanceOf(Function);
@@ -43,7 +41,7 @@ describe('PondClient', () => {
 
     test('it should publish messages received from the server', () => {
         pondClient.connect();
-        const mockWebSocket = pondClient['_socket'];
+        const mockWebSocket = pondClient['_socket']! as any;
         const broadcasterSpy = jest.spyOn(pondClient['_broadcaster'], 'publish');
 
         mockWebSocket.onmessage({
@@ -89,7 +87,7 @@ describe('PondClient', () => {
         mockCallback.mockClear();
 
         pondClient.connect();
-        const mockWebSocket = pondClient['_socket'];
+        const mockWebSocket = pondClient['_socket']! as any;
 
         expect(mockCallback).toHaveBeenCalledWith(ConnectionState.CONNECTING);
 
@@ -109,7 +107,6 @@ describe('PondClient', () => {
         const mockChannel = pondClient.createChannel('exampleChannel');
         const mockExistingChannel = pondClient.createChannel('exampleChannel');
 
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
         expect(mockChannel).toBeInstanceOf(require('../core/channel').Channel);
         expect(mockExistingChannel).toBe(mockChannel);
     });
@@ -128,7 +125,6 @@ describe('PondClient', () => {
 
         pondClient['_connectionState'].publish(ConnectionState.DISCONNECTED);
 
-        // Should not be called again after unsubscribe
         expect(mockCallback).toHaveBeenCalledTimes(1);
     });
 
@@ -146,7 +142,7 @@ describe('PondClient', () => {
 
     test('publish method should send a message to the server', () => {
         pondClient.connect();
-        const mockWebSocket = pondClient['_socket'];
+        const mockWebSocket = pondClient['_socket']! as any;
         const channel = pondClient.createChannel('exampleChannel');
 
         const acknowledgeEvent: ChannelEvent = {
@@ -181,7 +177,7 @@ describe('PondClient', () => {
         const connectSpy = jest.spyOn(pondClient, 'connect');
 
         pondClient.connect();
-        let mockWebSocket = pondClient['_socket'];
+        let mockWebSocket = pondClient['_socket']! as any;
 
         expect(connectSpy).toHaveBeenCalledTimes(1);
 
@@ -190,7 +186,7 @@ describe('PondClient', () => {
         await new Promise((resolve) => setTimeout(resolve, 1000));
         expect(connectSpy).toHaveBeenCalledTimes(1);
         connectSpy.mockClear();
-        mockWebSocket = pondClient['_socket'];
+        mockWebSocket = pondClient['_socket']! as any;
 
         mockWebSocket.onclose();
 
@@ -204,7 +200,7 @@ describe('PondClient', () => {
         pondClient.onError(errorCallback);
         pondClient.connect();
 
-        const mockWebSocket = pondClient['_socket'];
+        const mockWebSocket = pondClient['_socket']! as any;
 
         mockWebSocket.onerror({ type: 'error' });
 
@@ -232,7 +228,7 @@ describe('PondClient', () => {
         clientWithTimeout.onError(errorCallback);
         clientWithTimeout.connect();
 
-        const mockWebSocket = clientWithTimeout['_socket'];
+        const mockWebSocket = clientWithTimeout['_socket']! as any;
 
         mockWebSocket.readyState = MockWebSocket.CONNECTING;
 
@@ -250,7 +246,7 @@ describe('PondClient', () => {
 
         clientWithPing.connect();
 
-        const mockWebSocket = clientWithPing['_socket'];
+        const mockWebSocket = clientWithPing['_socket']! as any;
 
         mockWebSocket.readyState = MockWebSocket.OPEN;
 
@@ -269,7 +265,7 @@ describe('PondClient', () => {
 
     test('disconnect should clear timeouts and stop reconnection', () => {
         pondClient.connect();
-        const mockWebSocket = pondClient['_socket'];
+        const mockWebSocket = pondClient['_socket']! as any;
 
         pondClient.disconnect();
 

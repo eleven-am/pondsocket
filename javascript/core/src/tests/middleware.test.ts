@@ -168,5 +168,117 @@ describe('Middleware', () => {
             expect(finalFn).toHaveBeenCalled();
             expect(finalFn).toHaveBeenCalled();
         });
+
+        it('should wrap non-Error thrown values in HttpError', () => {
+            const badMiddleware: MiddlewareFunction<any, any> = () => {
+                throw 'string error';
+            };
+
+            middleware.use(badMiddleware);
+
+            const finalFn = jest.fn();
+
+            middleware.run({}, {}, finalFn);
+
+            expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
+            expect(finalFn.mock.calls[0][0].message).toBe('An error occurred while processing the request');
+            expect(finalFn.mock.calls[0][0].statusCode).toBe(500);
+        });
+
+        it('should forward HttpError passed to next', () => {
+            const errorMiddleware: MiddlewareFunction<any, any> = (_req, _res, next) => {
+                next(new HttpError(403, 'Forbidden'));
+            };
+
+            middleware.use(errorMiddleware);
+
+            const finalFn = jest.fn();
+
+            middleware.run({}, {}, finalFn);
+
+            expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
+            expect(finalFn.mock.calls[0][0].statusCode).toBe(403);
+        });
+    });
+
+    describe('runAsync', () => {
+        it('should execute middleware functions in order', async () => {
+            const order: number[] = [];
+
+            middleware.use(async (_req, _res, next) => {
+                order.push(1);
+                await next();
+            });
+            middleware.use(async (_req, _res, next) => {
+                order.push(2);
+                await next();
+            });
+
+            await middleware.runAsync({}, {}, () => {
+                order.push(3);
+            });
+
+            expect(order).toEqual([1, 2, 3]);
+        });
+
+        it('should handle errors thrown in async middleware', async () => {
+            middleware.use(async () => {
+                throw new Error('Async runAsync error');
+            });
+
+            const finalFn = jest.fn();
+
+            await middleware.runAsync({}, {}, finalFn);
+
+            expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
+            expect(finalFn.mock.calls[0][0].message).toBe('Async runAsync error');
+        });
+
+        it('should pass HttpError through without wrapping in runAsync', async () => {
+            middleware.use(async () => {
+                throw new HttpError(401, 'Unauthorized');
+            });
+
+            const finalFn = jest.fn();
+
+            await middleware.runAsync({}, {}, finalFn);
+
+            expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
+            expect(finalFn.mock.calls[0][0].statusCode).toBe(401);
+        });
+
+        it('should call final when stack is empty', async () => {
+            const finalFn = jest.fn();
+
+            await middleware.runAsync({}, {}, finalFn);
+
+            expect(finalFn).toHaveBeenCalled();
+        });
+
+        it('should handle error passed to next in runAsync', async () => {
+            middleware.use(async (_req, _res, next) => {
+                await next(new HttpError(422, 'Unprocessable'));
+            });
+
+            const finalFn = jest.fn();
+
+            await middleware.runAsync({}, {}, finalFn);
+
+            expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
+            expect(finalFn.mock.calls[0][0].statusCode).toBe(422);
+        });
+
+        it('should wrap non-Error values thrown in runAsync', async () => {
+            middleware.use(async () => {
+                throw { weird: 'object' };
+            });
+
+            const finalFn = jest.fn();
+
+            await middleware.runAsync({}, {}, finalFn);
+
+            expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
+            expect(finalFn.mock.calls[0][0].message).toBe('An error occurred while processing the request');
+        });
     });
 });

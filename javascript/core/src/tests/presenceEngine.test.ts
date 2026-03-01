@@ -4,10 +4,12 @@ import { PresenceEngine } from '../engines/presenceEngine';
 
 describe('PresenceEngine', () => {
     let presenceEngine: PresenceEngine;
+    let publishCallback: jest.Mock;
     const channelId = 'test-channel';
 
     beforeEach(() => {
-        presenceEngine = new PresenceEngine(channelId);
+        publishCallback = jest.fn();
+        presenceEngine = new PresenceEngine(channelId, publishCallback);
     });
 
     describe('constructor', () => {
@@ -50,12 +52,10 @@ describe('PresenceEngine', () => {
         it('should publish a presence event', () => {
             const userId = 'user1';
             const presence: PondPresence = { status: 'online' };
-            const callback = jest.fn();
 
-            presenceEngine.subscribe(callback);
             presenceEngine.trackPresence(userId, presence);
 
-            expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+            expect(publishCallback).toHaveBeenCalledWith(expect.objectContaining({
                 event: PresenceEventTypes.JOIN,
                 action: ServerActions.PRESENCE,
                 channelName: channelId,
@@ -94,13 +94,12 @@ describe('PresenceEngine', () => {
             const userId = 'user1';
             const initialPresence: PondPresence = { status: 'online' };
             const updatedPresence: PondPresence = { status: 'away' };
-            const callback = jest.fn();
 
             presenceEngine.trackPresence(userId, initialPresence);
-            presenceEngine.subscribe(callback);
+            publishCallback.mockClear();
             presenceEngine.updatePresence(userId, updatedPresence);
 
-            expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+            expect(publishCallback).toHaveBeenCalledWith(expect.objectContaining({
                 event: PresenceEventTypes.UPDATE,
                 action: ServerActions.PRESENCE,
                 channelName: channelId,
@@ -136,13 +135,12 @@ describe('PresenceEngine', () => {
         it('should publish a presence event with the removed user data', () => {
             const userId = 'user1';
             const presence: PondPresence = { status: 'online' };
-            const callback = jest.fn();
 
             presenceEngine.trackPresence(userId, presence);
-            presenceEngine.subscribe(callback);
+            publishCallback.mockClear();
             presenceEngine.removePresence(userId);
 
-            expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+            expect(publishCallback).toHaveBeenCalledWith(expect.objectContaining({
                 event: PresenceEventTypes.LEAVE,
                 action: ServerActions.PRESENCE,
                 channelName: channelId,
@@ -229,58 +227,6 @@ describe('PresenceEngine', () => {
         });
     });
 
-    describe('subscribe', () => {
-        it('should allow subscription to presence events', () => {
-            const callback = jest.fn();
-            const unsubscribe = presenceEngine.subscribe(callback);
-
-            expect(typeof unsubscribe).toBe('function');
-        });
-
-        it('should call subscriber when presence changes', () => {
-            const callback = jest.fn();
-
-            presenceEngine.subscribe(callback);
-
-            const userId = 'user1';
-            const presence: PondPresence = { status: 'online' };
-
-            presenceEngine.trackPresence(userId, presence);
-
-            expect(callback).toHaveBeenCalledTimes(1);
-        });
-
-        it('should support multiple subscribers', () => {
-            const callback1 = jest.fn();
-            const callback2 = jest.fn();
-
-            presenceEngine.subscribe(callback1);
-            presenceEngine.subscribe(callback2);
-
-            const userId = 'user1';
-            const presence: PondPresence = { status: 'online' };
-
-            presenceEngine.trackPresence(userId, presence);
-
-            expect(callback1).toHaveBeenCalledTimes(1);
-            expect(callback2).toHaveBeenCalledTimes(1);
-        });
-
-        it('should stop calling subscriber after unsubscribe', () => {
-            const callback = jest.fn();
-            const unsubscribe = presenceEngine.subscribe(callback);
-
-            unsubscribe();
-
-            const userId = 'user1';
-            const presence: PondPresence = { status: 'online' };
-
-            presenceEngine.trackPresence(userId, presence);
-
-            expect(callback).not.toHaveBeenCalled();
-        });
-    });
-
     describe('close', () => {
         it('should clear all presence data', () => {
             const userId = 'user1';
@@ -291,26 +237,6 @@ describe('PresenceEngine', () => {
 
             expect(presenceEngine.presenceCount).toBe(0);
             expect(presenceEngine.getPresence(userId)).toBeNull();
-        });
-
-        it('should stop calling subscribers after close', () => {
-            const callback = jest.fn();
-
-            presenceEngine.subscribe(callback);
-
-            presenceEngine.close();
-
-            // Try to add presence after close - subscribers should not be called
-            try {
-                const userId = 'user1';
-                const presence: PondPresence = { status: 'online' };
-
-                presenceEngine.trackPresence(userId, presence);
-            } catch (e) {
-                // May throw error due to closed publisher, that's okay
-            }
-
-            expect(callback).not.toHaveBeenCalled();
         });
     });
 
@@ -345,10 +271,6 @@ describe('PresenceEngine', () => {
         });
 
         it('should emit events with correct recipients', () => {
-            const callback = jest.fn();
-
-            presenceEngine.subscribe(callback);
-
             const user1 = 'user1';
             const user2 = 'user2';
 
@@ -357,18 +279,15 @@ describe('PresenceEngine', () => {
 
             presenceEngine.trackPresence(user1, presence1);
 
-            // First event should have only user1 as recipient
-            expect(callback.mock.calls[0][0].recipients).toEqual([user1]);
+            expect(publishCallback.mock.calls[0][0].recipients).toEqual([user1]);
 
             presenceEngine.trackPresence(user2, presence2);
 
-            // Second event should have both users as recipients
-            expect(callback.mock.calls[1][0].recipients).toEqual([user1, user2]);
+            expect(publishCallback.mock.calls[1][0].recipients).toEqual([user1, user2]);
 
             presenceEngine.removePresence(user1);
 
-            // Third event should have only user2 as recipient
-            expect(callback.mock.calls[2][0].recipients).toEqual([user2]);
+            expect(publishCallback.mock.calls[2][0].recipients).toEqual([user2]);
         });
     });
 });

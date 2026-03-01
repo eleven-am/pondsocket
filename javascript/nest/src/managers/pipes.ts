@@ -1,40 +1,10 @@
 import type { PipeTransform } from '@nestjs/common';
 
 import { pondValidatorsKey } from '../constants';
-import { Constructor } from '../types';
-import { manageClass } from './class';
-import { manageMethod } from './method';
+import { createMetadataManager } from './createMetadataManager';
 
-const localValidators: Set<Constructor<PipeTransform>> = new Set();
+const { manage, getLocalItems } = createMetadataManager<PipeTransform>(pondValidatorsKey);
 
-export function managePipes (target: Object, propertyKey?: string) {
-    let getter: () => Constructor<PipeTransform>[] | null;
-    let setter: (value: Constructor<PipeTransform>[]) => void;
+export const managePipes = manage;
 
-    if (propertyKey) {
-        const { get, set } = manageMethod<Constructor<PipeTransform>[]>(pondValidatorsKey, target, propertyKey);
-
-        getter = get;
-        setter = set;
-    } else {
-        const { get, set } = manageClass<Constructor<PipeTransform>[]>(pondValidatorsKey, target);
-
-        getter = get;
-        setter = set;
-    }
-
-    return {
-        get: () => getter() ?? [],
-        set: (value: Constructor<PipeTransform>[]) => {
-            const current = getter() ?? [];
-
-            setter([...value, ...current]);
-
-            value.forEach((validator) => localValidators.add(validator));
-        },
-    };
-}
-
-export function getLocalPipes () {
-    return Array.from(localValidators);
-}
+export const getLocalPipes = getLocalItems;

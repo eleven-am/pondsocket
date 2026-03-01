@@ -1,25 +1,26 @@
-import PondSocket from '@eleven-am/pondsocket';
-import type {Endpoint, IDistributedBackend} from '@eleven-am/pondsocket/types';
-import {DiscoveryService} from '@golevelup/nestjs-discovery';
-import type {DiscoveredClass} from '@golevelup/nestjs-discovery/lib/discovery.interfaces';
-// eslint-disable-next-line import/no-unresolved
-import {Logger, OnModuleInit, PipeTransform, Type} from '@nestjs/common';
-// eslint-disable-next-line import/no-unresolved
-import {HttpAdapterHost, ModuleRef} from '@nestjs/core';
+import { PondSocket } from '@eleven-am/pondsocket';
+import type { Endpoint, IDistributedBackend } from '@eleven-am/pondsocket/types';
+import { DiscoveryService } from '@golevelup/nestjs-discovery';
+import type { DiscoveredClass } from '@golevelup/nestjs-discovery/lib/discovery.interfaces';
+import { Logger, OnModuleInit, OnModuleDestroy, PipeTransform, Type } from '@nestjs/common';
+import { HttpAdapterHost, ModuleRef } from '@nestjs/core';
 
-import {channelKey, endpointKey} from '../constants';
-import {manageChannel} from '../managers/channel';
-import {manageChannelInstance} from '../managers/channelInstance';
-import {manageConnection} from '../managers/connection';
-import {manageEndpoint} from '../managers/endpoint';
-import {manageEndpointInstance} from '../managers/endpointInstance';
-import {manageEvent} from '../managers/event';
-import {manageJoin} from '../managers/join';
-import {manageLeave} from '../managers/leave';
-import {CanActivate, Constructor, GroupedInstances} from '../types';
+import { channelKey, endpointKey } from '../constants';
+import { manageChannel } from '../managers/channel';
+import { manageChannelInstance } from '../managers/channelInstance';
+import { manageConnection } from '../managers/connection';
+import { manageEndpoint } from '../managers/endpoint';
+import { manageEndpointInstance } from '../managers/endpointInstance';
+import { manageEvent } from '../managers/event';
+import { manageJoin } from '../managers/join';
+import { manageLeave } from '../managers/leave';
+import { manageOutgoingEvent } from '../managers/outgoingEvent';
+import { CanActivate, Constructor, GroupedInstances } from '../types';
 
-export class PondSocketService implements OnModuleInit {
+export class PondSocketService implements OnModuleInit, OnModuleDestroy {
     private readonly logger = new Logger(PondSocketService.name);
+
+    private socket: PondSocket | null = null;
 
     constructor (
         private readonly moduleRef: ModuleRef,
@@ -28,19 +29,28 @@ export class PondSocketService implements OnModuleInit {
         private readonly globalGuards: Constructor<CanActivate>[],
         private readonly globalPipes: Constructor<PipeTransform>[],
         private readonly isExclusiveSocketServer: boolean,
-		private readonly distributedBackend?: IDistributedBackend,
+        private readonly distributedBackend?: IDistributedBackend,
+        private readonly maxMessageSize?: number,
+        private readonly heartbeatInterval?: number,
     ) {}
 
     async onModuleInit () {
         const instances = await this.getGroupedInstances();
 
-        const socket = new PondSocket({
+        this.socket = new PondSocket({
             server: this.adapterHost.httpAdapter.getHttpServer(),
             exclusiveServer: this.isExclusiveSocketServer,
-			distributedBackend: this.distributedBackend,
+            distributedBackend: this.distributedBackend,
+            maxMessageSize: this.maxMessageSize,
+            heartbeatInterval: this.heartbeatInterval,
         });
 
-        instances.forEach((instance) => this.manageEndpoint(socket, instance));
+        instances.forEach((instance) => this.manageEndpoint(this.socket!, instance));
+    }
+
+    onModuleDestroy () {
+        this.socket?.close();
+        this.socket = null;
     }
 
     private manageEndpoint (socket: PondSocket, groupedInstance: GroupedInstances) {
@@ -96,7 +106,8 @@ export class PondSocketService implements OnModuleInit {
             }
         });
 
-		const newPath = `${endpointPath}/${path}`.replace(/\/+/g, '/');
+        const newPath = `${endpointPath}/${path}`.replace(/\/+/g, '/');
+
         this.logger.log(`${channel.name} {${newPath}}`);
 
         if (handler) {
@@ -112,8 +123,21 @@ export class PondSocketService implements OnModuleInit {
                 await handler.value(instance, this.moduleRef, this.globalGuards, this.globalPipes, context);
             });
 
-			const newEventPath = `${newPath}/${handler.path}`.replace(/\/+/g, '/');
+            const newEventPath = `${newPath}/${handler.path}`.replace(/\/+/g, '/');
+
             this.logger.log(`Mapped {${newEventPath}, EVENT}`);
+        });
+
+        const { get: getOutgoingHandlers } = manageOutgoingEvent(instance);
+
+        getOutgoingHandlers().forEach((handler) => {
+            channelInstance.handleOutgoingEvent(handler.path, async (context) => {
+                await handler.value(instance, this.moduleRef, this.globalGuards, this.globalPipes, context as any);
+            });
+
+            const newOutgoingPath = `${newPath}/${handler.path}`.replace(/\/+/g, '/');
+
+            this.logger.log(`Mapped {${newOutgoingPath}, OUTGOING}`);
         });
 
         const [leaveHandler] = getLeaveHandlers();

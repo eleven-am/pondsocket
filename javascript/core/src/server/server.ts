@@ -23,16 +23,26 @@ export class PondSocket {
 
     readonly #middleware: Middleware<SocketRequest, ConnectionParams>;
 
+    readonly #maxMessageSize: number;
+
+    readonly #heartbeatMs: number;
+
+    #heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
     constructor ({
         server,
         socketServer,
         exclusiveServer = true,
         distributedBackend,
+        maxMessageSize = 1024 * 1024,
+        heartbeatInterval = 30000,
     }: PondSocketOptions = {}) {
         this.#middleware = new Middleware();
         this.#exclusiveServer = exclusiveServer;
         this.#server = server ?? new HTTPServer();
         this.#backend = distributedBackend ?? null;
+        this.#maxMessageSize = maxMessageSize;
+        this.#heartbeatMs = heartbeatInterval;
         this.#socketServer = socketServer ?? new WebSocketServer({ noServer: true });
         this.#init();
     }
@@ -47,7 +57,32 @@ export class PondSocket {
     /**
      * Close the server
      */
-    close (callback?: (err?: Error) => void) {
+    close (callback?: (err?: Error) => void, timeout: number = 5000) {
+        if (this.#heartbeatTimer) {
+            clearInterval(this.#heartbeatTimer);
+            this.#heartbeatTimer = null;
+        }
+
+        this.#socketServer.clients.forEach((socket) => {
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.close(1001, 'Server shutting down');
+            }
+        });
+
+        const forceClose = setTimeout(() => {
+            this.#socketServer.clients.forEach((socket) => {
+                if (socket.readyState !== WebSocket.CLOSED) {
+                    socket.terminate();
+                }
+            });
+
+            this.#socketServer.close();
+        }, timeout);
+
+        this.#socketServer.close(() => {
+            clearTimeout(forceClose);
+        });
+
         return this.#server.close(callback);
     }
 
@@ -55,7 +90,7 @@ export class PondSocket {
      * Create a new endpoint
      */
     createEndpoint<Path extends string> (path: PondPath<Path>, handler: ConnectionHandler<Path>) {
-        const endpoint = new EndpointEngine(String(path), this.#backend);
+        const endpoint = new EndpointEngine(String(path), this.#backend, this.#maxMessageSize);
 
         this.#middleware.use((req, params, next) => {
             const event = parseAddress(path, req.address);
@@ -90,7 +125,7 @@ export class PondSocket {
      * Handle WebSocket upgrade requests
      */
     #handleUpgrade (req: IncomingMessage, socket: internal.Duplex, head: Buffer) {
-        const clientId = req.headers['sec-websocket-key'] as string;
+        const clientId = uuid();
         const request: SocketRequest = {
             id: clientId,
             headers: req.headers,
@@ -137,22 +172,28 @@ export class PondSocket {
                 socket.isAlive = false;
                 socket.ping();
             });
-        }, 30000);
+        }, this.#heartbeatMs);
     }
 
     /**
      * Initialize the server
      */
     #init () {
-        const timeout = this.#manageHeartbeat();
+        this.#heartbeatTimer = this.#manageHeartbeat();
 
         this.#server.on('error', (error) => {
-            clearInterval(timeout);
+            if (this.#heartbeatTimer) {
+                clearInterval(this.#heartbeatTimer);
+                this.#heartbeatTimer = null;
+            }
             throw new Error(error.message);
         });
 
         this.#server.on('close', () => {
-            clearInterval(timeout);
+            if (this.#heartbeatTimer) {
+                clearInterval(this.#heartbeatTimer);
+                this.#heartbeatTimer = null;
+            }
         });
 
         this.#server.on('upgrade', this.#handleUpgrade.bind(this));
@@ -170,8 +211,15 @@ export class PondSocket {
 
         return cookieHeader.split(';')
             .reduce((cookies, cookie) => {
-                const [name, value] = cookie.trim()
-                    .split('=');
+                const trimmed = cookie.trim();
+                const eqIndex = trimmed.indexOf('=');
+
+                if (eqIndex === -1) {
+                    return cookies;
+                }
+
+                const name = trimmed.slice(0, eqIndex);
+                const value = trimmed.slice(eqIndex + 1);
 
                 cookies[name] = decodeURIComponent(value);
 

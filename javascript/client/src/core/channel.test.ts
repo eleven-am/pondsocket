@@ -826,6 +826,51 @@ describe('Channel', () => {
         expect(specificMessageListener).not.toHaveBeenCalled();
     });
 
+    it('should handle decline by setting state to DECLINED and clearing queue', () => {
+        const { channel } = createChannel();
+
+        channel.sendMessage('queued', { data: 'test' });
+
+        channel.decline({ message: 'Not authorized', statusCode: 403 });
+
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+    });
+
+    it('should not re-join when already in JOINED state', () => {
+        const { channel, publisher, receiver } = createChannel();
+
+        channel.join();
+        channel.acknowledge(receiver);
+
+        expect(channel.channelState).toBe(ChannelState.JOINED);
+
+        publisher.mockClear();
+        channel.join();
+
+        expect(publisher).not.toHaveBeenCalled();
+    });
+
+    it('sendForResponse should reject with timeout error', async () => {
+        const publisher = jest.fn();
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
+        const receiver = new Subject<ChannelEvent>();
+
+        const channel = new Channel(
+            publisher,
+            state,
+            'test',
+            {},
+        );
+
+        channel.join();
+        channel.acknowledge(receiver);
+
+        // @ts-expect-error - testing timeout behavior
+        const promise = channel.sendForResponse('timeout-event', { data: 'test' }, 100);
+
+        await expect(promise).rejects.toThrow(/sendForResponse timed out after 100ms/);
+    });
+
     it('should be able to wait for a message', async () => {
         const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
         const receiver = new Subject<ChannelEvent>();

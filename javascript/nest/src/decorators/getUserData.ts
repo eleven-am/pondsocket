@@ -1,13 +1,3 @@
-import { createParamDecorator } from '../helpers/createParamDecorator';
+import { createContextParamDecorator } from '../helpers/createContextParamDecorator';
 
-export const GetUserData = createParamDecorator(
-    (data: void, context) => {
-        const userData = context.user;
-
-        if (!userData) {
-            throw new Error('Invalid decorator usage: GetUserData');
-        }
-
-        return userData;
-    },
-);
+export const GetUserData = createContextParamDecorator('user', 'GetUserData');

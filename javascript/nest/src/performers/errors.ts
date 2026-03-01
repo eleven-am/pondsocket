@@ -1,5 +1,4 @@
 import type { ConnectionContext, JoinContext, EventContext } from '@eleven-am/pondsocket/types';
-// eslint-disable-next-line import/no-unresolved
 import { HttpException } from '@nestjs/common';
 
 import { isEventContext } from './narrow';

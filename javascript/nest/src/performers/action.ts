@@ -36,10 +36,13 @@ async function performGuards (moduleRef: ModuleRef, globalGuards: Constructor<Ca
         .concat(classGuards, methodGuards)
         .map((Guard) => retrieveInstance(moduleRef, Guard));
 
-    const promises = guards.map((guard) => guard.canActivate(context));
-    const results = await Promise.all(promises);
+    for (const guard of guards) {
+        if (!await guard.canActivate(context)) {
+            return false;
+        }
+    }
 
-    return results.every((result) => result);
+    return true;
 }
 
 function getNestContext (
@@ -48,24 +51,24 @@ function getNestContext (
     if (isJoinContext(context)) {
         return {
             join: context,
-        }
+        };
     }
 
     if (isEventContext(context)) {
         return {
             event: context,
-        }
+        };
     }
 
     if (isConnectionContext(context)) {
         return {
             connection: context,
-        }
+        };
     }
 
     return {
         leave: context,
-    }
+    };
 }
 
 export async function performAction (
@@ -91,7 +94,7 @@ export async function performAction (
         );
 
         performResponse(socketId, channel, data, input);
-    } else if (isJoinContext(input) || isJoinContext(input)) {
+    } else if (isJoinContext(input) || isConnectionContext(input)) {
         input.decline('Unauthorized', 403);
     }
 }

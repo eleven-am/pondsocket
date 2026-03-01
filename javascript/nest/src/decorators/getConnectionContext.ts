@@ -1,13 +1,3 @@
-import { createParamDecorator } from '../helpers/createParamDecorator';
+import { createContextParamDecorator } from '../helpers/createContextParamDecorator';
 
-export const GetConnectionContext = createParamDecorator(
-    (data: void, context) => {
-        const connection = context.connectionContext;
-
-        if (!connection) {
-            throw new Error('Invalid decorator usage: GetConnectionContext');
-        }
-
-        return connection;
-    },
-);
+export const GetConnectionContext = createContextParamDecorator('connectionContext', 'GetConnectionContext');

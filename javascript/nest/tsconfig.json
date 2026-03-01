@@ -2,11 +2,21 @@
   "compilerOptions": {
     "target": "es2015",
     "module": "commonjs",
+    "declaration": true,
     "outDir": "./dist",
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "strict": true
+    "strict": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "baseUrl": ".",
+    "paths": {
+      "@eleven-am/pondsocket": ["../core/dist"],
+      "@eleven-am/pondsocket/types": ["../core/dist"],
+      "@eleven-am/pondsocket-common": ["../comnon/dist"]
+    },
+    "types": ["reflect-metadata"]
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "**/__tests__/*"]
+  "exclude": ["node_modules", "**/__tests__/*", "src/tests/*"]
 }

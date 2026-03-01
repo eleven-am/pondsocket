@@ -135,4 +135,79 @@ describe('LobbyEngine', () => {
             expect(leaveCallback).toHaveBeenCalledWith(leaveEvent);
         });
     });
+
+    describe('deleteChannel', () => {
+        it('should remove a channel that exists', () => {
+            lobbyEngine.getOrCreateChannel('ch1');
+            expect(() => lobbyEngine.getChannel('ch1')).not.toThrow();
+
+            lobbyEngine.deleteChannel('ch1');
+            expect(() => lobbyEngine.getChannel('ch1')).toThrow(HttpError);
+        });
+
+        it('should not throw when deleting a non-existent channel', () => {
+            expect(() => lobbyEngine.deleteChannel('nonexistent')).not.toThrow();
+        });
+    });
+
+    describe('wrapChannel', () => {
+        it('should return a Channel instance wrapping the engine', () => {
+            const mockChannel = new MockChannelEngine();
+            const wrapped = lobbyEngine.wrapChannel(mockChannel);
+
+            expect(wrapped).toBeInstanceOf(Channel);
+        });
+    });
+
+    describe('handleOutgoingEvent', () => {
+        it('should add an outgoing event handler to the outgoing middleware', () => {
+            const useSpy = jest.spyOn(lobbyEngine.outgoing, 'use');
+
+            lobbyEngine.handleOutgoingEvent('test', jest.fn());
+
+            expect(useSpy).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe('processOutgoingEvents', () => {
+        it('should return the event when no outgoing middleware is set', async () => {
+            const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
+            channelEngine.addUser('user-1', {}, jest.fn());
+            const event = { event: 'test', payload: { data: 'hello' }, action: 'broadcast' as any, channelName: 'test-ch', requestId: 'req-1' };
+
+            const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
+
+            expect(result).toBeDefined();
+            expect(result!.event).toBe('test');
+            expect(result!.payload).toEqual({ data: 'hello' });
+        });
+
+        it('should return undefined when event is blocked', async () => {
+            const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
+            channelEngine.addUser('user-1', {}, jest.fn());
+
+            lobbyEngine.handleOutgoingEvent('test', (ctx) => {
+                ctx.block();
+            });
+
+            const event = { event: 'test', payload: { data: 'hello' }, action: 'broadcast' as any, channelName: 'test-ch', requestId: 'req-1' };
+            const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
+
+            expect(result).toBeUndefined();
+        });
+
+        it('should transform payload when handler returns a value', async () => {
+            const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
+            channelEngine.addUser('user-1', {}, jest.fn());
+
+            lobbyEngine.handleOutgoingEvent('test', () => {
+                return { transformed: true };
+            });
+
+            const event = { event: 'test', payload: { data: 'hello' }, action: 'broadcast' as any, channelName: 'test-ch', requestId: 'req-1' };
+            const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
+
+            expect(result).toBeDefined();
+        });
+    });
 });

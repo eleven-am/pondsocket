@@ -57,7 +57,13 @@ export class Middleware<Request, Response> {
                 const result = middleware(req, res, next);
 
                 if (result instanceof Promise) {
-                    result.catch(next);
+                    result.catch((error) => {
+                        try {
+                            final(this.#handleError(error));
+                        } catch (_) {
+                            void 0;
+                        }
+                    });
                 }
             } catch (error) {
                 return final(this.#handleError(error));

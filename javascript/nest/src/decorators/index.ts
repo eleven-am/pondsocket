@@ -20,5 +20,6 @@ export * from './onConnectionRequest';
 export * from './onJoinRequest';
 export * from './onLeave';
 export * from './onEvent';
+export * from './onOutgoingEvent';
 export * from './useGuards';
 export * from './usePipes';

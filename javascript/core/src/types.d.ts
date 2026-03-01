@@ -36,6 +36,9 @@ export interface RedisDistributedBackendOptions {
     database?: number;
     url?: string;
     keyPrefix?: string;
+    heartbeatIntervalMs?: number;
+    heartbeatTimeoutMs?: number;
+    onError?: (error: Error) => void;
 }
 
 export interface PondSocketOptions {
@@ -43,6 +46,8 @@ export interface PondSocketOptions {
     socketServer?: WebSocketServer;
     exclusiveServer?: boolean;
     distributedBackend?: IDistributedBackend;
+    maxMessageSize?: number;
+    heartbeatInterval?: number;
 }
 
 export enum DistributedMessageType {
@@ -55,7 +60,8 @@ export enum DistributedMessageType {
     PRESENCE_REMOVED = 'PRESENCE_REMOVED',
     ASSIGNS_UPDATE = 'ASSIGNS_UPDATE',
     ASSIGNS_REMOVED = 'ASSIGNS_REMOVED',
-    EVICT_USER = 'EVICT_USER'
+    EVICT_USER = 'EVICT_USER',
+    NODE_HEARTBEAT = 'NODE_HEARTBEAT'
 }
 
 export interface DistributedMessage {
@@ -63,6 +69,7 @@ export interface DistributedMessage {
     endpointName: string;
     channelName: string;
     timestamp?: number;
+    sourceNodeId?: string;
 }
 
 export interface StateRequest extends DistributedMessage {
@@ -129,6 +136,11 @@ export interface EvictUser extends DistributedMessage {
     fromNode?: string;
 }
 
+export interface NodeHeartbeat extends DistributedMessage {
+    type: DistributedMessageType.NODE_HEARTBEAT;
+    nodeId: string;
+}
+
 export type DistributedChannelMessage =
    | StateRequest
    | StateResponse
@@ -139,11 +151,16 @@ export type DistributedChannelMessage =
    | PresenceRemoved
    | AssignsUpdate
    | AssignsRemoved
-   | EvictUser;
+   | EvictUser
+   | NodeHeartbeat;
 
 export interface IDistributedBackend {
+    readonly nodeId: string;
+    readonly heartbeatTimeoutMs: number;
+    initialize(): Promise<void>;
     broadcast(endpointName: string, channelName: string, message: DistributedChannelMessage): Promise<void>;
     subscribe(endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Unsubscribe;
+    subscribeToHeartbeats(handler: (nodeId: string) => void): Unsubscribe;
     cleanup(): Promise<void>;
 }
 
@@ -160,7 +177,7 @@ export declare class PondSocket {
      * @desc Closes the server
      * @param callback - the callback to call when the server is closed
      */
-    close(callback?: () => void): Server<typeof IncomingMessage, typeof ServerResponse>
+    close(callback?: (err?: Error) => void, timeout?: number): Server<typeof IncomingMessage, typeof ServerResponse>
 
     /**
      * @desc Accepts a new socket upgrade request on the provided endpoint using the handler function to authenticate the socket
@@ -671,24 +688,17 @@ export class OutgoingContext<
 export declare class RedisDistributedBackend implements IDistributedBackend {
     constructor(options?: RedisDistributedBackendOptions);
 
-    /**
-     * @desc Gets the subject for subscribing to distributed messages
-     * @param endpointName - The name of the endpoint to subscribe to
-     * @param channelName - The name of the channel to subscribe to
-     * @param message - The message to send
-     */
+    readonly nodeId: string;
+
+    readonly heartbeatTimeoutMs: number;
+
+    initialize (): Promise<void>;
+
     broadcast (endpointName: string, channelName: string, message: DistributedChannelMessage): Promise<void>;
 
-    /**
-     * @desc Cleans up the distributed backend, closing any connections and cleaning up resources
-     */
     cleanup (): Promise<void>;
 
-    /**
-     * @desc Subscribe to messages for a specific endpoint and channel
-     * @param endpointName - The name of the endpoint to subscribe to
-     * @param channelName - The name of the channel to subscribe to
-     * @param handler - The handler function to call when a message is received
-     */
     subscribe (endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Unsubscribe;
+
+    subscribeToHeartbeats (handler: (nodeId: string) => void): Unsubscribe;
 }

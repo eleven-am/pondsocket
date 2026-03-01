@@ -57,15 +57,14 @@ function getQuery (query: string) {
         return {};
     }
 
-    const parts = query.split('&');
+    const searchParams = new URLSearchParams(query);
+    const params: Record<string, string> = {};
 
-    return parts.reduce((params, part) => {
-        const [key, value] = part.split('=');
-
+    searchParams.forEach((value, key) => {
         params[key] = value;
+    });
 
-        return params;
-    }, {} as Record<string, string>);
+    return params;
 }
 
 export function parseAddress <Path extends string> (route: PondPath<Path>, address: string) {

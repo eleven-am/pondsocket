@@ -1,0 +1,29 @@
+{
+  "private": true,
+  "name": "pondsocket-monorepo",
+  "workspaces": [
+    "comnon",
+    "core",
+    "client",
+    "express",
+    "nest"
+  ],
+  "scripts": {
+    "build:common": "cd comnon && npm run build",
+    "build:core": "cd core && npm run build",
+    "build:client": "cd client && npm run build",
+    "build:express": "cd express && npm run build",
+    "build:nest": "cd nest && npm run build",
+    "build": "npm run build:common && npm run build:core && npm run build:client && npm run build:express && npm run build:nest",
+    "test:common": "cd comnon && npm test",
+    "test:core": "cd core && npm test",
+    "test:client": "cd client && npm test",
+    "test:express": "cd express && npm test",
+    "test": "npm run test:common && npm run test:core && npm run test:client && npm run test:express",
+    "lint": "cd comnon && npm run lint && cd ../core && npm run lint && cd ../client && npm run lint && cd ../express && npm run lint"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3"
+  }
+}

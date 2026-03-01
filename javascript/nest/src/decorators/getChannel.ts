@@ -1,13 +1,3 @@
-import { createParamDecorator } from '../helpers/createParamDecorator';
+import { createContextParamDecorator } from '../helpers/createContextParamDecorator';
 
-export const GetChannel = createParamDecorator(
-    (data: void, context) => {
-        const channel = context.channel;
-
-        if (!channel) {
-            throw new Error('Invalid decorator usage: GetChannel');
-        }
-
-        return channel;
-    },
-);
+export const GetChannel = createContextParamDecorator('channel', 'GetChannel');

@@ -1,13 +1,3 @@
-import { createParamDecorator } from '../helpers/createParamDecorator';
+import { createContextParamDecorator } from '../helpers/createContextParamDecorator';
 
-export const GetJoinParams = createParamDecorator(
-    (data: void, context) => {
-        const joinRequest = context.joinContext;
-
-        if (!joinRequest) {
-            throw new Error('Invalid decorator usage: GetJoinParams');
-        }
-
-        return joinRequest.joinParams;
-    },
-);
+export const GetJoinParams = createContextParamDecorator('joinContext', 'GetJoinParams', (joinRequest) => joinRequest.joinParams);

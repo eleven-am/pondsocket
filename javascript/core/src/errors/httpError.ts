@@ -23,6 +23,8 @@ export class HttpError extends Error {
                 return 'Not Acceptable';
             case 409:
                 return 'Conflict';
+            case 413:
+                return 'Payload Too Large';
             case 429:
                 return 'Too Many Requests';
             case 500:

@@ -1,4 +1,6 @@
-import { ClientActions, PondMessage } from '@eleven-am/pondsocket-common';
+import { ClientMessage } from '@eleven-am/pondsocket-common';
+
+export { ClientMessage };
 
 export enum ConnectionState {
     DISCONNECTED = 'disconnected',
@@ -10,14 +12,6 @@ export interface ClientOptions {
     connectionTimeout?: number;
     maxReconnectDelay?: number;
     pingInterval?: number;
-}
-
-export interface ClientMessage {
-    action: ClientActions;
-    event: string;
-    payload: PondMessage;
-    channelName: string;
-    requestId: string;
 }
 
 export type Publisher = (data: ClientMessage) => void;

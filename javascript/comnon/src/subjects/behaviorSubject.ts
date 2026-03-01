@@ -31,7 +31,7 @@ export class BehaviorSubject<T> extends Subject<T> {
      * @param observer - The observer to subscribe
      */
     subscribe (observer: Subscriber<T>): Unsubscribe {
-        if (this.#lastMessage) {
+        if (this.#lastMessage !== undefined) {
             observer(this.#lastMessage);
         }
 

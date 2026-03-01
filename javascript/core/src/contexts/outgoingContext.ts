@@ -1,4 +1,10 @@
-import { Event, EventParams, PondMessage } from '@eleven-am/pondsocket-common';
+import {
+    ChannelReceivers,
+    Event,
+    EventParams,
+    PondMessage,
+    PondObject,
+} from '@eleven-am/pondsocket-common';
 
 import { BaseContext } from './baseContext';
 import { ChannelEngine } from '../engines/channelEngine';
@@ -52,5 +58,9 @@ export class OutgoingContext<Path extends string> extends BaseContext<Path> {
      */
     updateParams (params: EventParams<Path>) {
         super.updateParams(params);
+    }
+
+    protected _sendMessageToRecipients (_recipient: ChannelReceivers, _event: string, _payload: PondObject): void {
+        void 0;
     }
 }

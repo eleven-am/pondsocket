@@ -1,18 +1,18 @@
 import type {
-	ConnectionContext,
-	EventContext,
-	IDistributedBackend,
-	JoinContext,
-	LeaveEvent,
-	PondAssigns,
-	PondMessage,
-	PondPresence,
+    ConnectionContext,
+    EventContext,
+    IDistributedBackend,
+    JoinContext,
+    LeaveEvent,
+    PondAssigns,
+    PondMessage,
+    PondPresence,
 } from '@eleven-am/pondsocket/types';
-import type {DiscoveredClass} from '@golevelup/nestjs-discovery/lib/discovery.interfaces';
-import type {ModuleMetadata, PipeTransform} from '@nestjs/common';
-import type {ModuleRef} from '@nestjs/core';
+import type { DiscoveredClass } from '@golevelup/nestjs-discovery/lib/discovery.interfaces';
+import type { ModuleMetadata, PipeTransform } from '@nestjs/common';
+import type { ModuleRef } from '@nestjs/core';
 
-import type {Context} from './context/context';
+import type { Context } from './context/context';
 
 export interface NestContext {
     connection?: ConnectionContext<string>;
@@ -55,15 +55,23 @@ export interface Metadata extends Omit<ModuleMetadata, 'controllers'> {
     guards?: Constructor<CanActivate>[];
     pipes?: Constructor<PipeTransform>[];
     isExclusiveSocketServer?: boolean;
-	backend?: IDistributedBackend;
+    backend?: IDistributedBackend;
+    maxMessageSize?: number;
+    heartbeatInterval?: number;
     isGlobal?: boolean;
 }
 
-export interface AsyncMetadata extends Omit<Metadata, 'backend'> {
-	isGlobal?: boolean;
-	inject?: any[];
-	imports?: any[];
-	useFactory: (...args: any[]) => Promise<IDistributedBackend> | IDistributedBackend;
+export interface AsyncFactoryResult {
+    backend?: IDistributedBackend;
+    maxMessageSize?: number;
+    heartbeatInterval?: number;
+}
+
+export interface AsyncMetadata extends Omit<Metadata, 'backend' | 'maxMessageSize' | 'heartbeatInterval'> {
+    isGlobal?: boolean;
+    inject?: any[];
+    imports?: any[];
+    useFactory: (...args: any[]) => Promise<AsyncFactoryResult> | AsyncFactoryResult;
 }
 
 export type PondResponse<Event extends string = string, Payload extends PondMessage = PondMessage, Presence extends PondPresence = PondPresence, Assigns extends PondAssigns = PondAssigns> = {

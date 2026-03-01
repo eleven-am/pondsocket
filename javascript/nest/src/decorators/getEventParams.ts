@@ -1,13 +1,3 @@
-import { createParamDecorator } from '../helpers/createParamDecorator';
+import { createContextParamDecorator } from '../helpers/createContextParamDecorator';
 
-export const GetEventParams = createParamDecorator(
-    (data: void, context) => {
-        const event = context.event;
-
-        if (!event) {
-            throw new Error('Invalid decorator usage: GetEventParams');
-        }
-
-        return event.params;
-    },
-);
+export const GetEventParams = createContextParamDecorator('event', 'GetEventParams', (event) => event.params);

@@ -30,18 +30,23 @@
     "pipeline": "npm run test && npm run build && npm run push"
   },
   "dependencies": {
-    "@eleven-am/pondsocket-common": "^0.0.34",
-    "websocket": "^1.0.35"
+    "@eleven-am/pondsocket-common": "^0.0.34"
   },
   "devDependencies": {
+    "@eslint/compat": "^2.0.2",
+    "@eslint/eslintrc": "^3.3.4",
+    "@eslint/js": "^9.39.3",
+    "@stylistic/eslint-plugin-ts": "^4.4.1",
     "@types/jest": "^30.0.0",
-    "@types/websocket": "^1.0.10",
-    "@typescript-eslint/eslint-plugin": "^8.49.0",
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1",
+    "eslint": "^9.39.3",
     "eslint-plugin-file-progress": "^3.0.2",
     "eslint-plugin-import": "^2.32.0",
+    "globals": "^17.4.0",
     "jest": "^30.2.0",
-    "prettier": "^3.7.4",
-    "supertest": "^7.1.4",
+    "prettier": "^3.8.1",
+    "supertest": "^7.2.2",
     "ts-jest": "^29.4.6",
     "ts-loader": "^9.5.4",
     "ts-node": "^10.9.2",
@@ -56,12 +61,20 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.(t|j)s$": ["ts-jest", { "diagnostics": false }]
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "**/*.(t|j)s",
+      "!**/*.test.ts",
+      "!**/*.d.ts",
+      "!**/index.ts",
+      "!**/index.d.ts",
+      "!**/dist.d.ts"
     ],
     "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^@eleven-am/pondsocket-common$": "<rootDir>/../../comnon/dist"
+    }
   }
 }

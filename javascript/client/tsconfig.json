@@ -4,7 +4,11 @@
     "module": "commonjs",
     "outDir": "./dist",
     "esModuleInterop": true,
-    "strict": true
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@eleven-am/pondsocket-common": ["../comnon/dist"]
+    }
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "**/__tests__/*"]

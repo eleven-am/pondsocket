@@ -1,6 +1,10 @@
+import { Logger } from '@nestjs/common';
+
 import { manageLeave } from '../managers/leave';
 import { performAction } from '../performers/action';
 import { PondResponse } from '../types';
+
+const logger = new Logger('OnLeave');
 
 export function OnLeave (): MethodDecorator {
     return (target, propertyKey, descriptor) => {
@@ -19,7 +23,7 @@ export function OnLeave (): MethodDecorator {
                     leaveEvent,
                 );
             } catch (err) {
-                // no-op
+                logger.error(`Error in OnLeave handler "${String(propertyKey)}": ${err instanceof Error ? err.message : err}`);
             }
         });
     };

@@ -6,7 +6,13 @@
     "declaration": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "strict": true
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@eleven-am/pondsocket": ["../core/dist"],
+      "@eleven-am/pondsocket/types": ["../core/dist"],
+      "@eleven-am/pondsocket-common": ["../comnon/dist"]
+    }
   },
   "exclude": [
       "node_modules"

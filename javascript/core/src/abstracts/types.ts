@@ -92,15 +92,3 @@ export interface LeaveEvent {
 
 export type LeaveCallback = (event: LeaveEvent) => void;
 
-export enum DistributedMessageType {
-    STATE_REQUEST = 'STATE_REQUEST',
-    STATE_RESPONSE = 'STATE_RESPONSE',
-    USER_JOINED = 'USER_JOINED',
-    USER_LEFT = 'USER_LEFT',
-    USER_MESSAGE = 'USER_MESSAGE',
-    PRESENCE_UPDATE = 'PRESENCE_UPDATE',
-    PRESENCE_REMOVED = 'PRESENCE_REMOVED',
-    ASSIGNS_UPDATE = 'ASSIGNS_UPDATE',
-    ASSIGNS_REMOVED = 'ASSIGNS_REMOVED',
-    EVICT_USER = 'EVICT_USER'
-}

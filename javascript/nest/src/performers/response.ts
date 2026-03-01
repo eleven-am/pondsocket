@@ -13,10 +13,15 @@ import {
 } from './narrow';
 
 function isNotEmpty<TValue> (value: TValue | null | undefined): value is TValue {
-    return value !== null &&
-        value !== undefined &&
-        value !== '' &&
-        Object.keys(value).length !== 0;
+    if (value === null || value === undefined) {
+        return false;
+    }
+
+    if (typeof value === 'object') {
+        return Object.keys(value).length !== 0;
+    }
+
+    return value !== '';
 }
 
 export function performResponse (
@@ -39,52 +44,36 @@ export function performResponse (
         ...rest
     } = data;
 
-    if (context) {
-        if (isConnectionContext(context) || isJoinContext(context)) {
-            context
-                .assign(typeof assigns === 'object' ? assigns : {})
-                .accept();
-        } else {
-            (context as EventContext<string>)
-                .assign(typeof assigns === 'object' ? assigns : {});
+    if (isConnectionContext(context) || isJoinContext(context)) {
+        context
+            .assign(typeof assigns === 'object' ? assigns : {})
+            .accept();
+    } else {
+        (context as EventContext<string>)
+            .assign(typeof assigns === 'object' ? assigns : {});
+    }
+
+    const payload = isNotEmpty(rest) ? rest : {};
+
+    if (event) {
+        context.reply(event, payload);
+    }
+
+    if (isJoinContext(context) || isEventContext(context)) {
+        if (broadcast) {
+            context.broadcast(broadcast, payload);
         }
 
-        if (isNotEmpty(rest)) {
-            if (event) {
-                context.reply(event, rest);
-            }
+        if (broadcastFrom) {
+            context.broadcastFrom(broadcastFrom, payload);
+        }
 
-            if (isJoinContext(context) || isEventContext(context)) {
-                if (broadcast) {
-                    context.broadcast(broadcast, rest);
-                }
-
-                if (broadcastFrom) {
-                    context.broadcastFrom(broadcastFrom, rest);
-                }
-
-                if (broadcastTo) {
-                    context.broadcastTo(broadcastTo.event, rest, broadcastTo.users);
-                }
-            }
+        if (broadcastTo) {
+            context.broadcastTo(broadcastTo.event, payload, broadcastTo.users);
         }
     }
 
-    if (channel) {
-        if (isNotEmpty(rest) && !context) {
-            if (broadcast || event) {
-                const newEvent = (broadcast || event) as string;
-
-                channel.broadcast(newEvent, rest);
-            }
-
-            if (broadcastTo) {
-                channel.broadcastTo(broadcastTo.users, broadcastTo.event, rest);
-            }
-        }
-
-        if (isNotEmpty(presence)) {
-            channel.upsertPresence(socketId, presence);
-        }
+    if (channel && isNotEmpty(presence)) {
+        channel.upsertPresence(socketId, presence);
     }
 }

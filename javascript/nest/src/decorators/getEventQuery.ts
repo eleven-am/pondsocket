@@ -1,13 +1,3 @@
-import { createParamDecorator } from '../helpers/createParamDecorator';
+import { createContextParamDecorator } from '../helpers/createContextParamDecorator';
 
-export const GetEventQuery = createParamDecorator(
-    (data: void, context) => {
-        const event = context.event;
-
-        if (!event) {
-            throw new Error('Invalid decorator usage: GetEventQuery');
-        }
-
-        return event.query;
-    },
-);
+export const GetEventQuery = createContextParamDecorator('event', 'GetEventQuery', (event) => event.query);

@@ -17,7 +17,7 @@ export function OnConnectionRequest (): MethodDecorator {
                     globalPipes,
                     originalMethod,
                     propertyKey as string,
-                    ctx
+                    ctx,
                 );
             } catch (error) {
                 performErrors(error, ctx);

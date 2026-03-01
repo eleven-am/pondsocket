@@ -72,10 +72,7 @@ export class LobbyEngine {
                 return;
             }
 
-            context.transform({
-                ...chEvent,
-                payload,
-            });
+            context.transform(payload);
 
             return next();
         });

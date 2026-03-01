@@ -23,24 +23,33 @@
     "build": "rimraf dist && tsc",
     "lint": "eslint --ext .ts src",
     "lint:fix": "eslint --fix --ext .ts src",
-    "copy": "cp package.json dist && cp README.md dist && cp LICENSE dist && cp src/context.d.ts dist/index.d.ts",
+    "copy": "cp package.json dist && cp README.md dist && cp LICENSE dist",
     "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
     "pipeline": "npm run build && npm run push"
   },
   "dependencies": {
     "@eleven-am/pondsocket": "^0.1.214",
-    "@golevelup/nestjs-discovery": "^5.0.0"
+    "@golevelup/nestjs-discovery": "^6.1.2",
+    "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
-    "@nestjs/common": "^11.1.6",
-    "@nestjs/core": "^11.1.6",
+    "@eslint/compat": "^2.0.2",
+    "@eslint/eslintrc": "^3.3.4",
+    "@eslint/js": "^10.0.1",
+    "@nestjs/common": "^11.1.14",
+    "@nestjs/core": "^11.1.14",
+    "@stylistic/eslint-plugin-ts": "^4.4.1",
     "@types/jest": "^30.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.46.1",
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1",
+    "eslint": "^9.39.3",
     "eslint-plugin-file-progress": "^3.0.2",
     "eslint-plugin-import": "^2.32.0",
+    "globals": "^17.4.0",
     "jest": "^30.2.0",
-    "prettier": "^3.6.2",
-    "ts-jest": "^29.4.5",
+    "prettier": "^3.8.1",
+    "rxjs": "^7.8.2",
+    "ts-jest": "^29.4.6",
     "ts-loader": "^9.5.4",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
@@ -54,7 +63,12 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.(t|j)s$": [
+        "ts-jest",
+        {
+          "tsconfig": "tsconfig.test.json"
+        }
+      ]
     },
     "collectCoverageFrom": [
       "**/*.(t|j)s"

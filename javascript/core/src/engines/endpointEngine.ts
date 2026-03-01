@@ -32,11 +32,14 @@ export class EndpointEngine {
 
     readonly #lobbyEngines: Map<PondPath<string>, LobbyEngine>;
 
-    constructor (public readonly path: string, backend: IDistributedBackend | null) {
+    readonly #maxMessageSize: number;
+
+    constructor (public readonly path: string, backend: IDistributedBackend | null, maxMessageSize: number = 1024 * 1024) {
         this.#sockets = new Map();
         this.#lobbyEngines = new Map();
         this.#middleware = new Middleware();
         this.#backend = backend || null;
+        this.#maxMessageSize = maxMessageSize;
     }
 
     /**
@@ -97,7 +100,7 @@ export class EndpointEngine {
         this.#sockets.set(cache.clientId, cache);
         cache.socket.on('message', (message: string) => this.#readMessage(cache, message));
         cache.socket.on('close', () => this.#handleSocketClose(cache));
-        cache.socket.on('error', () => this.#handleSocketClose(cache));
+        cache.socket.on('error', () => {});
 
         const event: ChannelEvent = {
             event: Events.CONNECTION,
@@ -114,7 +117,9 @@ export class EndpointEngine {
      * Sends a message to a WebSocket
      */
     sendMessage (socket: WebSocket, message: ChannelEvent) {
-        socket.send(JSON.stringify(message));
+        if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify(message));
+        }
     }
 
     /**
@@ -138,8 +143,8 @@ export class EndpointEngine {
         try {
             this.#sockets.delete(cache.clientId);
             cache.subscriptions.forEach((unsubscribe) => unsubscribe());
-        } catch (e) {
-            // no-op
+        } catch {
+            void 0;
         }
     }
 
@@ -253,6 +258,10 @@ export class EndpointEngine {
      */
     #readMessage (cache: SocketCache, message: string) {
         try {
+            if (message.length > this.#maxMessageSize) {
+                throw new HttpError(413, `Message size ${message.length} exceeds maximum allowed size of ${this.#maxMessageSize} bytes`);
+            }
+
             const data = JSON.parse(message);
             const result = clientMessageSchema.parse(data);
 

@@ -17,11 +17,10 @@
   },
   "scripts": {
     "test": "jest --coverage --verbose --forceExit --detectOpenHandles --runInBand --bail",
-    "build": "rimraf dist && tsc && npm run remove",
+    "build": "rimraf dist && tsc --project tsconfig.build.json && rm -rf dist/tests",
     "lint": "eslint --ext .ts src",
     "lint:fix": "eslint --fix --ext .ts src",
-    "remove": "rm -r dist/tests && rm dist/distIndex.js",
-    "copy": "cp src/types.d.ts dist/types.d.ts && cp src/distIndex.ts dist/index.d.ts && cp package.json dist && cp README.md dist && cp LICENSE dist",
+    "copy": "cp package.json dist && cp README.md dist && cp LICENSE dist",
     "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
     "pipeline": "npm run lint:fix && npm run lint && npm run test && npm run build && npm run push"
   },
@@ -29,37 +28,47 @@
   "license": "GPL-3.0",
   "main": "./index.js",
   "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./types": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Eleven-am/pondSocket.git"
   },
   "dependencies": {
-    "@eleven-am/pondsocket-common": "^0.0.32",
-    "redis": "^5.8.3",
-    "ws": "^8.18.3"
+    "@eleven-am/pondsocket-common": "^0.0.34",
+    "redis": "^5.11.0",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@eslint/compat": "^1.4.0",
-    "@eslint/eslintrc": "^3.3.1",
+    "@eslint/eslintrc": "^3.3.4",
     "@eslint/js": "^9.38.0",
     "@stylistic/eslint-plugin-ts": "^4.4.1",
     "@types/jest": "^30.0.0",
-    "@types/node": "^24.8.1",
+    "@types/node": "^25.3.3",
     "@types/ws": "^8.18.1",
-    "@typescript-eslint/eslint-plugin": "^8.46.1",
-    "@typescript-eslint/parser": "^8.46.1",
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1",
     "eslint": "^9.38.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-import-resolver-node": "^0.3.9",
     "eslint-plugin-file-progress": "^3.0.2",
     "eslint-plugin-import": "^2.32.0",
-    "eslint-plugin-prettier": "^5.5.4",
+    "eslint-plugin-prettier": "^5.5.5",
     "globals": "^16.4.0",
     "jest": "^30.2.0",
-    "prettier": "^3.6.2",
+    "prettier": "^3.8.1",
     "source-map-support": "^0.5.21",
-    "supertest": "^7.1.4",
-    "ts-jest": "^29.4.5",
+    "supertest": "^7.2.2",
+    "ts-jest": "^29.4.6",
     "ts-loader": "^9.5.4",
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
@@ -74,12 +83,21 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.(t|j)s$": ["ts-jest", { "diagnostics": false }]
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "**/*.(t|j)s",
+      "!**/*.test.ts",
+      "!**/*.d.ts",
+      "!**/index.ts",
+      "!**/tests/**",
+      "!**/types.d.ts",
+      "!**/abstracts/distributor.ts"
     ],
     "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^@eleven-am/pondsocket-common$": "<rootDir>/../../comnon/dist"
+    }
   }
 }

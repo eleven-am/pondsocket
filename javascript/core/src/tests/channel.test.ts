@@ -147,4 +147,100 @@ describe('Channel', () => {
             expect(mockChannelEngine.updateAssigns).toHaveBeenCalledWith(userId, assigns);
         });
     });
+
+    describe('getPresences', () => {
+        it('should call getPresence on the channel engine', () => {
+            const presences = { user1: { status: 'online' } };
+
+            mockChannelEngine.getPresence.mockReturnValue(presences);
+
+            const result = channel.getPresences();
+
+            expect(mockChannelEngine.getPresence).toHaveBeenCalled();
+            expect(result).toEqual(presences);
+        });
+    });
+
+    describe('getAssigns', () => {
+        it('should call getAssigns on the channel engine', () => {
+            const assigns = { user1: { role: 'admin' } };
+
+            mockChannelEngine.getAssigns.mockReturnValue(assigns);
+
+            const result = channel.getAssigns();
+
+            expect(mockChannelEngine.getAssigns).toHaveBeenCalled();
+            expect(result).toEqual(assigns);
+        });
+    });
+
+    describe('chaining', () => {
+        it('should return this from broadcast', () => {
+            const result = channel.broadcast('event', {});
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from broadcastFrom', () => {
+            const result = channel.broadcastFrom('user1', 'event', {});
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from broadcastTo', () => {
+            const result = channel.broadcastTo('user1', 'event', {});
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from evictUser', () => {
+            const result = channel.evictUser('user1');
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from trackPresence', () => {
+            const result = channel.trackPresence('user1', {});
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from updatePresence', () => {
+            const result = channel.updatePresence('user1', {});
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from removePresence', () => {
+            const result = channel.removePresence('user1');
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from upsertPresence', () => {
+            const result = channel.upsertPresence('user1', {});
+
+            expect(result).toBe(channel);
+        });
+
+        it('should return this from updateAssigns', () => {
+            const result = channel.updateAssigns('user1', {});
+
+            expect(result).toBe(channel);
+        });
+    });
+
+    describe('broadcastTo with single string userId', () => {
+        it('should wrap a single userId in an array', () => {
+            channel.broadcastTo('user1', 'event', { msg: 'hello' });
+
+            expect(mockChannelEngine.sendMessage).toHaveBeenCalledWith(
+                SystemSender.CHANNEL,
+                ['user1'],
+                ServerActions.BROADCAST,
+                'event',
+                { msg: 'hello' },
+            );
+        });
+    });
 });

@@ -39,12 +39,15 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
 
     readonly #joinState: BehaviorSubject<ChannelState>;
 
-    constructor (publisher: Publisher, clientState: BehaviorSubject<ConnectionState>, name: string, params: JoinParams) {
+    readonly #maxQueueSize: number;
+
+    constructor (publisher: Publisher, clientState: BehaviorSubject<ConnectionState>, name: string, params: JoinParams, maxQueueSize: number = 100) {
         this.#name = name;
         this.#queue = [];
         this.#presence = [];
         this.#joinParams = params;
         this.#publisher = publisher;
+        this.#maxQueueSize = maxQueueSize;
         this.#clientState = clientState;
         this.#receiver = new Subject<ChannelEvent>();
         this.#joinState = new BehaviorSubject<ChannelState>(ChannelState.IDLE);
@@ -72,6 +75,10 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @param receiver - The receiver to subscribe to.
      */
     public acknowledge (receiver: Subject<ChannelEvent>) {
+        if (this.#joinState.value === ChannelState.JOINED) {
+            return;
+        }
+
         this.#joinState.publish(ChannelState.JOINED);
         this.#init(receiver);
         this.#emptyQueue();
@@ -81,7 +88,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @desc Marks the channel join as declined by the server.
      * @param payload - The decline payload containing status code and message.
      */
-    public decline (payload: { message?: string; statusCode?: number }) {
+    public decline (payload: { message?: string, statusCode?: number }) {
         this.#joinState.publish(ChannelState.DECLINED);
         this.#queue = [];
     }
@@ -231,21 +238,25 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
         this.#publish(message);
     }
 
-    /**
-     * @desc Sends a message to the server and waits for a response.
-     * @param sentEvent - The event to send.
-     * @param payload - The message to send.
-     */
-    public sendForResponse<Event extends EventWithResponse<EventMap>> (sentEvent: Event, payload: PayloadForResponse<EventMap, Event>) {
+    public sendForResponse<Event extends EventWithResponse<EventMap>> (sentEvent: Event, payload: PayloadForResponse<EventMap, Event>, timeoutMs = 30000) {
         const requestId = uuid();
 
-        return new Promise<ResponseForEvent<EventMap, Event>>((resolve) => {
-            const unsub = this.#onMessage((_, message, responseId) => {
+        return new Promise<ResponseForEvent<EventMap, Event>>((resolve, reject) => {
+            const cleanup = { timer: undefined as ReturnType<typeof setTimeout> | undefined,
+                unsub: () => {} };
+
+            cleanup.unsub = this.#onMessage((_, message, responseId) => {
                 if (requestId === responseId) {
+                    clearTimeout(cleanup.timer);
                     resolve(message as ResponseForEvent<EventMap, Event>);
-                    unsub();
+                    cleanup.unsub();
                 }
             });
+
+            cleanup.timer = setTimeout(() => {
+                cleanup.unsub();
+                reject(new Error(`sendForResponse timed out after ${timeoutMs}ms for event "${String(sentEvent)}"`));
+            }, timeoutMs);
 
             const message: ClientMessage = {
                 action: ClientActions.BROADCAST,
@@ -331,6 +342,10 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
     #publish (data: ClientMessage) {
         if (this.#joinState.value === ChannelState.JOINED) {
             return this.#publisher(data);
+        }
+
+        if (this.#queue.length >= this.#maxQueueSize) {
+            this.#queue.shift();
         }
 
         this.#queue.push(data);

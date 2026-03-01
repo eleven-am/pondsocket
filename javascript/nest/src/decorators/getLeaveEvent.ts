@@ -1,13 +1,3 @@
-import { createParamDecorator } from '../helpers/createParamDecorator';
+import { createContextParamDecorator } from '../helpers/createContextParamDecorator';
 
-export const GetLeaveEvent = createParamDecorator(
-    (data: void, context) => {
-        const leaveEvent = context.leaveEvent;
-
-        if (!leaveEvent) {
-            throw new Error('Invalid decorator usage: GetLeaveEvent');
-        }
-
-        return leaveEvent;
-    },
-);
+export const GetLeaveEvent = createContextParamDecorator('leaveEvent', 'GetLeaveEvent');

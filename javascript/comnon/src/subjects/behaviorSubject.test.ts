@@ -48,4 +48,43 @@ describe('behaviorSubject', () => {
         testSubject.publish(message);
         expect(testSubject.value).toBe(message);
     });
+
+    it('should return undefined when constructed without initial value', () => {
+        const sub = new BehaviorSubject<number>();
+
+        expect(sub.value).toBeUndefined();
+    });
+
+    it('should not call subscriber on subscribe when no initial value', () => {
+        const sub = new BehaviorSubject<number>();
+        const obs = jest.fn();
+
+        sub.subscribe(obs);
+        expect(obs).not.toHaveBeenCalled();
+    });
+
+    it('should return the initial value before any publish', () => {
+        expect(testSubject.value).toBe(0);
+    });
+
+    it('should track the latest published value', () => {
+        testSubject.publish(5);
+        testSubject.publish(10);
+        testSubject.publish(15);
+        expect(testSubject.value).toBe(15);
+    });
+
+    it('should call new subscriber with latest value immediately', () => {
+        testSubject.publish(42);
+        const laterObserver = jest.fn();
+
+        testSubject.subscribe(laterObserver);
+        expect(laterObserver).toHaveBeenCalledWith(42);
+        expect(laterObserver).toHaveBeenCalledTimes(1);
+    });
+
+    it('should close and prevent further subscriptions', () => {
+        testSubject.close();
+        expect(() => testSubject.subscribe(jest.fn())).toThrow('Cannot subscribe to a closed subject');
+    });
 });

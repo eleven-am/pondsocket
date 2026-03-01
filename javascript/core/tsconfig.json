@@ -2,10 +2,14 @@
   "compilerOptions": {
     "target": "es2015",
     "module": "commonjs",
-    "declaration": false,
+    "declaration": true,
     "outDir": "./dist",
     "esModuleInterop": true,
     "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@eleven-am/pondsocket-common": ["../comnon/dist"]
+    }
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "**/__tests__/*"]

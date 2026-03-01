@@ -156,4 +156,30 @@ describe('PondChannel', () => {
             expect(result).toBe(pondChannel);
         });
     });
+
+    describe('getChannel - null case', () => {
+        it('should return null when the channel does not exist', () => {
+            mockLobbyEngine.getChannel.mockImplementation(() => {
+                throw new Error('Channel not found');
+            });
+
+            const result = pondChannel.getChannel('nonexistent');
+
+            expect(result).toBeNull();
+        });
+    });
+
+    describe('handleOutgoingEvent', () => {
+        it('should delegate to the lobby engine and return pondChannel for chaining', () => {
+            const mockHandleOutgoing = jest.fn();
+
+            (mockLobbyEngine as any).handleOutgoingEvent = mockHandleOutgoing;
+
+            const handler = jest.fn();
+            const result = pondChannel.handleOutgoingEvent('test', handler);
+
+            expect(mockHandleOutgoing).toHaveBeenCalledWith('test', handler);
+            expect(result).toBe(pondChannel);
+        });
+    });
 });

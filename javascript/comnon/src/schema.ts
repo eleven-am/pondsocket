@@ -1,9 +1,5 @@
 import { ClientActions, PresenceEventTypes, ServerActions } from './enums';
 
-// ============================================================================
-// Types
-// ============================================================================
-
 export interface ClientMessage {
     event: string;
     requestId: string;
@@ -33,20 +29,12 @@ export interface ServerMessage {
 
 type ChannelEvent = ServerMessage | PresenceMessage;
 
-// ============================================================================
-// Validation Error
-// ============================================================================
-
 export class ValidationError extends Error {
     constructor (message: string, public readonly path?: string) {
         super(path ? `${path}: ${message}` : message);
         this.name = 'ValidationError';
     }
 }
-
-// ============================================================================
-// Validation Utilities
-// ============================================================================
 
 function isObject (value: unknown): value is Record<string, any> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -108,17 +96,12 @@ function validateEnum<T extends string | number> (
     }
 }
 
-// ============================================================================
-// Schema Validators
-// ============================================================================
-
 export const clientMessageSchema = {
     parse (data: unknown): ClientMessage {
         validateObject(data, 'clientMessage');
 
         const obj = data as Record<string, unknown>;
 
-        // Validate required fields
         if (!('event' in obj)) {
             throw new ValidationError('Missing required field', 'event');
         }
@@ -135,7 +118,6 @@ export const clientMessageSchema = {
             throw new ValidationError('Missing required field', 'action');
         }
 
-        // Validate types
         validateString(obj.event, 'event');
         validateString(obj.requestId, 'requestId');
         validateString(obj.channelName, 'channelName');
@@ -158,7 +140,6 @@ export const presenceMessageSchema = {
 
         const obj = data as Record<string, unknown>;
 
-        // Validate required fields
         if (!('requestId' in obj)) {
             throw new ValidationError('Missing required field', 'requestId');
         }
@@ -175,12 +156,10 @@ export const presenceMessageSchema = {
             throw new ValidationError('Missing required field', 'payload');
         }
 
-        // Validate types
         validateString(obj.requestId, 'requestId');
         validateString(obj.channelName, 'channelName');
         validateEnum(obj.event, PresenceEventTypes, 'event');
 
-        // Validate action is exactly PRESENCE
         if (obj.action !== ServerActions.PRESENCE) {
             throw new ValidationError(
                 `Expected ${ServerActions.PRESENCE}, got ${JSON.stringify(obj.action)}`,
@@ -188,7 +167,6 @@ export const presenceMessageSchema = {
             );
         }
 
-        // Validate payload structure
         validateObject(obj.payload, 'payload');
 
         const payload = obj.payload as Record<string, unknown>;
@@ -202,7 +180,6 @@ export const presenceMessageSchema = {
 
         validateArray(payload.presence, 'payload.presence');
 
-        // Validate each presence item is a record
         (payload.presence as unknown[]).forEach((item, index) => {
             validateRecord(item, `payload.presence[${index}]`);
         });
@@ -228,7 +205,6 @@ export const serverMessageSchema = {
 
         const obj = data as Record<string, unknown>;
 
-        // Validate required fields
         if (!('event' in obj)) {
             throw new ValidationError('Missing required field', 'event');
         }
@@ -245,13 +221,11 @@ export const serverMessageSchema = {
             throw new ValidationError('Missing required field', 'action');
         }
 
-        // Validate types
         validateString(obj.event, 'event');
         validateString(obj.requestId, 'requestId');
         validateString(obj.channelName, 'channelName');
         validateRecord(obj.payload, 'payload');
 
-        // Validate action is one of the allowed server actions
         const validActions = [
             ServerActions.BROADCAST,
             ServerActions.CONNECT,
@@ -282,12 +256,10 @@ export const channelEventSchema = {
 
         const obj = data as Record<string, unknown>;
 
-        // Check action to determine which schema to use
         if (!('action' in obj)) {
             throw new ValidationError('Missing required field', 'action');
         }
 
-        // Discriminate based on action field
         if (obj.action === ServerActions.PRESENCE) {
             return presenceMessageSchema.parse(data);
         }

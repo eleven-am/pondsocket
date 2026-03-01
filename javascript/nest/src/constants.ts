@@ -8,4 +8,5 @@ export const onLeaveHandlerKey = Symbol('NEST_POND-SOCKET_ON-LEAVE');
 export const onEventHandlerKey = Symbol('NEST_POND-SOCKET_ON-EVENT');
 export const pondGuardsKey = Symbol('NEST_POND-SOCKET_GUARDS');
 export const parametersKey = Symbol('NEST_POND-SOCKET_PARAMETERS');
+export const onOutgoingEventHandlerKey = Symbol('NEST_POND-SOCKET_ON-OUTGOING-EVENT');
 export const pondValidatorsKey = Symbol('NEST_POND-SOCKET_VALIDATORS');
