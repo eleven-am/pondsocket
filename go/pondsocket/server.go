@@ -65,8 +65,8 @@ func NewServer(options *ServerOptions) *Server {
 // The handlerFunc will be called for each new WebSocket connection attempt,
 // allowing you to accept or decline connections based on custom logic.
 // Returns an Endpoint instance that can be used to create channels and configure message handling.
-func (s *Server) CreateEndpoint(path string, handlerFunc ConnectionEventHandler) *Endpoint {
-	return s.manager.CreateEndpoint(path, handlerFunc)
+func (s *Server) CreateEndpoint(path string, handlerFunc ConnectionEventHandler, middlewares ...ConnectionMiddleware) *Endpoint {
+	return s.manager.CreateEndpoint(path, handlerFunc, middlewares...)
 }
 
 // Start begins listening for HTTP/WebSocket connections on the configured address.

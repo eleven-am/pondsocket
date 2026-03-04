@@ -131,11 +131,12 @@ func TestChannelRemoveUser(t *testing.T) {
 			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
 			InternalQueueTimeout: 1 * time.Second,
 		}
-		leaveHandler := LeaveHandler(func(ctx *LeaveContext) {
+		leaveHandler := LeaveEventHandler(func(ctx *LeaveContext) error {
 			leaveCalledMutex.Lock()
 
 			leaveCalled = true
 			leaveCalledMutex.Unlock()
+			return nil
 		})
 
 		opts.Leave = &leaveHandler

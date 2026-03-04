@@ -51,6 +51,22 @@ func (m *middleware[Request, Response]) Compose(others ...*middleware[Request, R
 	return result
 }
 
+func executeWithMiddleware[C any](ctx *C, handler func(ctx *C) error, middlewares []MiddlewareFunc[C]) error {
+	if len(middlewares) == 0 {
+		return handler(ctx)
+	}
+	var run func(i int) error
+	run = func(i int) error {
+		if i >= len(middlewares) {
+			return handler(ctx)
+		}
+		return middlewares[i](ctx, func() error {
+			return run(i + 1)
+		})
+	}
+	return run(0)
+}
+
 func (m *middleware[Request, Response]) Handle(ctx context.Context, request Request, response Response, finalHandler FinalHandlerFunc[Request, Response]) error {
 	select {
 	case <-ctx.Done():

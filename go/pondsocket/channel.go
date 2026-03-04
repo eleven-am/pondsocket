@@ -28,7 +28,8 @@ type Channel struct {
 	name                        string
 	endpointPath                string
 	presence                    *presenceClient
-	leave                       *LeaveHandler
+	leave                       *LeaveEventHandler
+	leaveMiddlewares            []LeaveMiddleware
 	store                       *store[map[string]interface{}]
 	channel                     chan internalEvent
 	connections                 *store[Transport]
@@ -62,6 +63,7 @@ func newChannel(ctx context.Context, options options) *Channel {
 		channel:                 make(chan internalEvent, 128),
 		middleware:              options.Middleware,
 		leave:                   options.Leave,
+		leaveMiddlewares:        options.LeaveMiddlewares,
 		onDestroy:               options.OnDestroy,
 		pubsub:                  options.PubSub,
 		hooks:                   options.Hooks,
@@ -129,7 +131,11 @@ func (c *Channel) removeUserLocal(user *User, userID, reason string) error {
 	if c.leave != nil && user != nil {
 		go func(u User, channelName string, leaveReason string) {
 			leaveCtx := newLeaveContext(c.ctx, c, &u, leaveReason)
-			(*c.leave)(leaveCtx)
+			if err := executeWithMiddleware(leaveCtx, func(ctx *LeaveContext) error {
+				return (*c.leave)(ctx)
+			}, c.leaveMiddlewares); err != nil {
+				c.reportError("leave_handler", err)
+			}
 		}(*user, c.name, reason)
 	}
 

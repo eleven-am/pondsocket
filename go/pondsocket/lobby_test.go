@@ -47,9 +47,10 @@ func TestLobbyOnLeave(t *testing.T) {
 
 	leaveCalled := false
 	var leaveUser User
-	lobby.OnLeave(func(ctx *LeaveContext) {
+	lobby.OnLeave(func(ctx *LeaveContext) error {
 		leaveCalled = true
 		leaveUser = *ctx.GetUser()
+		return nil
 	})
 
 	if lobby.leaveHandler == nil {
@@ -58,7 +59,9 @@ func TestLobbyOnLeave(t *testing.T) {
 	testUser := User{UserID: "test", Assigns: map[string]interface{}{"role": "member"}}
 	testChannel := &Channel{name: "test-channel"}
 	leaveCtx := newLeaveContext(ctx, testChannel, &testUser, "test")
-	(*lobby.leaveHandler)(leaveCtx)
+	if err := (*lobby.leaveHandler)(leaveCtx); err != nil {
+		t.Errorf("expected no error from leave handler, got %v", err)
+	}
 
 	if !leaveCalled {
 		t.Error("expected leave handler to be called")
@@ -334,8 +337,9 @@ func TestLobbyMiddlewareIntegration(t *testing.T) {
 	lobby := newLobby(endpoint)
 
 	leaveCalled := false
-	lobby.OnLeave(func(ctx *LeaveContext) {
+	lobby.OnLeave(func(ctx *LeaveContext) error {
 		leaveCalled = true
+		return nil
 	})
 
 	channel, err := lobby.createChannel("middleware-test")
@@ -348,7 +352,9 @@ func TestLobbyMiddlewareIntegration(t *testing.T) {
 	}
 	testUser := User{UserID: "test"}
 	leaveCtx := newLeaveContext(ctx, channel, &testUser, "test")
-	(*channel.leave)(leaveCtx)
+	if err := (*channel.leave)(leaveCtx); err != nil {
+		t.Errorf("expected no error from leave handler, got %v", err)
+	}
 
 	if !leaveCalled {
 		t.Error("expected leave handler to be called through channel")

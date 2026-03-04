@@ -10,12 +10,13 @@ import (
 )
 
 type Lobby struct {
-	leaveHandler *LeaveHandler
-	middleware   *middleware[*messageEvent, *Channel]
-	outgoing     *middleware[*OutgoingContext, interface{}]
-	channels     *store[*Channel]
-	endpoint     *Endpoint
-	channelMutex sync.RWMutex
+	leaveHandler     *LeaveEventHandler
+	leaveMiddlewares []LeaveMiddleware
+	middleware       *middleware[*messageEvent, *Channel]
+	outgoing         *middleware[*OutgoingContext, interface{}]
+	channels         *store[*Channel]
+	endpoint         *Endpoint
+	channelMutex     sync.RWMutex
 }
 
 func newLobby(endpoint *Endpoint) *Lobby {
@@ -30,18 +31,19 @@ func newLobby(endpoint *Endpoint) *Lobby {
 // OnLeave registers a handler that is called when a user leaves any channel in this lobby.
 // The handler is called asynchronously after the user has been removed from the channel.
 // Only one leave handler can be registered; subsequent calls will replace the previous handler.
-func (l *Lobby) OnLeave(handler LeaveHandler) {
+func (l *Lobby) OnLeave(handler LeaveEventHandler, middlewares ...LeaveMiddleware) {
 	if err := l.endpoint.checkState(); err != nil {
 		return
 	}
 	l.leaveHandler = &handler
+	l.leaveMiddlewares = middlewares
 }
 
 // OnMessage registers a handler for messages matching the specified event pattern.
 // The event pattern can include parameters (e.g., "chat:*" or "user.:action").
 // Handlers are called in the order they were registered until one handles the message.
 // Multiple handlers can be registered for different event patterns.
-func (l *Lobby) OnMessage(event Path, handler MessageEventHandler) {
+func (l *Lobby) OnMessage(event Path, handler MessageEventHandler, middlewares ...MessageMiddleware) {
 	if err := l.endpoint.checkState(); err != nil {
 		return
 	}
@@ -65,7 +67,9 @@ func (l *Lobby) OnMessage(event Path, handler MessageEventHandler) {
 		defer cancel()
 		eventCtx := newEventContext(ctx, ch, request, route)
 
-		return handler(eventCtx)
+		return executeWithMiddleware(eventCtx, func(ctx *EventContext) error {
+			return handler(ctx)
+		}, middlewares)
 	})
 }
 
@@ -73,7 +77,7 @@ func (l *Lobby) OnMessage(event Path, handler MessageEventHandler) {
 // This allows transformation or blocking of messages before they are sent to clients.
 // Handlers can modify the payload, block the message, or refresh user data.
 // Multiple handlers can be registered and are executed in registration order.
-func (l *Lobby) OnOutgoing(event Path, handler OutgoingEventHandler) {
+func (l *Lobby) OnOutgoing(event Path, handler OutgoingEventHandler, middlewares ...OutgoingMiddleware) {
 	if err := l.endpoint.checkState(); err != nil {
 		return
 	}
@@ -95,7 +99,9 @@ func (l *Lobby) OnOutgoing(event Path, handler OutgoingEventHandler) {
 		}
 		request.setRoute(route)
 
-		return handler(request)
+		return executeWithMiddleware(request, func(ctx *OutgoingContext) error {
+			return handler(ctx)
+		}, middlewares)
 	})
 }
 
@@ -141,6 +147,7 @@ func (l *Lobby) createChannelUnsafe(name string) (*Channel, error) {
 		Name:                 name,
 		Middleware:           l.middleware,
 		Leave:                l.leaveHandler,
+		LeaveMiddlewares:     l.leaveMiddlewares,
 		Outgoing:             l.outgoing,
 		InternalQueueTimeout: l.endpoint.options.InternalQueueTimeout,
 		PubSub:               l.endpoint.options.PubSub,

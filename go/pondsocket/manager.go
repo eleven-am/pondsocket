@@ -126,7 +126,7 @@ func NewManager(ctx context.Context, options ...Options) *Manager {
 	}
 }
 
-func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler) *Endpoint {
+func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler, middlewares ...ConnectionMiddleware) *Endpoint {
 	select {
 	case <-m.ctx.Done():
 		return newEndpoint(m.ctx, path, m.Options)
@@ -152,7 +152,7 @@ func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler
 
 		switch request.Method {
 		case http.MethodGet:
-			return m.handleConnection(ctx, request, response, endpoint, route, handlerFunc)
+			return m.handleConnection(ctx, request, response, endpoint, route, handlerFunc, middlewares)
 
 		case http.MethodPost:
 			return m.handleSSEMessage(request, response, endpoint)
@@ -168,7 +168,7 @@ func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler
 	return endpoint
 }
 
-func (m *Manager) handleConnection(ctx context.Context, request *http.Request, response *http.ResponseWriter, endpoint *Endpoint, route *Route, handlerFunc ConnectionEventHandler) error {
+func (m *Manager) handleConnection(ctx context.Context, request *http.Request, response *http.ResponseWriter, endpoint *Endpoint, route *Route, handlerFunc ConnectionEventHandler, middlewares []ConnectionMiddleware) error {
 	userId := uuid.NewString()
 
 	connOpts := connectionOptions{
@@ -182,7 +182,9 @@ func (m *Manager) handleConnection(ctx context.Context, request *http.Request, r
 	}
 
 	connCtx := newConnectionContext(connOpts)
-	if err := handlerFunc(connCtx); err != nil {
+	if err := executeWithMiddleware(connCtx, func(ctx *ConnectionContext) error {
+		return handlerFunc(ctx)
+	}, middlewares); err != nil {
 		return err
 	}
 

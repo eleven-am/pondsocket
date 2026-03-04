@@ -65,7 +65,8 @@ type options struct {
 	Name                 string
 	Middleware           *middleware[*messageEvent, *Channel]
 	Outgoing             *middleware[*OutgoingContext, interface{}]
-	Leave                *LeaveHandler
+	Leave                *LeaveEventHandler
+	LeaveMiddlewares     []LeaveMiddleware
 	OnDestroy            func() error
 	InternalQueueTimeout time.Duration
 	PubSub               PubSub
@@ -137,13 +138,6 @@ type Error struct {
 	cause       error
 }
 
-// LeaveHandler is a callback function invoked when a user leaves a channel.
-// It receives a LeaveContext with information about the leaving user and the channel state.
-type LeaveHandler func(ctx *LeaveContext)
-
-// User represents a connected user in a channel.
-// It contains the unique user identifier, server-side assigns metadata (never sent to clients),
-// and presence data that can be shared with other users in the channel.
 type User struct {
 	UserID   string
 	Assigns  map[string]interface{}
@@ -162,22 +156,24 @@ type Route struct {
 // after all middleware has been executed.
 type FinalHandlerFunc[Request any, Response any] func(request Request, response Response) error
 
-// HandlerFunc is a generic handler function type that processes context objects.
 type HandlerFunc[Context any] func(ctx *Context) error
 
-// MessageEventHandler processes incoming message events in a channel context.
+type MiddlewareFunc[Context any] func(ctx *Context, next func() error) error
+
+type ConnectionMiddleware = MiddlewareFunc[ConnectionContext]
+type JoinMiddleware = MiddlewareFunc[JoinContext]
+type MessageMiddleware = MiddlewareFunc[EventContext]
+type LeaveMiddleware = MiddlewareFunc[LeaveContext]
+type OutgoingMiddleware = MiddlewareFunc[OutgoingContext]
+
 type MessageEventHandler HandlerFunc[EventContext]
 
-// JoinEventHandler processes channel join requests.
 type JoinEventHandler HandlerFunc[JoinContext]
 
-// ConnectionEventHandler processes new WebSocket connection events.
 type ConnectionEventHandler HandlerFunc[ConnectionContext]
 
-// OutgoingEventHandler processes outgoing messages before they are sent to clients.
 type OutgoingEventHandler HandlerFunc[OutgoingContext]
 
-// LeaveEventHandler processes user leave events from a channel.
 type LeaveEventHandler HandlerFunc[LeaveContext]
 
 // Options configures WebSocket server behavior and connection parameters.

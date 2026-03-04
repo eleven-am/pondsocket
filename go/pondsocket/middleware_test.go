@@ -308,6 +308,179 @@ func TestMiddlewareCompose(t *testing.T) {
 	})
 }
 
+type testCtx struct {
+	Value string
+}
+
+func TestExecuteWithMiddleware(t *testing.T) {
+	t.Run("no middleware calls handler directly", func(t *testing.T) {
+		ctx := &testCtx{Value: "original"}
+		called := false
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			called = true
+			return nil
+		}, nil)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if !called {
+			t.Error("expected handler to be called")
+		}
+	})
+
+	t.Run("single middleware runs before handler", func(t *testing.T) {
+		ctx := &testCtx{Value: "original"}
+		order := make([]int, 0)
+		mws := []MiddlewareFunc[testCtx]{
+			func(c *testCtx, next func() error) error {
+				order = append(order, 1)
+				return next()
+			},
+		}
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			order = append(order, 2)
+			return nil
+		}, mws)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if len(order) != 2 || order[0] != 1 || order[1] != 2 {
+			t.Errorf("expected order [1 2], got %v", order)
+		}
+	})
+
+	t.Run("multiple middleware execute in order", func(t *testing.T) {
+		ctx := &testCtx{}
+		order := make([]int, 0)
+		mws := []MiddlewareFunc[testCtx]{
+			func(c *testCtx, next func() error) error {
+				order = append(order, 1)
+				return next()
+			},
+			func(c *testCtx, next func() error) error {
+				order = append(order, 2)
+				return next()
+			},
+			func(c *testCtx, next func() error) error {
+				order = append(order, 3)
+				return next()
+			},
+		}
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			order = append(order, 4)
+			return nil
+		}, mws)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		expected := []int{1, 2, 3, 4}
+		if len(order) != len(expected) {
+			t.Fatalf("expected %d items, got %d", len(expected), len(order))
+		}
+		for i, v := range order {
+			if v != expected[i] {
+				t.Errorf("order[%d] = %d, want %d", i, v, expected[i])
+			}
+		}
+	})
+
+	t.Run("short-circuit stops chain", func(t *testing.T) {
+		ctx := &testCtx{}
+		handlerCalled := false
+		secondCalled := false
+		mws := []MiddlewareFunc[testCtx]{
+			func(c *testCtx, next func() error) error {
+				return nil
+			},
+			func(c *testCtx, next func() error) error {
+				secondCalled = true
+				return next()
+			},
+		}
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			handlerCalled = true
+			return nil
+		}, mws)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if secondCalled {
+			t.Error("expected second middleware not to be called")
+		}
+		if handlerCalled {
+			t.Error("expected handler not to be called")
+		}
+	})
+
+	t.Run("error propagation from middleware", func(t *testing.T) {
+		ctx := &testCtx{}
+		testErr := errors.New("middleware error")
+		mws := []MiddlewareFunc[testCtx]{
+			func(c *testCtx, next func() error) error {
+				return testErr
+			},
+		}
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			return nil
+		}, mws)
+		if err != testErr {
+			t.Errorf("expected %v, got %v", testErr, err)
+		}
+	})
+
+	t.Run("error propagation from handler", func(t *testing.T) {
+		ctx := &testCtx{}
+		testErr := errors.New("handler error")
+		mws := []MiddlewareFunc[testCtx]{
+			func(c *testCtx, next func() error) error {
+				return next()
+			},
+		}
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			return testErr
+		}, mws)
+		if err != testErr {
+			t.Errorf("expected %v, got %v", testErr, err)
+		}
+	})
+
+	t.Run("middleware can modify context", func(t *testing.T) {
+		ctx := &testCtx{Value: "original"}
+		mws := []MiddlewareFunc[testCtx]{
+			func(c *testCtx, next func() error) error {
+				c.Value = "modified"
+				return next()
+			},
+		}
+		var handlerSaw string
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			handlerSaw = c.Value
+			return nil
+		}, mws)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if handlerSaw != "modified" {
+			t.Errorf("expected handler to see 'modified', got '%s'", handlerSaw)
+		}
+	})
+
+	t.Run("empty middleware slice calls handler directly", func(t *testing.T) {
+		ctx := &testCtx{}
+		called := false
+		err := executeWithMiddleware(ctx, func(c *testCtx) error {
+			called = true
+			return nil
+		}, []MiddlewareFunc[testCtx]{})
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if !called {
+			t.Error("expected handler to be called")
+		}
+	})
+}
+
 func TestMiddlewareWithComplexTypes(t *testing.T) {
 
 	type Request struct {

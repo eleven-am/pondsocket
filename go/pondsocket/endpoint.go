@@ -44,7 +44,7 @@ func newEndpoint(ctx context.Context, path string, options *Options) *Endpoint {
 // The handlerFunc is called when a client attempts to join a matching channel,
 // allowing for custom authorization and setup logic.
 // Returns a Lobby instance for further configuration of message and presence handling.
-func (e *Endpoint) CreateChannel(path string, handlerFunc JoinEventHandler) *Lobby {
+func (e *Endpoint) CreateChannel(path string, handlerFunc JoinEventHandler, middlewares ...JoinMiddleware) *Lobby {
 	if err := e.checkState(); err != nil {
 		return newLobby(e)
 	}
@@ -83,7 +83,9 @@ func (e *Endpoint) CreateChannel(path string, handlerFunc JoinEventHandler) *Lob
 		}
 		joinCtx := newJoinContext(ctx, ch, route, request.user, ev)
 
-		if err := handlerFunc(joinCtx); err != nil {
+		if err := executeWithMiddleware(joinCtx, func(ctx *JoinContext) error {
+			return handlerFunc(ctx)
+		}, middlewares); err != nil {
 			return err
 		}
 		if joinCtx.err != nil {
