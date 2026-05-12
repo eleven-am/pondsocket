@@ -1,0 +1,23 @@
+[project]
+name = "pondsocket-asgi"
+version = "0.0.1"
+description = "Canonical ASGI adapter for PondSocket."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "eleven-am" }]
+dependencies = [
+    "pondsocket>=0.0.1,<0.1.0",
+    "pondsocket-common>=0.0.1,<0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pondsocket_asgi"]
+
+[tool.uv.sources]
+pondsocket = { workspace = true }
+pondsocket-common = { workspace = true }

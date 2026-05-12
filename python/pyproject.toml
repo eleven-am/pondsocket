@@ -1,0 +1,70 @@
+[build-system]
+requires = []
+build-backend = "build_backend"
+backend-path = ["."]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["pondsocket-common", "pondsocket", "pondsocket-asgi"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "redis>=5",
+    "fakeredis>=2.20",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = [
+    "pondsocket-common/src",
+    "pondsocket/src",
+    "pondsocket-asgi/src",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "RUF", "SIM", "PIE"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+disallow_untyped_decorators = true
+no_implicit_reexport = true
+files = [
+    "pondsocket-common/src",
+    "pondsocket/src",
+    "pondsocket-asgi/src",
+]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = ["fakeredis.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["redis.*"]
+disallow_untyped_calls = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = [
+    "pondsocket-common/tests",
+    "pondsocket/tests",
+    "pondsocket-asgi/tests",
+]

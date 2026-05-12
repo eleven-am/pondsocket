@@ -1,0 +1,24 @@
+[project]
+name = "pondsocket"
+version = "0.0.1"
+description = "PondSocket - channel-based real-time framework with bring-your-own-server design."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "eleven-am" }]
+dependencies = [
+    "pondsocket-common>=0.0.1,<0.1.0",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pondsocket"]
+
+[tool.uv.sources]
+pondsocket-common = { workspace = true }
