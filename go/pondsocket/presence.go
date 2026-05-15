@@ -4,7 +4,6 @@
 package pondsocket
 
 import (
-	"encoding/json"
 	"errors"
 	"sync"
 
@@ -182,7 +181,7 @@ func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userI
 		}
 		topic := formatTopic(cleanEndpoint, p.channel.name, string(eventType))
 
-		data, err := json.Marshal(evt)
+		data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
 
 		if err != nil {
 			return err
@@ -244,7 +243,7 @@ func (p *presenceClient) requestPresenceSync(requesterUserID string) {
 	}
 	topic := formatTopic(cleanEndpoint, p.channel.name, string(syncRequest))
 
-	data, err := json.Marshal(evt)
+	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
 
 	if err != nil {
 		return

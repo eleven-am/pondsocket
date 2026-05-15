@@ -26,6 +26,7 @@ from .types import (
     AllExceptSender,
     AllUsers,
     Event,
+    InternalActions,
     LeaveReason,
     MessageEvent,
     Options,
@@ -34,7 +35,6 @@ from .types import (
     ToUsers,
     User,
 )
-from .wire import event_to_pubsub_bytes, pubsub_bytes_to_event
 
 LeaveHandler: TypeAlias = Callable[[LeaveContext], Awaitable[None]]
 LeaveMiddlewareFn: TypeAlias = Callable[
@@ -497,12 +497,15 @@ class Channel:
             return
         topic = format_topic(self._clean_endpoint(), self.name, event_subtype)
         try:
-            await self._pubsub.publish(topic, event_to_pubsub_bytes(event))
+            await self._pubsub.publish(
+                topic,
+                _event_to_distributed_bytes(event, event_subtype, self._clean_endpoint()),
+            )
         except Exception:
             return
 
     async def _handle_pubsub_message(self, _topic: str, data: bytes) -> None:
-        event = pubsub_bytes_to_event(data)
+        event = _distributed_bytes_to_event(data)
         if event is None:
             return
         if event.node_id and event.node_id == self.node_id:
@@ -578,3 +581,133 @@ class Channel:
             await hooks.after_message(event, err)
         except Exception:
             return
+
+
+def _now_ms() -> int:
+    import time
+
+    return int(time.time() * 1000)
+
+
+def _event_to_distributed_bytes(event: Event, subtype: str, endpoint: str) -> bytes:
+    import json
+
+    if event.action == ServerActions.BROADCAST.value:
+        message_type = "USER_MESSAGE"
+    elif event.action == ServerActions.PRESENCE.value and (
+        subtype.endswith("remove") or event.event == "LEAVE"
+    ):
+        message_type = "PRESENCE_REMOVED"
+    elif event.action == ServerActions.PRESENCE.value:
+        message_type = "PRESENCE_UPDATE"
+    elif event.action == InternalActions.ASSIGNS.value:
+        message_type = "ASSIGNS_UPDATE"
+    elif event.action == InternalActions.USER_COMMAND.value and event.event == "user:remove":
+        message_type = "USER_REMOVE"
+    elif event.action == InternalActions.USER_COMMAND.value:
+        message_type = "EVICT_USER"
+    else:
+        message_type = "USER_MESSAGE"
+
+    envelope: dict[str, object] = {
+        "protocol": "pondsocket.distributed",
+        "version": 1,
+        "type": message_type,
+        "messageId": uuid(),
+        "sourceNodeId": event.node_id,
+        "endpointName": endpoint,
+        "channelName": event.channel_name,
+        "timestamp": _now_ms(),
+    }
+    if message_type == "USER_MESSAGE":
+        envelope.update(
+            {
+                "fromUserId": "CHANNEL",
+                "event": event.event,
+                "payload": event.payload if event.payload is not None else {},
+                "requestId": event.request_id,
+                "recipientDescriptor": "ALL_USERS",
+            }
+        )
+    elif message_type == "PRESENCE_UPDATE":
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        envelope["event"] = event.event
+        envelope["userId"] = ""
+        envelope["presence"] = payload.get("changed", {})
+    elif message_type == "PRESENCE_REMOVED":
+        envelope["userId"] = ""
+    elif message_type == "ASSIGNS_UPDATE":
+        envelope["userId"] = event.payload.get("userId", "") if isinstance(event.payload, dict) else ""
+        envelope["assigns"] = event.payload if isinstance(event.payload, dict) else {}
+    elif message_type in {"EVICT_USER", "USER_REMOVE"}:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        envelope["userId"] = payload.get("userId", "")
+        envelope["reason"] = payload.get("reason", "")
+    return json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _distributed_bytes_to_event(data: bytes) -> Event | None:
+    import json
+
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("protocol") != "pondsocket.distributed":
+        return None
+    if raw.get("version") != 1:
+        return None
+    message_type = raw.get("type")
+    channel_name = raw.get("channelName")
+    node_id = raw.get("sourceNodeId")
+    if not isinstance(message_type, str) or not isinstance(channel_name, str) or not isinstance(node_id, str):
+        return None
+    request_id = str(raw.get("requestId") or uuid())
+    if message_type == "USER_MESSAGE":
+        return Event(
+            action=ServerActions.BROADCAST.value,
+            channel_name=channel_name,
+            request_id=request_id,
+            event=str(raw.get("event") or ""),
+            payload=raw.get("payload") if raw.get("payload") is not None else {},
+            node_id=node_id,
+        )
+    if message_type == "PRESENCE_UPDATE":
+        return Event(
+            action=ServerActions.PRESENCE.value,
+            channel_name=channel_name,
+            request_id=request_id,
+            event=str(raw.get("event") or PresenceEventTypes.UPDATE.value),
+            payload={"presence": [], "changed": raw.get("presence") or {}},
+            node_id=node_id,
+        )
+    if message_type == "PRESENCE_REMOVED":
+        return Event(
+            action=ServerActions.PRESENCE.value,
+            channel_name=channel_name,
+            request_id=request_id,
+            event=PresenceEventTypes.LEAVE.value,
+            payload={"presence": [], "changed": {"userId": raw.get("userId") or ""}},
+            node_id=node_id,
+        )
+    if message_type == "ASSIGNS_UPDATE":
+        return Event(
+            action=InternalActions.ASSIGNS.value,
+            channel_name=channel_name,
+            request_id=request_id,
+            event="assigns:update",
+            payload={"userId": raw.get("userId") or "", "assigns": raw.get("assigns") or {}},
+            node_id=node_id,
+        )
+    if message_type in {"EVICT_USER", "USER_REMOVE"}:
+        return Event(
+            action=InternalActions.USER_COMMAND.value,
+            channel_name=channel_name,
+            request_id=request_id,
+            event="user:remove" if message_type == "USER_REMOVE" else "user:evict",
+            payload={"userId": raw.get("userId") or "", "reason": raw.get("reason") or ""},
+            node_id=node_id,
+        )
+    return None

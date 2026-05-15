@@ -5,7 +5,6 @@ package pondsocket
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -338,7 +337,7 @@ func (c *Channel) GetPresence() map[string]interface{} {
 	}
 	topic := formatTopic(cleanEndpoint, c.name, string(syncRequest))
 
-	data, err := json.Marshal(evt)
+	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		c.removeSyncCoordinator(requestID)
 		return c.presence.GetAll()
@@ -565,7 +564,7 @@ func (c *Channel) Close() error {
 		if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 			cleanEndpoint = cleanEndpoint[1:]
 		}
-		pattern := fmt.Sprintf("pondsocket:%s:%s:.*", cleanEndpoint, c.name)
+		pattern := formatTopic(cleanEndpoint, c.name, "")
 
 		if err := c.pubsub.Unsubscribe(pattern); err != nil {
 			errs = append(errs, err)
@@ -671,7 +670,17 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 
 		eventForPubSub := event
 		eventForPubSub.NodeID = c.nodeID
-		data, err := json.Marshal(eventForPubSub)
+		var descriptor interface{}
+		if recipients.recipient != nil {
+			if *recipients.recipient == all {
+				descriptor = "ALL_USERS"
+			} else if *recipients.recipient == allExceptSender {
+				descriptor = "ALL_EXCEPT_SENDER"
+			}
+		} else if len(recipients.userIds) > 0 {
+			descriptor = recipients.userIds
+		}
+		data, err := distributedBytesFromEvent(cleanEndpoint, eventForPubSub, sender, descriptor)
 
 		if err == nil {
 			go func() {
@@ -917,15 +926,15 @@ func (c *Channel) subscribeToPubSub() {
 	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 		cleanEndpoint = cleanEndpoint[1:]
 	}
-	pattern := fmt.Sprintf("pondsocket:%s:%s:.*", cleanEndpoint, c.name)
+	pattern := formatTopic(cleanEndpoint, c.name, "")
 
 	err := c.pubsub.Subscribe(pattern, func(topic string, data []byte) {
 		if err := c.checkState(); err != nil {
 			return
 		}
 
-		var event Event
-		if err := json.Unmarshal(data, &event); err != nil {
+		event, ok := eventFromDistributedBytes(data)
+		if !ok {
 			return
 		}
 
@@ -933,23 +942,23 @@ func (c *Channel) subscribeToPubSub() {
 			return
 		}
 		if event.Action == assigns {
-			c.handleRemoteAssignsEvent(&event)
+			c.handleRemoteAssignsEvent(event)
 			return
 		}
 
 		if event.Action == userCommand {
-			c.handleRemoteUserCommand(&event)
+			c.handleRemoteUserCommand(event)
 			return
 		}
 
 		var recipientIDs *array[string]
 		if event.Action == presence {
 			if event.Event == string(syncResponse) {
-				c.handleSyncResponse(&event)
+				c.handleSyncResponse(event)
 				return
 			}
 
-			c.handleRemotePresenceEvent(&event)
+			c.handleRemotePresenceEvent(event)
 			c.presence.mutex.RLock()
 			trackedUsers := c.presence.store.Keys()
 			c.presence.mutex.RUnlock()
@@ -976,7 +985,7 @@ func (c *Channel) subscribeToPubSub() {
 			return
 		}
 		internalEv := internalEvent{
-			Event:      event,
+			Event:      *event,
 			Recipients: recipientIDs,
 		}
 		select {
@@ -1054,7 +1063,7 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 	}
 	topic := formatTopic(cleanEndpoint, c.name, "assigns:update")
 
-	data, err := json.Marshal(event)
+	data, err := distributedBytesFromEvent(cleanEndpoint, event, "CHANNEL", "ALL_USERS")
 
 	if err != nil {
 		return
@@ -1090,7 +1099,7 @@ func (c *Channel) publishUserCommand(commandType userCommandType, userID string,
 
 	topic := formatTopic(cleanEndpoint, c.name, string(commandType))
 
-	data, err := json.Marshal(event)
+	data, err := distributedBytesFromEvent(cleanEndpoint, event, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		return wrapF(err, "failed to marshal user command event")
 	}
@@ -1351,7 +1360,7 @@ func (c *Channel) requestAssignsSync(requesterUserID string) string {
 	}
 	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncRequest))
 
-	data, err := json.Marshal(evt)
+	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		c.removeAssignsSyncCoordinator(requestID)
 		return ""
@@ -1410,7 +1419,7 @@ func (c *Channel) handlePresenceSyncRequest(requestEvent *Event) {
 	}
 	topic := formatTopic(cleanEndpoint, c.name, string(syncResponse))
 
-	data, err := json.Marshal(evt)
+	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
 
 	if err != nil {
 		return
@@ -1539,7 +1548,7 @@ func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
 	}
 
 	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncResponse))
-	data, err := json.Marshal(evt)
+	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		return
 	}
@@ -1661,7 +1670,7 @@ func (c *Channel) requestRemoteUser(userID string) (*User, error) {
 	}
 
 	topic := formatTopic(cleanEndpoint, c.name, string(userGetRequest))
-	data, err := json.Marshal(event)
+	data, err := distributedBytesFromEvent(cleanEndpoint, event, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		return nil, wrapF(err, "failed to marshal user get request")
 	}
@@ -1734,7 +1743,7 @@ func (c *Channel) handleUserGetRequest(event *Event, userID string) {
 	}
 
 	topic := formatTopic(cleanEndpoint, c.name, string(userGetResponse))
-	data, err := json.Marshal(responseEvent)
+	data, err := distributedBytesFromEvent(cleanEndpoint, responseEvent, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		return
 	}

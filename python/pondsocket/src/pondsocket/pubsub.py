@@ -29,7 +29,12 @@ def match_topic(pattern: str, topic: str) -> bool:
 
 
 def format_topic(endpoint: str, channel: str, event: str) -> str:
-    return f"pondsocket:{endpoint}:{channel}:{event}"
+    del event
+    return f"pondsocket:v1:default:{endpoint}:{channel}"
+
+
+def format_heartbeat_topic() -> str:
+    return "pondsocket:v1:default:__heartbeat__"
 
 
 def format_presence_topic(endpoint: str, channel: str) -> str:

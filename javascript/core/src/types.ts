@@ -16,6 +16,7 @@ export interface RedisDistributedBackendOptions {
     database?: number;
     url?: string;
     keyPrefix?: string;
+    namespace?: string;
     heartbeatIntervalMs?: number;
     heartbeatTimeoutMs?: number;
     onError?: (error: Error) => void;
@@ -40,11 +41,17 @@ export enum DistributedMessageType {
     PRESENCE_REMOVED = 'PRESENCE_REMOVED',
     ASSIGNS_UPDATE = 'ASSIGNS_UPDATE',
     EVICT_USER = 'EVICT_USER',
+    USER_REMOVE = 'USER_REMOVE',
+    USER_GET_REQUEST = 'USER_GET_REQUEST',
+    USER_GET_RESPONSE = 'USER_GET_RESPONSE',
     NODE_HEARTBEAT = 'NODE_HEARTBEAT'
 }
 
 export interface DistributedMessage {
+    protocol?: 'pondsocket.distributed';
+    version?: 1;
     type: DistributedMessageType;
+    messageId?: string;
     endpointName: string;
     channelName: string;
     timestamp?: number;
@@ -107,7 +114,27 @@ export interface EvictUser extends DistributedMessage {
     type: DistributedMessageType.EVICT_USER;
     userId: string;
     reason: string;
-    fromNode?: string;
+}
+
+export interface UserRemove extends DistributedMessage {
+    type: DistributedMessageType.USER_REMOVE;
+    userId: string;
+    reason: string;
+}
+
+export interface UserGetRequest extends DistributedMessage {
+    type: DistributedMessageType.USER_GET_REQUEST;
+    userId: string;
+    lookupRequestId: string;
+}
+
+export interface UserGetResponse extends DistributedMessage {
+    type: DistributedMessageType.USER_GET_RESPONSE;
+    lookupRequestId: string;
+    userId: string;
+    found: boolean;
+    assigns?: PondAssigns;
+    presence?: PondPresence;
 }
 
 export interface NodeHeartbeat extends DistributedMessage {
@@ -125,6 +152,9 @@ export type DistributedChannelMessage =
    | PresenceRemoved
    | AssignsUpdate
    | EvictUser
+   | UserRemove
+   | UserGetRequest
+   | UserGetResponse
    | NodeHeartbeat;
 
 export interface IDistributedBackend {
