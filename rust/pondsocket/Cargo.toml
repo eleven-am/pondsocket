@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Channel-based realtime server framework with distributed pubsub support."
+readme = "../README.md"
 
 [features]
 default = []
@@ -14,7 +19,7 @@ redis = ["dep:redis", "dep:tokio-stream"]
 async-trait.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
-pondsocket-common = { path = "../pondsocket-common" }
+pondsocket-common = { path = "../pondsocket-common", version = "0.1.0" }
 redis = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -25,4 +30,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-

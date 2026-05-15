@@ -10,7 +10,10 @@ resolver = "2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["eleven-am"]
-repository = "https://github.com/Eleven-am/pondSocket"
+repository = "https://github.com/eleven-am/pondsocket"
+homepage = "https://github.com/eleven-am/pondsocket"
+keywords = ["websocket", "realtime", "pubsub", "presence"]
+categories = ["web-programming", "network-programming"]
 
 [workspace.dependencies]
 async-trait = "0.1"
