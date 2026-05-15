@@ -74,7 +74,7 @@ func TestPubSubIntegration(t *testing.T) {
 		if len(messagesCopy) == 0 {
 			t.Error("Expected message to be published to PubSub")
 		} else {
-			expectedTopic := "pondsocket:socket:test:channel:test:event"
+			expectedTopic := "pondsocket:v1:default:socket:test:channel"
 			if messagesCopy[0].Topic != expectedTopic {
 				t.Errorf("Expected topic %s, got %s", expectedTopic, messagesCopy[0].Topic)
 			}
@@ -142,7 +142,8 @@ func TestPubSubIntegration(t *testing.T) {
 			},
 		}
 
-		data, err := json.Marshal(event)
+		event.NodeID = "remote-node"
+		data, err := distributedBytesFromEvent("socket", event, "CHANNEL", "ALL_USERS")
 		if err != nil {
 			t.Fatalf("Failed to marshal event: %v", err)
 		}
@@ -192,7 +193,7 @@ func TestPubSubIntegration(t *testing.T) {
 
 		time.Sleep(200 * time.Millisecond)
 
-		pattern := "pondsocket:socket:test:channel:.*"
+		pattern := "pondsocket:v1:default:socket:test:channel"
 		trackingPubSub.mu.Lock()
 		subscribed := trackingPubSub.subscriptions[pattern]
 		trackingPubSub.mu.Unlock()

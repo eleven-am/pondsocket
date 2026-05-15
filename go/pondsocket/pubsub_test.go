@@ -228,17 +228,17 @@ func TestTopicFormatting(t *testing.T) {
 		{
 			name:     "format message topic",
 			fn:       func() string { return formatMessageTopic("socket", "room:123") },
-			expected: "pondsocket:socket:room:123:message",
+			expected: "pondsocket:v1:default:socket:room:123",
 		},
 		{
 			name:     "format presence topic",
 			fn:       func() string { return formatPresenceTopic("admin", "room:456") },
-			expected: "pondsocket:admin:room:456:presence",
+			expected: "pondsocket:v1:default:admin:room:456",
 		},
 		{
 			name:     "format system topic",
 			fn:       func() string { return formatSystemTopic("node-join") },
-			expected: "pondsocket:system:node-join",
+			expected: "pondsocket:v1:default:system:node-join",
 		},
 	}
 

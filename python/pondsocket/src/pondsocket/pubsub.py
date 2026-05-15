@@ -46,4 +46,4 @@ def format_message_topic(endpoint: str, channel: str) -> str:
 
 
 def format_system_topic(event: str) -> str:
-    return f"pondsocket:system:{event}"
+    return f"pondsocket:v1:default:system:{event}"

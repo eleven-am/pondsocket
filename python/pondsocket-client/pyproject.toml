@@ -1,24 +1,22 @@
 [project]
-name = "pondsocket"
+name = "pondsocket-client"
 version = "0.0.2"
-description = "PondSocket - channel-based real-time framework with bring-your-own-server design."
+description = "PondSocket Python client — connect to a PondSocket server from Python."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "eleven-am" }]
 dependencies = [
     "pondsocket-common>=0.0.2,<0.1.0",
+    "websockets>=13",
 ]
-
-[project.optional-dependencies]
-redis = ["redis>=5"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pondsocket"]
+packages = ["src/pondsocket_client"]
 
 [tool.uv.sources]
 pondsocket-common = { workspace = true }

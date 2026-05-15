@@ -235,7 +235,7 @@ export class RedisDistributedBackend implements IDistributedBackend {
         try {
             const parsedMessage = JSON.parse(message);
 
-            if (this.#isValidMessage(parsedMessage) && parsedMessage.type === DistributedMessageType.NODE_HEARTBEAT && parsedMessage.sourceNodeId !== this.#nodeId) {
+            if (this.#isValidMessage(parsedMessage) && parsedMessage.type === DistributedMessageType.NODE_HEARTBEAT && parsedMessage.sourceNodeId && parsedMessage.sourceNodeId !== this.#nodeId) {
                 this.#heartbeatSubject.publish(parsedMessage.sourceNodeId);
             }
         } catch (_) {
