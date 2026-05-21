@@ -143,6 +143,7 @@ export class EndpointEngine {
         try {
             this.#sockets.delete(cache.clientId);
             cache.subscriptions.forEach((unsubscribe) => unsubscribe());
+            cache.channelSubscriptions?.clear();
         } catch {
             void 0;
         }
@@ -190,8 +191,13 @@ export class EndpointEngine {
      * Handles a leave channel request
      */
     #leaveChannel (channel: string, socket: SocketCache) {
-        const engine = this.#retrieveChannel(channel);
+        const subscription = socket.channelSubscriptions?.get(channel);
+        if (subscription) {
+            subscription();
+            return;
+        }
 
+        const engine = this.#retrieveChannel(channel);
         engine.removeUser(socket.clientId);
     }
 

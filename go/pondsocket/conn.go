@@ -106,6 +106,9 @@ func (c *Conn) readPump() {
 			messageType, message, err := c.conn.ReadMessage()
 
 			if err != nil {
+				if !c.IsActive() {
+					return
+				}
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
 					return
 				}

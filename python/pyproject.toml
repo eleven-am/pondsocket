@@ -7,7 +7,7 @@ backend-path = ["."]
 package = false
 
 [tool.uv.workspace]
-members = ["pondsocket-common", "pondsocket", "pondsocket-asgi"]
+members = ["pondsocket-common", "pondsocket", "pondsocket-asgi", "pondsocket-client"]
 
 [dependency-groups]
 dev = [
@@ -47,6 +47,7 @@ files = [
     "pondsocket-common/src",
     "pondsocket/src",
     "pondsocket-asgi/src",
+    "pondsocket-client/src",
 ]
 
 [[tool.mypy.overrides]]
@@ -67,4 +68,5 @@ testpaths = [
     "pondsocket-common/tests",
     "pondsocket/tests",
     "pondsocket-asgi/tests",
+    "pondsocket-client/tests",
 ]

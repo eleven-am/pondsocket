@@ -79,6 +79,10 @@ class Event:
     event: str
     payload: Any = None
     node_id: str = ""
+    recipients: list[str] = field(default_factory=list)
+    recipient_descriptor: object = "ALL_USERS"
+    from_user_id: str = "CHANNEL"
+    user_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.action:

@@ -38,10 +38,10 @@ def test_match_topic_minimal_wildcard_pattern_matches_prefix() -> None:
 
 
 def test_format_helpers() -> None:
-    assert format_topic("api", "room", "message") == "pondsocket:api:room:message"
-    assert format_presence_topic("api", "room") == "pondsocket:api:room:presence"
-    assert format_message_topic("api", "room") == "pondsocket:api:room:message"
-    assert format_system_topic("ping") == "pondsocket:system:ping"
+    assert format_topic("api", "room", "message") == "pondsocket:v1:default:api:room"
+    assert format_presence_topic("api", "room") == "pondsocket:v1:default:api:room"
+    assert format_message_topic("api", "room") == "pondsocket:v1:default:api:room"
+    assert format_system_topic("ping") == "pondsocket:v1:default:system:ping"
 
 
 def test_local_pubsub_satisfies_protocol() -> None:

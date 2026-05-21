@@ -1,6 +1,7 @@
 import { IncomingHttpHeaders, IncomingMessage, Server as HTTPServer, Server, ServerResponse } from 'http';
 
 import {
+    ChannelReceivers,
     EventParams,
     IncomingConnection,
     JoinParams,
@@ -59,13 +60,18 @@ export enum DistributedMessageType {
     PRESENCE_UPDATE = 'PRESENCE_UPDATE',
     PRESENCE_REMOVED = 'PRESENCE_REMOVED',
     ASSIGNS_UPDATE = 'ASSIGNS_UPDATE',
-    ASSIGNS_REMOVED = 'ASSIGNS_REMOVED',
     EVICT_USER = 'EVICT_USER',
+    USER_REMOVE = 'USER_REMOVE',
+    USER_GET_REQUEST = 'USER_GET_REQUEST',
+    USER_GET_RESPONSE = 'USER_GET_RESPONSE',
     NODE_HEARTBEAT = 'NODE_HEARTBEAT'
 }
 
 export interface DistributedMessage {
+    protocol?: 'pondsocket.distributed';
+    version?: 1;
     type: DistributedMessageType;
+    messageId?: string;
     endpointName: string;
     channelName: string;
     timestamp?: number;
@@ -104,7 +110,7 @@ export interface UserMessage extends DistributedMessage {
     event: string;
     payload: PondMessage;
     requestId: string;
-    recipients: string[];
+    recipientDescriptor: ChannelReceivers;
 }
 
 export interface PresenceUpdate extends DistributedMessage {
@@ -121,19 +127,36 @@ export interface PresenceRemoved extends DistributedMessage {
 export interface AssignsUpdate extends DistributedMessage {
     type: DistributedMessageType.ASSIGNS_UPDATE;
     userId: string;
-    assigns: PondAssigns;
-}
-
-export interface AssignsRemoved extends DistributedMessage {
-    type: DistributedMessageType.ASSIGNS_REMOVED;
-    userId: string;
+    assigns?: PondAssigns;
+    key?: string;
+    value?: unknown;
 }
 
 export interface EvictUser extends DistributedMessage {
     type: DistributedMessageType.EVICT_USER;
     userId: string;
     reason: string;
-    fromNode?: string;
+}
+
+export interface UserRemove extends DistributedMessage {
+    type: DistributedMessageType.USER_REMOVE;
+    userId: string;
+    reason: string;
+}
+
+export interface UserGetRequest extends DistributedMessage {
+    type: DistributedMessageType.USER_GET_REQUEST;
+    userId: string;
+    lookupRequestId: string;
+}
+
+export interface UserGetResponse extends DistributedMessage {
+    type: DistributedMessageType.USER_GET_RESPONSE;
+    lookupRequestId: string;
+    userId: string;
+    found: boolean;
+    assigns?: PondAssigns;
+    presence?: PondPresence;
 }
 
 export interface NodeHeartbeat extends DistributedMessage {
@@ -150,8 +173,10 @@ export type DistributedChannelMessage =
    | PresenceUpdate
    | PresenceRemoved
    | AssignsUpdate
-   | AssignsRemoved
    | EvictUser
+   | UserRemove
+   | UserGetRequest
+   | UserGetResponse
    | NodeHeartbeat;
 
 export interface IDistributedBackend {
@@ -159,7 +184,7 @@ export interface IDistributedBackend {
     readonly heartbeatTimeoutMs: number;
     initialize(): Promise<void>;
     broadcast(endpointName: string, channelName: string, message: DistributedChannelMessage): Promise<void>;
-    subscribe(endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Unsubscribe;
+    subscribeToChannel(endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Promise<Unsubscribe>;
     subscribeToHeartbeats(handler: (nodeId: string) => void): Unsubscribe;
     cleanup(): Promise<void>;
 }

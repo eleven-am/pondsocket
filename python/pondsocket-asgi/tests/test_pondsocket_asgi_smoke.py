@@ -4,4 +4,4 @@ import pondsocket_asgi
 
 
 def test_package_imports() -> None:
-    assert pondsocket_asgi.__version__ == "0.0.1"
+    assert pondsocket_asgi.__version__ == "0.0.2"

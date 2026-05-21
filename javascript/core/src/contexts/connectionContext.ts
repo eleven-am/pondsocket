@@ -155,6 +155,7 @@ export class ConnectionContext<Path extends string> {
                 const cache: SocketCache = {
                     clientId: this.#clientId,
                     subscriptions: new Set(),
+                    channelSubscriptions: new Map(),
                     assigns: this.#assigns,
                     socket: ws,
                 };

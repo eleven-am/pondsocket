@@ -1248,7 +1248,7 @@ func TestChannelSendAssignsSyncComplete(t *testing.T) {
 }
 
 func TestChannelHandleSyncTimeout(t *testing.T) {
-	t.Run("removes coordinator when complete channel receives", func(t *testing.T) {
+	t.Run("does not consume complete channel result before caller", func(t *testing.T) {
 		ctx := context.Background()
 		opts := options{
 			Name:                 "test-channel",
@@ -1264,21 +1264,20 @@ func TestChannelHandleSyncTimeout(t *testing.T) {
 			requesterUserID: "test-user",
 			responses:       make(map[string]map[string]interface{}),
 			completeChan:    make(chan map[string]interface{}, 1),
-			timeout:         1 * time.Second,
+			timeout:         50 * time.Millisecond,
 		}
 
-		done := make(chan struct{})
 		go func() {
 			channel.handleSyncTimeout(coordinator)
-			close(done)
 		}()
 
-		coordinator.completeChan <- map[string]interface{}{}
-
 		select {
-		case <-done:
-		case <-time.After(100 * time.Millisecond):
-			t.Error("expected handleSyncTimeout to complete")
+		case result := <-coordinator.completeChan:
+			if result == nil {
+				t.Fatal("expected timeout result to remain available to caller")
+			}
+		case <-time.After(200 * time.Millisecond):
+			t.Error("expected complete result after timeout")
 		}
 	})
 
@@ -1317,7 +1316,7 @@ func TestChannelHandleSyncTimeout(t *testing.T) {
 }
 
 func TestChannelHandleAssignsSyncTimeout(t *testing.T) {
-	t.Run("removes coordinator when complete channel receives", func(t *testing.T) {
+	t.Run("does not consume complete channel result before caller", func(t *testing.T) {
 		ctx := context.Background()
 		opts := options{
 			Name:                 "test-channel",
@@ -1333,21 +1332,20 @@ func TestChannelHandleAssignsSyncTimeout(t *testing.T) {
 			requesterUserID: "test-user",
 			responses:       make(map[string]map[string]interface{}),
 			completeChan:    make(chan map[string]interface{}, 1),
-			timeout:         1 * time.Second,
+			timeout:         50 * time.Millisecond,
 		}
 
-		done := make(chan struct{})
 		go func() {
 			channel.handleAssignsSyncTimeout(coordinator)
-			close(done)
 		}()
 
-		coordinator.completeChan <- map[string]interface{}{}
-
 		select {
-		case <-done:
-		case <-time.After(100 * time.Millisecond):
-			t.Error("expected handleAssignsSyncTimeout to complete")
+		case result := <-coordinator.completeChan:
+			if result == nil {
+				t.Fatal("expected timeout result to remain available to caller")
+			}
+		case <-time.After(200 * time.Millisecond):
+			t.Error("expected complete result after timeout")
 		}
 	})
 }
@@ -1393,6 +1391,155 @@ func TestChannelGetAssignsDistributed(t *testing.T) {
 			t.Error("expected nil assigns when channel is closing")
 		}
 	})
+}
+
+func TestChannelGetAssignsMergesLocalWithRemote(t *testing.T) {
+	ctx := context.Background()
+	pubsub := NewLocalPubSub(ctx, 100)
+	defer pubsub.Close()
+	opts := options{
+		Name:                 "test-channel",
+		Middleware:           newMiddleWare[*messageEvent, *Channel](),
+		Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+		InternalQueueTimeout: 1 * time.Second,
+		PubSub:               pubsub,
+	}
+	channel := newChannel(ctx, opts)
+	channel.endpointPath = "/socket"
+	defer channel.Close()
+
+	if err := channel.store.Create("local", map[string]interface{}{"role": "local"}); err != nil {
+		t.Fatalf("failed to create local assigns: %v", err)
+	}
+
+	resultCh := make(chan map[string]map[string]interface{}, 1)
+	go func() {
+		resultCh <- channel.GetAssigns()
+	}()
+
+	var coordinator *syncCoordinator
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		channel.assignsSyncCoordinatorMutex.RLock()
+		for _, candidate := range channel.assignsSyncCoordinators {
+			coordinator = candidate
+			break
+		}
+		channel.assignsSyncCoordinatorMutex.RUnlock()
+		if coordinator != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if coordinator == nil {
+		t.Fatal("expected assigns sync coordinator")
+	}
+
+	coordinator.completeChan <- map[string]interface{}{
+		"local":  map[string]interface{}{"role": "remote"},
+		"remote": map[string]interface{}{"role": "remote"},
+	}
+
+	select {
+	case result := <-resultCh:
+		if result["local"]["role"] != "local" {
+			t.Fatalf("expected local assigns to win, got %v", result["local"]["role"])
+		}
+		if result["remote"]["role"] != "remote" {
+			t.Fatalf("expected remote assigns to be included, got %v", result["remote"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for merged assigns")
+	}
+}
+
+func TestChannelGetPresenceMergesLocalWithRemote(t *testing.T) {
+	ctx := context.Background()
+	pubsub := NewLocalPubSub(ctx, 100)
+	defer pubsub.Close()
+	opts := options{
+		Name:                 "test-channel",
+		Middleware:           newMiddleWare[*messageEvent, *Channel](),
+		Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+		InternalQueueTimeout: 1 * time.Second,
+		PubSub:               pubsub,
+	}
+	channel := newChannel(ctx, opts)
+	channel.endpointPath = "/socket"
+	defer channel.Close()
+
+	if err := channel.presence.store.Create("local", map[string]interface{}{"status": "local"}); err != nil {
+		t.Fatalf("failed to create local presence: %v", err)
+	}
+
+	resultCh := make(chan map[string]interface{}, 1)
+	go func() {
+		resultCh <- channel.GetPresence()
+	}()
+
+	var coordinator *syncCoordinator
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		channel.syncCoordinatorMutex.RLock()
+		for _, candidate := range channel.syncCoordinators {
+			coordinator = candidate
+			break
+		}
+		channel.syncCoordinatorMutex.RUnlock()
+		if coordinator != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if coordinator == nil {
+		t.Fatal("expected presence sync coordinator")
+	}
+
+	coordinator.completeChan <- map[string]interface{}{
+		"local":  map[string]interface{}{"status": "remote"},
+		"remote": map[string]interface{}{"status": "remote"},
+	}
+
+	select {
+	case result := <-resultCh:
+		local, _ := result["local"].(map[string]interface{})
+		if local["status"] != "local" {
+			t.Fatalf("expected local presence to win, got %v", local["status"])
+		}
+		remote, _ := result["remote"].(map[string]interface{})
+		if remote["status"] != "remote" {
+			t.Fatalf("expected remote presence to be included, got %v", result["remote"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for merged presence")
+	}
+}
+
+func TestRemoteAssignsUpdateDoesNotCreateLocalMembership(t *testing.T) {
+	ctx := context.Background()
+	opts := options{
+		Name:                 "test-channel",
+		Middleware:           newMiddleWare[*messageEvent, *Channel](),
+		Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+		InternalQueueTimeout: 1 * time.Second,
+	}
+	channel := newChannel(ctx, opts)
+	defer channel.Close()
+
+	channel.handleRemoteAssignsEvent(&Event{
+		Action:      assigns,
+		ChannelName: "test-channel",
+		Event:       "assigns:update",
+		Payload: map[string]interface{}{
+			"UserID": "remote-only",
+			"Key":    "role",
+			"Value":  "admin",
+		},
+	})
+
+	if _, err := channel.store.Read("remote-only"); err == nil {
+		t.Fatal("remote assigns update created local membership for unknown user")
+	}
 }
 
 func TestChannelGetLocalAssigns(t *testing.T) {

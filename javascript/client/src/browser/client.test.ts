@@ -240,10 +240,12 @@ describe('PondClient', () => {
         jest.useRealTimers();
     });
 
-    test('ping interval should send ping messages when connected', async () => {
+    test('ping interval should close when no server messages arrive', async () => {
         jest.useFakeTimers();
         const clientWithPing = new PondClient('ws://example.com', {}, { pingInterval: 1000 });
+        const errorCallback = jest.fn();
 
+        clientWithPing.onError(errorCallback);
         clientWithPing.connect();
 
         const mockWebSocket = clientWithPing['_socket']! as any;
@@ -252,14 +254,13 @@ describe('PondClient', () => {
 
         mockWebSocket.onopen();
 
-        jest.advanceTimersByTime(1000);
+        jest.advanceTimersByTime(2000);
 
-        expect(mockWebSocket.send).toHaveBeenCalledWith(JSON.stringify({ action: 'ping' }));
-
-        jest.advanceTimersByTime(1000);
-
-        expect(mockWebSocket.send).toHaveBeenCalledTimes(2);
-
+        expect(mockWebSocket.send).not.toHaveBeenCalledWith(JSON.stringify({ action: 'ping' }));
+        expect(errorCallback).toHaveBeenCalledWith(expect.objectContaining({
+            message: 'Connection lost: no response from server',
+        }));
+        expect(mockWebSocket.close).toHaveBeenCalled();
         jest.useRealTimers();
     });
 

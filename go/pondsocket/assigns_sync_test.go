@@ -2,7 +2,6 @@ package pondsocket
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -166,15 +165,14 @@ func TestAssignsSync(t *testing.T) {
 		messagesMutex.Unlock()
 
 		for _, msg := range messagesCopy {
-			if msg.Topic == "pondsocket:socket:test:channel:assigns:update" {
-				var event Event
-				if err := json.Unmarshal(msg.Data, &event); err == nil {
-					if event.Action == "ASSIGNS" && event.Event == "assigns:update" {
-						payload, ok := event.Payload.(map[string]interface{})
-						if ok && payload["UserID"] == "user1" && payload["Key"] == "status" && payload["Value"] == "online" {
-							found = true
-							break
-						}
+			if msg.Topic == "pondsocket:v1:default:socket:test:channel" {
+				event, ok := eventFromDistributedBytes(msg.Data)
+				if ok && event.Action == assigns && event.Event == "assigns:update" {
+					payload, ok := event.Payload.(map[string]interface{})
+					assigns, _ := payload["assigns"].(map[string]interface{})
+					if ok && payload["userId"] == "user1" && payload["key"] == "status" && payload["value"] == "online" && assigns["status"] == "online" {
+						found = true
+						break
 					}
 				}
 			}
@@ -239,7 +237,8 @@ func TestAssignsSync(t *testing.T) {
 			},
 		}
 
-		data, err := json.Marshal(assignsEvent)
+		assignsEvent.NodeID = "remote-node"
+		data, err := distributedBytesFromEvent("socket", assignsEvent, "CHANNEL", "ALL_USERS")
 		if err != nil {
 			t.Fatalf("Failed to marshal assigns event: %v", err)
 		}

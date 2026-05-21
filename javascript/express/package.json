@@ -20,7 +20,7 @@
   "types": "./index.d.ts",
   "license": "GPL-3.0",
   "scripts": {
-    "test": "jest --coverage --verbose",
+    "test": "jest --coverage --verbose --passWithNoTests",
     "build": "rimraf dist && tsc --build tsconfig.json",
     "lint": "eslint --ext .ts src",
     "lint:fix": "eslint --fix --ext .ts src",

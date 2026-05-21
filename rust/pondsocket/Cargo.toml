@@ -1,0 +1,32 @@
+[package]
+name = "pondsocket"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Channel-based realtime server framework with distributed pubsub support."
+readme = "../README.md"
+
+[features]
+default = []
+redis = ["dep:redis", "dep:tokio-stream"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+pondsocket-common = { path = "../pondsocket-common", version = "0.1.0" }
+redis = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream = { workspace = true, optional = true }
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -8,12 +8,21 @@ import {
     RedisDistributedBackendOptions,
 } from '../types';
 
+const DISTRIBUTED_PROTOCOL = 'pondsocket.distributed';
+const DISTRIBUTED_VERSION = 1;
+
+function distributedId (): string {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 export class RedisDistributedBackend implements IDistributedBackend {
     readonly #publishClient: RedisClientType;
 
     readonly #subscribeClient: RedisClientType;
 
     readonly #keyPrefix: string;
+
+    readonly #namespace: string;
 
     readonly #heartbeatSubject: Subject<string>;
 
@@ -45,12 +54,14 @@ export class RedisDistributedBackend implements IDistributedBackend {
             database = 0,
             url,
             keyPrefix = 'pondsocket',
+            namespace = 'default',
             heartbeatIntervalMs = 30_000,
             heartbeatTimeoutMs = 90_000,
             onError = null,
         } = options;
 
         this.#keyPrefix = keyPrefix;
+        this.#namespace = namespace;
         this.#heartbeatIntervalMs = heartbeatIntervalMs;
         this.#heartbeatTimeoutMs = heartbeatTimeoutMs;
         this.#onError = onError;
@@ -87,13 +98,13 @@ export class RedisDistributedBackend implements IDistributedBackend {
 
         const listener = (message: string) => {
             try {
-                const parsedMessage: DistributedChannelMessage & { nodeId: string } = JSON.parse(message);
+                const parsedMessage: DistributedChannelMessage & { nodeId?: string } = JSON.parse(message);
 
                 if (!this.#isValidMessage(parsedMessage)) {
                     return;
                 }
 
-                if (parsedMessage.nodeId !== this.#nodeId) {
+                if (parsedMessage.sourceNodeId !== this.#nodeId) {
                     handler(parsedMessage);
                 }
             } catch (_) {
@@ -118,10 +129,15 @@ export class RedisDistributedBackend implements IDistributedBackend {
         }
 
         const key = this.#buildKey(endpointName, channelName);
+        const normalizedEndpointName = this.#normalizeTopicPart(endpointName);
         const distributedMessage = {
             ...message,
-            nodeId: this.#nodeId,
+            protocol: DISTRIBUTED_PROTOCOL,
+            version: DISTRIBUTED_VERSION,
+            messageId: message.messageId ?? distributedId(),
+            timestamp: message.timestamp ?? Date.now(),
             sourceNodeId: this.#nodeId,
+            endpointName: normalizedEndpointName,
         };
 
         const serializedMessage = JSON.stringify(distributedMessage);
@@ -197,9 +213,14 @@ export class RedisDistributedBackend implements IDistributedBackend {
         }
 
         const heartbeatMessage = {
+            protocol: DISTRIBUTED_PROTOCOL,
+            version: DISTRIBUTED_VERSION,
             type: DistributedMessageType.NODE_HEARTBEAT,
+            messageId: distributedId(),
             endpointName: '__heartbeat__',
             channelName: '__heartbeat__',
+            sourceNodeId: this.#nodeId,
+            timestamp: Date.now(),
             nodeId: this.#nodeId,
         };
 
@@ -216,8 +237,8 @@ export class RedisDistributedBackend implements IDistributedBackend {
         try {
             const parsedMessage = JSON.parse(message);
 
-            if (parsedMessage.type === DistributedMessageType.NODE_HEARTBEAT && parsedMessage.nodeId !== this.#nodeId) {
-                this.#heartbeatSubject.publish(parsedMessage.nodeId);
+            if (this.#isValidMessage(parsedMessage) && parsedMessage.type === DistributedMessageType.NODE_HEARTBEAT && parsedMessage.sourceNodeId && parsedMessage.sourceNodeId !== this.#nodeId) {
+                this.#heartbeatSubject.publish(parsedMessage.sourceNodeId);
             }
         } catch (_) {
             void 0;
@@ -227,14 +248,27 @@ export class RedisDistributedBackend implements IDistributedBackend {
     #isValidMessage (message: any): message is DistributedChannelMessage {
         return (
             typeof message === 'object' &&
+            message.protocol === DISTRIBUTED_PROTOCOL &&
+            message.version === DISTRIBUTED_VERSION &&
             typeof message.type === 'string' &&
             Object.values(DistributedMessageType).includes(message.type) &&
+            typeof message.messageId === 'string' &&
             typeof message.endpointName === 'string' &&
-            typeof message.channelName === 'string'
+            typeof message.channelName === 'string' &&
+            typeof message.sourceNodeId === 'string' &&
+            typeof message.timestamp === 'number'
         );
     }
 
     #buildKey (endpointName: string, channelName: string): string {
-        return `${this.#keyPrefix}:${endpointName}:${channelName}`;
+        if (endpointName === '__heartbeat__' && channelName === '__heartbeat__') {
+            return `${this.#keyPrefix}:v1:${this.#namespace}:__heartbeat__`;
+        }
+
+        return `${this.#keyPrefix}:v1:${this.#namespace}:${this.#normalizeTopicPart(endpointName)}:${channelName}`;
+    }
+
+    #normalizeTopicPart (value: string): string {
+        return value.replace(/^\/+/, '');
     }
 }

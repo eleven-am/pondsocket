@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 
 from .errors import not_found
@@ -59,6 +60,8 @@ class LocalPubSub:
             subs = self._subs.pop(pattern)
         for sub in subs:
             sub.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sub.task
 
     async def publish(self, topic: str, data: bytes) -> None:
         if self._closed:
@@ -83,3 +86,6 @@ class LocalPubSub:
             self._subs.clear()
         for sub in all_subs:
             sub.task.cancel()
+        for sub in all_subs:
+            with contextlib.suppress(asyncio.CancelledError):
+                await sub.task

@@ -20,23 +20,49 @@ type PondClient struct {
 	eventBroadcast  chan ChannelEvent
 	connectionState chan bool
 	connectionValue bool
+	writeMu         sync.Mutex
 	channels        map[string]*Channel
 	channelsMu      sync.RWMutex
 	connMu          sync.RWMutex
+	reconnectMu     sync.Mutex
 	stateMu         sync.RWMutex
 	ctx             context.Context
 	cancel          context.CancelFunc
 	reconnectCount  int
 
 	// Connection state subscribers
-	connectionSubs   map[int]chan bool
+	connectionSubs   map[int]*boolSubscriber
 	nextConnSubID    int
 	connectionSubsMu sync.RWMutex
 
 	// Event broadcast subscribers
-	eventSubs   map[int]chan ChannelEvent
+	eventSubs   map[int]*clientEventSubscriber
 	nextEventID int
 	eventSubsMu sync.RWMutex
+}
+
+type boolSubscriber struct {
+	ch   chan bool
+	done chan struct{}
+	once sync.Once
+}
+
+func (s *boolSubscriber) close() {
+	s.once.Do(func() {
+		close(s.done)
+	})
+}
+
+type clientEventSubscriber struct {
+	ch   chan ChannelEvent
+	done chan struct{}
+	once sync.Once
+}
+
+func (s *clientEventSubscriber) close() {
+	s.once.Do(func() {
+		close(s.done)
+	})
 }
 
 // NewPondClient creates a new PondSocket client
@@ -92,8 +118,8 @@ func NewPondClientWithConfig(endpoint string, params map[string]interface{}, con
 		ctx:             ctx,
 		cancel:          cancel,
 		reconnectCount:  0,
-		connectionSubs:  make(map[int]chan bool),
-		eventSubs:       make(map[int]chan ChannelEvent),
+		connectionSubs:  make(map[int]*boolSubscriber),
+		eventSubs:       make(map[int]*clientEventSubscriber),
 	}
 
 	// Start the event dispatcher
@@ -175,7 +201,8 @@ func (c *PondClient) CreateChannel(name string, params JoinParams) *Channel {
 		return channel
 	}
 
-	channel := NewChannel(c.createPublisher(), c.subscribeToConnection(), name, params)
+	connectionChan, unsubscribeConnection := c.subscribeToConnection()
+	channel := NewChannelWithCleanup(c.createPublisher(), connectionChan, unsubscribeConnection, name, params)
 	c.channels[name] = channel
 
 	return channel
@@ -184,7 +211,7 @@ func (c *PondClient) CreateChannel(name string, params JoinParams) *Channel {
 // OnConnectionChange subscribes to connection state changes
 func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 	c.connectionSubsMu.Lock()
-	sub := make(chan bool, 1)
+	sub := &boolSubscriber{ch: make(chan bool, 1), done: make(chan struct{})}
 	id := c.nextConnSubID
 	c.nextConnSubID++
 	c.connectionSubs[id] = sub
@@ -197,8 +224,15 @@ func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 
 	// Start listener goroutine
 	go func() {
-		for state := range sub {
-			callback(state)
+		for {
+			select {
+			case state := <-sub.ch:
+				callback(state)
+			case <-sub.done:
+				return
+			case <-c.ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -207,16 +241,16 @@ func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 		c.connectionSubsMu.Lock()
 		if existing, ok := c.connectionSubs[id]; ok {
 			delete(c.connectionSubs, id)
-			close(existing)
+			existing.close()
 		}
 		c.connectionSubsMu.Unlock()
 	}
 }
 
 // subscribeToConnection returns a channel that receives connection state changes
-func (c *PondClient) subscribeToConnection() <-chan bool {
+func (c *PondClient) subscribeToConnection() (<-chan bool, func()) {
 	c.connectionSubsMu.Lock()
-	sub := make(chan bool, 1)
+	sub := &boolSubscriber{ch: make(chan bool, 1), done: make(chan struct{})}
 	id := c.nextConnSubID
 	c.nextConnSubID++
 	c.connectionSubs[id] = sub
@@ -227,19 +261,42 @@ func (c *PondClient) subscribeToConnection() <-chan bool {
 		c.safeSendBool(sub, c.GetState())
 	}()
 
-	return sub
+	unsubscribe := func() {
+		c.connectionSubsMu.Lock()
+		if existing, ok := c.connectionSubs[id]; ok {
+			delete(c.connectionSubs, id)
+			existing.close()
+		}
+		c.connectionSubsMu.Unlock()
+	}
+
+	return sub.ch, unsubscribe
 }
 
 // subscribeToEvents returns a channel that receives all events
 func (c *PondClient) subscribeToEvents() <-chan ChannelEvent {
+	sub, _ := c.subscribeToEventsWithUnsubscribe()
+	return sub
+}
+
+func (c *PondClient) subscribeToEventsWithUnsubscribe() (<-chan ChannelEvent, func()) {
 	c.eventSubsMu.Lock()
-	sub := make(chan ChannelEvent, 100)
+	sub := &clientEventSubscriber{ch: make(chan ChannelEvent, 100), done: make(chan struct{})}
 	id := c.nextEventID
 	c.nextEventID++
 	c.eventSubs[id] = sub
 	c.eventSubsMu.Unlock()
 
-	return sub
+	unsubscribe := func() {
+		c.eventSubsMu.Lock()
+		if existing, ok := c.eventSubs[id]; ok {
+			delete(c.eventSubs, id)
+			existing.close()
+		}
+		c.eventSubsMu.Unlock()
+	}
+
+	return sub.ch, unsubscribe
 }
 
 // createPublisher returns a function that publishes messages to the WebSocket
@@ -262,8 +319,10 @@ func (c *PondClient) createPublisher() func(ClientMessage) {
 			return
 		}
 
+		c.writeMu.Lock()
 		conn.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
 		err = conn.WriteMessage(websocket.TextMessage, data)
+		c.writeMu.Unlock()
 		if err != nil {
 			// Connection error, will be handled by readMessages
 			return
@@ -279,10 +338,15 @@ func (c *PondClient) setConnectionState(connected bool) {
 	c.stateMu.Unlock()
 
 	if oldValue != connected {
-		select {
-		case c.connectionState <- connected:
-		default:
-			// Channel is full, skip
+		c.connectionSubsMu.RLock()
+		subs := make([]*boolSubscriber, 0, len(c.connectionSubs))
+		for _, sub := range c.connectionSubs {
+			subs = append(subs, sub)
+		}
+		c.connectionSubsMu.RUnlock()
+
+		for _, sub := range subs {
+			c.safeSendBool(sub, connected)
 		}
 	}
 }
@@ -293,7 +357,7 @@ func (c *PondClient) dispatchConnectionChanges() {
 		select {
 		case state := <-c.connectionState:
 			c.connectionSubsMu.RLock()
-			subs := make([]chan bool, 0, len(c.connectionSubs))
+			subs := make([]*boolSubscriber, 0, len(c.connectionSubs))
 			for _, sub := range c.connectionSubs {
 				subs = append(subs, sub)
 			}
@@ -314,7 +378,7 @@ func (c *PondClient) dispatchEvents() {
 		select {
 		case event := <-c.eventBroadcast:
 			c.eventSubsMu.RLock()
-			subs := make([]chan ChannelEvent, 0, len(c.eventSubs))
+			subs := make([]*clientEventSubscriber, 0, len(c.eventSubs))
 			for _, sub := range c.eventSubs {
 				subs = append(subs, sub)
 			}
@@ -376,44 +440,48 @@ func (c *PondClient) readMessages() {
 
 // handleDisconnect handles disconnection and reconnection logic
 func (c *PondClient) handleDisconnect() {
-	c.connMu.Lock()
-	if c.disconnecting {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
+	for {
+		c.connMu.Lock()
+		if c.disconnecting {
+			c.connMu.Unlock()
+			return
+		}
+		c.reconnectCount++
+		reconnectCount := c.reconnectCount
 		c.connMu.Unlock()
-		return
-	}
-	c.reconnectCount++
-	reconnectCount := c.reconnectCount
-	c.connMu.Unlock()
 
-	// Check if we should attempt reconnection
-	if c.config.MaxReconnectTries >= 0 && reconnectCount > c.config.MaxReconnectTries {
-		return
-	}
+		if c.config.MaxReconnectTries >= 0 && reconnectCount > c.config.MaxReconnectTries {
+			return
+		}
 
-	// Exponential backoff with jitter
-	backoff := time.Duration(reconnectCount) * c.config.ReconnectInterval
-	if backoff > 30*time.Second {
-		backoff = 30 * time.Second
-	}
+		backoff := time.Duration(reconnectCount) * c.config.ReconnectInterval
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
 
-	timer := time.NewTimer(backoff)
-	defer timer.Stop()
+		timer := time.NewTimer(backoff)
+		select {
+		case <-c.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 
-	select {
-	case <-c.ctx.Done():
-		return
-	case <-timer.C:
-		if err := c.Connect(); err != nil {
-			// Connection failed, will try again
+		if err := c.Connect(); err == nil {
+			return
 		}
 	}
 }
 
 // init initializes the client's event handling
 func (c *PondClient) init() {
-	eventChan := c.subscribeToEvents()
+	eventChan, unsubscribe := c.subscribeToEventsWithUnsubscribe()
 
 	go func() {
+		defer unsubscribe()
 		for event := range eventChan {
 			switch event.Event {
 			case string(EventAcknowledge):
@@ -434,35 +502,36 @@ func (c *PondClient) handleAcknowledge(event ChannelEvent) {
 
 	channel, exists := c.channels[event.ChannelName]
 	if !exists {
-		channel = NewChannel(c.createPublisher(), c.subscribeToConnection(), event.ChannelName, JoinParams{})
+		connectionChan, unsubscribeConnection := c.subscribeToConnection()
+		channel = NewChannelWithCleanup(c.createPublisher(), connectionChan, unsubscribeConnection, event.ChannelName, JoinParams{})
 		c.channels[event.ChannelName] = channel
 	}
 
-	channel.Acknowledge(c.subscribeToEvents())
+	eventChan, unsubscribe := c.subscribeToEventsWithUnsubscribe()
+	channel.Acknowledge(eventChan, unsubscribe)
 }
 
-func (c *PondClient) safeSendBool(ch chan bool, value bool) {
-	defer func() {
-		if recover() != nil {
-			// Channel closed, ignore
-		}
-	}()
-
+func (c *PondClient) safeSendBool(sub *boolSubscriber, value bool) {
 	select {
-	case ch <- value:
+	case <-sub.done:
+	case sub.ch <- value:
 	default:
+		select {
+		case <-sub.ch:
+		default:
+		}
+		select {
+		case <-sub.done:
+		case sub.ch <- value:
+		default:
+		}
 	}
 }
 
-func (c *PondClient) safeSendEvent(ch chan ChannelEvent, event ChannelEvent) {
-	defer func() {
-		if recover() != nil {
-			// Channel closed, ignore
-		}
-	}()
-
+func (c *PondClient) safeSendEvent(sub *clientEventSubscriber, event ChannelEvent) {
 	select {
-	case ch <- event:
+	case <-sub.done:
+	case sub.ch <- event:
 	default:
 	}
 }

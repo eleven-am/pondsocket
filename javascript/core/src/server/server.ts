@@ -29,6 +29,8 @@ export class PondSocket {
 
     #heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
+    #backendReady: Promise<void> | null = null;
+
     constructor ({
         server,
         socketServer,
@@ -82,6 +84,11 @@ export class PondSocket {
         this.#socketServer.close(() => {
             clearTimeout(forceClose);
         });
+
+        this.#backendReady = this.#backendReady
+            ?.catch(() => {})
+            .then(() => this.#backend?.cleanup())
+            .catch(() => {}) ?? null;
 
         return this.#server.close(callback);
     }
@@ -180,6 +187,9 @@ export class PondSocket {
      */
     #init () {
         this.#heartbeatTimer = this.#manageHeartbeat();
+        this.#backendReady = this.#backend?.initialize().catch((error) => {
+            this.#server.emit('error', error);
+        }) ?? null;
 
         this.#server.on('error', (error) => {
             if (this.#heartbeatTimer) {

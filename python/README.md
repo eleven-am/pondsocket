@@ -11,6 +11,7 @@ Designed around **bring-your-own-server**: the core never imports a WebSocket li
 | [`pondsocket-common`](./pondsocket-common/) | Shared wire types, schemas (pydantic), reactive primitives | `pondsocket-common` |
 | [`pondsocket`](./pondsocket/) | Server core: channels, presence, contexts, middleware, hooks, distributed | `pondsocket` |
 | [`pondsocket-asgi`](./pondsocket-asgi/) | Canonical ASGI adapter (WebSocket + SSE) | `pondsocket-asgi` |
+| [`pondsocket-client`](./pondsocket-client/) | Python client (WebSocket) | `pondsocket-client` |
 
 Optional extras: `pondsocket[redis]` for multi-node deployments.
 

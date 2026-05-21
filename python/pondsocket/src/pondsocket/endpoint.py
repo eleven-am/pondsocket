@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ class Endpoint:
         "_options",
         "_path",
         "_pubsub",
+        "_registration_lock",
     )
 
     def __init__(
@@ -73,6 +75,7 @@ class Endpoint:
         self._connections: Store[Transport] = Store()
         self._channel_registrations: list[_ChannelRegistration] = []
         self._connect_times: dict[str, float] = {}
+        self._registration_lock = asyncio.Lock()
 
     @property
     def path(self) -> str:
@@ -126,9 +129,10 @@ class Endpoint:
         return ctx
 
     async def register_transport(self, transport: Transport) -> None:
-        await self._check_max_connections()
-        await self._connections.create(transport.get_id(), transport)
-        self._connect_times[transport.get_id()] = time.monotonic()
+        async with self._registration_lock:
+            await self._check_max_connections()
+            await self._connections.create(transport.get_id(), transport)
+            self._connect_times[transport.get_id()] = time.monotonic()
         await self._send_connect_event(transport)
         transport.on_close(self._on_transport_closed)
         transport.on_message(self._handle_transport_message)
@@ -212,6 +216,8 @@ class Endpoint:
                 await ctx.decline(401, "Join handler did not respond")
             if ctx.is_accepted:
                 await self._fire_after_join(transport, channel_name)
+            elif await channel.user_count() == 0:
+                await channel.close()
             return
         await self._send_not_found(transport, event)
 

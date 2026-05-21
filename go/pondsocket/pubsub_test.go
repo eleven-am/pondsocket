@@ -187,6 +187,29 @@ func TestLocalPubSub(t *testing.T) {
 			t.Errorf("Second close returned error: %v", err)
 		}
 	})
+
+	t.Run("unsubscribe does not dispatch zero value message", func(t *testing.T) {
+		ps := NewLocalPubSub(ctx, 1)
+		defer ps.Close()
+
+		received := make(chan PubSubMessage, 1)
+		err := ps.Subscribe("zero.topic", func(topic string, data []byte) {
+			received <- PubSubMessage{Topic: topic, Data: data}
+		})
+		if err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		if err := ps.Unsubscribe("zero.topic"); err != nil {
+			t.Fatalf("Unsubscribe failed: %v", err)
+		}
+
+		select {
+		case msg := <-received:
+			t.Fatalf("unexpected dispatch after unsubscribe: topic=%q data=%q", msg.Topic, string(msg.Data))
+		case <-time.After(50 * time.Millisecond):
+		}
+	})
 }
 
 func TestPubSubClosedError(t *testing.T) {
@@ -228,17 +251,17 @@ func TestTopicFormatting(t *testing.T) {
 		{
 			name:     "format message topic",
 			fn:       func() string { return formatMessageTopic("socket", "room:123") },
-			expected: "pondsocket:socket:room:123:message",
+			expected: "pondsocket:v1:default:socket:room:123",
 		},
 		{
 			name:     "format presence topic",
 			fn:       func() string { return formatPresenceTopic("admin", "room:456") },
-			expected: "pondsocket:admin:room:456:presence",
+			expected: "pondsocket:v1:default:admin:room:456",
 		},
 		{
 			name:     "format system topic",
 			fn:       func() string { return formatSystemTopic("node-join") },
-			expected: "pondsocket:system:node-join",
+			expected: "pondsocket:v1:default:system:node-join",
 		},
 	}
 

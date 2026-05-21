@@ -57,8 +57,14 @@ export class JoinContext<Path extends string> extends BaseContext<Path> {
         const onMessage = this.engine.parent.parent.sendMessage.bind(this.engine.parent.parent, this.#user.socket);
 
         const subscription = this.engine.addUser(this.#user.clientId, this.#newAssigns, onMessage);
+        const wrappedSubscription = () => {
+            subscription();
+            this.#user.subscriptions.delete(wrappedSubscription);
+            this.#user.channelSubscriptions?.delete(this.engine.name);
+        };
 
-        this.#user.subscriptions.add(subscription);
+        this.#user.subscriptions.add(wrappedSubscription);
+        this.#user.channelSubscriptions?.set(this.engine.name, wrappedSubscription);
         this.#accepted = true;
 
         return this;

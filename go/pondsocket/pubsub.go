@@ -63,7 +63,8 @@ func matchTopic(pattern, topic string) bool {
 }
 
 func formatTopic(endpoint, channel, event string) string {
-	return fmt.Sprintf("pondsocket:%s:%s:%s", endpoint, channel, event)
+	_ = event
+	return fmt.Sprintf("pondsocket:v1:default:%s:%s", endpoint, channel)
 }
 
 func formatPresenceTopic(endpoint, channel string) string {
@@ -75,5 +76,5 @@ func formatMessageTopic(endpoint, channel string) string {
 }
 
 func formatSystemTopic(event string) string {
-	return fmt.Sprintf("pondsocket:system:%s", event)
+	return fmt.Sprintf("pondsocket:v1:default:system:%s", event)
 }
