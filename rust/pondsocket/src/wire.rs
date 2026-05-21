@@ -20,6 +20,8 @@ pub fn parse_inbound_text(text: &str) -> Result<Event, ValidationError> {
         payload: Value::Object(msg.payload),
         node_id: String::new(),
         recipients: Vec::new(),
+        from_user_id: String::new(),
+        recipient_descriptor: String::new(),
     })
 }
 

@@ -988,6 +988,10 @@ func (c *Channel) subscribeToPubSub() {
 						return targetID == connID
 					})
 				})
+			} else if event.Recipient == "ALL_EXCEPT_SENDER" {
+				recipientIDs = connectedUsers.filter(func(connID string) bool {
+					return connID != event.FromUserID
+				})
 			} else {
 				recipientIDs = connectedUsers
 			}
@@ -1059,9 +1063,18 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 	}
 
 	assignsPayload := map[string]interface{}{
-		"UserID": userID,
-		"Key":    key,
-		"Value":  value,
+		"userId": userID,
+		"key":    key,
+		"value":  value,
+	}
+	if current, err := c.store.Read(userID); err == nil && current != nil {
+		assignsCopy := make(map[string]interface{}, len(current))
+		for k, v := range current {
+			assignsCopy[k] = v
+		}
+		assignsPayload["assigns"] = assignsCopy
+	} else {
+		assignsPayload["assigns"] = map[string]interface{}{key: value}
 	}
 
 	event := Event{
@@ -1184,12 +1197,19 @@ func (c *Channel) handleRemoteAssignsEvent(event *Event) {
 	if !ok {
 		return
 	}
-	userID, _ := payload["UserID"].(string)
-
-	key, _ := payload["Key"].(string)
-
-	value := payload["Value"]
-	if userID == "" || key == "" {
+	userID, _ := payload["userId"].(string)
+	if userID == "" {
+		userID, _ = payload["UserID"].(string)
+	}
+	key, _ := payload["key"].(string)
+	if key == "" {
+		key, _ = payload["Key"].(string)
+	}
+	value := payload["value"]
+	if value == nil {
+		value = payload["Value"]
+	}
+	if userID == "" {
 		return
 	}
 	assigns, err := c.store.Read(userID)
@@ -1201,7 +1221,17 @@ func (c *Channel) handleRemoteAssignsEvent(event *Event) {
 	for k, v := range assigns {
 		assignsCopy[k] = v
 	}
-	assignsCopy[key] = value
+	if remoteAssigns, ok := payload["assigns"].(map[string]interface{}); ok {
+		for k, v := range remoteAssigns {
+			assignsCopy[k] = v
+		}
+	} else if remoteAssigns, ok := payload["Assigns"].(map[string]interface{}); ok {
+		for k, v := range remoteAssigns {
+			assignsCopy[k] = v
+		}
+	} else if key != "" {
+		assignsCopy[key] = value
+	}
 	_ = c.store.Update(userID, assignsCopy)
 }
 

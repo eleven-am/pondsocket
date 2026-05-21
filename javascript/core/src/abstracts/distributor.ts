@@ -129,6 +129,7 @@ export class RedisDistributedBackend implements IDistributedBackend {
         }
 
         const key = this.#buildKey(endpointName, channelName);
+        const normalizedEndpointName = this.#normalizeTopicPart(endpointName);
         const distributedMessage = {
             ...message,
             protocol: DISTRIBUTED_PROTOCOL,
@@ -136,6 +137,7 @@ export class RedisDistributedBackend implements IDistributedBackend {
             messageId: message.messageId ?? distributedId(),
             timestamp: message.timestamp ?? Date.now(),
             sourceNodeId: this.#nodeId,
+            endpointName: normalizedEndpointName,
         };
 
         const serializedMessage = JSON.stringify(distributedMessage);
@@ -263,6 +265,10 @@ export class RedisDistributedBackend implements IDistributedBackend {
             return `${this.#keyPrefix}:v1:${this.#namespace}:__heartbeat__`;
         }
 
-        return `${this.#keyPrefix}:v1:${this.#namespace}:${endpointName}:${channelName}`;
+        return `${this.#keyPrefix}:v1:${this.#namespace}:${this.#normalizeTopicPart(endpointName)}:${channelName}`;
+    }
+
+    #normalizeTopicPart (value: string): string {
+        return value.replace(/^\/+/, '');
     }
 }

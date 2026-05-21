@@ -107,7 +107,9 @@ export interface PresenceRemoved extends DistributedMessage {
 export interface AssignsUpdate extends DistributedMessage {
     type: DistributedMessageType.ASSIGNS_UPDATE;
     userId: string;
-    assigns: PondAssigns;
+    assigns?: PondAssigns;
+    key?: string;
+    value?: unknown;
 }
 
 export interface EvictUser extends DistributedMessage {

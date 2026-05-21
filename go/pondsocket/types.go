@@ -21,6 +21,8 @@ type Event struct {
 	Event       string      `json:"event"`
 	NodeID      string      `json:"nodeId,omitempty"`
 	Recipients  []string    `json:"recipients,omitempty"`
+	FromUserID  string      `json:"fromUserId,omitempty"`
+	Recipient   string      `json:"recipientDescriptor,omitempty"`
 }
 
 type internalEvent struct {

@@ -220,7 +220,7 @@ class Channel:
             channel_name=self.name,
             request_id=uuid(),
             event="assigns:update",
-            payload={"userId": user_id, "key": key, "value": value},
+            payload={"userId": user_id, "key": key, "value": value, "assigns": dict(current)},
             node_id=self.node_id,
         )
         await self._publish_event_to_pubsub(ev, "assigns:update")
@@ -594,6 +594,9 @@ class Channel:
         user_id = str(event.payload.get("userId") or "")
         key = event.payload.get("key")
         if not user_id or not isinstance(key, str):
+            remote_assigns = event.payload.get("assigns")
+            if user_id and isinstance(remote_assigns, dict) and await self._assigns.has(user_id):
+                await self._assigns.update(user_id, dict(remote_assigns))
             return
         if not await self._assigns.has(user_id):
             return
@@ -759,9 +762,14 @@ def _event_to_distributed_bytes(event: Event, subtype: str, endpoint: str) -> by
             envelope["userId"] = ""
         envelope["payload"] = payload
     elif message_type == "ASSIGNS_UPDATE":
-        envelope["userId"] = event.payload.get("userId", "") if isinstance(event.payload, dict) else ""
-        envelope["assigns"] = event.payload if isinstance(event.payload, dict) else {}
-        envelope["payload"] = event.payload if isinstance(event.payload, dict) else {}
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        envelope["userId"] = payload.get("userId", "")
+        if "key" in payload:
+            envelope["key"] = payload.get("key")
+        if "value" in payload:
+            envelope["value"] = payload.get("value")
+        envelope["assigns"] = payload.get("assigns", {})
+        envelope["payload"] = payload
     elif message_type in {"EVICT_USER", "USER_REMOVE"}:
         payload = event.payload if isinstance(event.payload, dict) else {}
         envelope["userId"] = payload.get("userId", "")
@@ -827,12 +835,20 @@ def _distributed_bytes_to_event(data: bytes) -> Event | None:
         )
     if message_type == "ASSIGNS_UPDATE":
         payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else None
+        assigns_payload = {
+            "userId": raw.get("userId") or "",
+            "assigns": raw.get("assigns") or {},
+        }
+        if "key" in raw:
+            assigns_payload["key"] = raw.get("key")
+        if "value" in raw:
+            assigns_payload["value"] = raw.get("value")
         return Event(
             action=InternalActions.ASSIGNS.value,
             channel_name=channel_name,
             request_id=request_id,
             event="assigns:update",
-            payload=payload or {"userId": raw.get("userId") or "", "assigns": raw.get("assigns") or {}},
+            payload=payload or assigns_payload,
             node_id=node_id,
         )
     if message_type in {"EVICT_USER", "USER_REMOVE"}:

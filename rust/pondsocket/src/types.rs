@@ -45,6 +45,18 @@ pub struct Event {
     pub node_id: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub recipients: Vec<String>,
+    #[serde(
+        rename = "fromUserId",
+        skip_serializing_if = "String::is_empty",
+        default
+    )]
+    pub from_user_id: String,
+    #[serde(
+        rename = "recipientDescriptor",
+        skip_serializing_if = "String::is_empty",
+        default
+    )]
+    pub recipient_descriptor: String,
 }
 
 impl Event {
@@ -63,6 +75,8 @@ impl Event {
             payload,
             node_id: String::new(),
             recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
         }
     }
 }

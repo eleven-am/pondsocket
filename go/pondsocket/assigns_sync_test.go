@@ -169,7 +169,8 @@ func TestAssignsSync(t *testing.T) {
 				event, ok := eventFromDistributedBytes(msg.Data)
 				if ok && event.Action == assigns && event.Event == "assigns:update" {
 					payload, ok := event.Payload.(map[string]interface{})
-					if ok && payload["UserID"] == "user1" && payload["Key"] == "status" && payload["Value"] == "online" {
+					assigns, _ := payload["assigns"].(map[string]interface{})
+					if ok && payload["userId"] == "user1" && payload["key"] == "status" && payload["value"] == "online" && assigns["status"] == "online" {
 						found = true
 						break
 					}

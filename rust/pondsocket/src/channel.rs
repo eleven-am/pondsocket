@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use pondsocket_common::{PresenceEventType, ServerAction, uuid};
-use serde_json::{Value, json};
+use pondsocket_common::{PondAssigns, PresenceEventType, ServerAction, uuid};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore, mpsc};
@@ -213,7 +213,7 @@ impl Channel {
             .unwrap_or_default();
         let presence = self.presence.write().await.remove(user_id);
         if let Some(old) = presence.clone() {
-            self.publish_presence_change(PresenceEventType::Leave, old)
+            self.publish_presence_change(user_id, PresenceEventType::Leave, old)
                 .await?;
         }
         let user = User {
@@ -266,12 +266,17 @@ impl Channel {
         let mut assigns = self.assigns.write().await;
         let Some(current) = assigns.get_mut(user_id) else {
             drop(assigns);
-            self.publish_assign_update(user_id, key, value).await?;
+            let mut remote_assigns = Map::new();
+            remote_assigns.insert(key.to_owned(), value.clone());
+            self.publish_assign_update(user_id, key, value, remote_assigns)
+                .await?;
             return Err(not_found(&self.name, "user not in channel"));
         };
         current.insert(key.to_owned(), value.clone());
+        let updated_assigns = current.clone();
         drop(assigns);
-        self.publish_assign_update(user_id, key, value).await?;
+        self.publish_assign_update(user_id, key, value, updated_assigns)
+            .await?;
         Ok(())
     }
 
@@ -285,7 +290,7 @@ impl Channel {
         }
         store.insert(user_id.to_owned(), presence.clone());
         drop(store);
-        self.publish_presence_change(PresenceEventType::Join, presence)
+        self.publish_presence_change(user_id, PresenceEventType::Join, presence)
             .await
     }
 
@@ -299,14 +304,14 @@ impl Channel {
         }
         store.insert(user_id.to_owned(), presence.clone());
         drop(store);
-        self.publish_presence_change(PresenceEventType::Update, presence)
+        self.publish_presence_change(user_id, PresenceEventType::Update, presence)
             .await
     }
 
     pub async fn untrack_presence(&self, user_id: &str) -> Result<()> {
         let old = self.presence.write().await.remove(user_id);
         if let Some(old) = old {
-            self.publish_presence_change(PresenceEventType::Leave, old)
+            self.publish_presence_change(user_id, PresenceEventType::Leave, old)
                 .await?;
         }
         Ok(())
@@ -569,6 +574,14 @@ impl Channel {
                 .filter(|id| local.contains_key(id.as_str()))
                 .cloned()
                 .collect::<Vec<_>>()
+        } else if event.recipient_descriptor == "ALL_EXCEPT_SENDER" {
+            self.connections
+                .read()
+                .await
+                .keys()
+                .filter(|id| *id != &event.from_user_id)
+                .cloned()
+                .collect::<Vec<_>>()
         } else {
             self.connections
                 .read()
@@ -582,10 +595,14 @@ impl Channel {
 
     async fn publish_presence_change(
         &self,
+        user_id: &str,
         event_type: PresenceEventType,
-        changed: pondsocket_common::PondPresence,
+        mut changed: pondsocket_common::PondPresence,
     ) -> Result<()> {
         let (snapshot, recipients) = self.local_presence_snapshot().await;
+        changed
+            .entry("userId".to_owned())
+            .or_insert_with(|| json!(user_id));
         let mut ev = Event::new(
             "PRESENCE",
             &self.name,
@@ -704,13 +721,19 @@ impl Channel {
         self.dispatch_pubsub_event(event).await
     }
 
-    async fn publish_assign_update(&self, user_id: &str, key: &str, value: Value) -> Result<()> {
+    async fn publish_assign_update(
+        &self,
+        user_id: &str,
+        key: &str,
+        value: Value,
+        assigns: PondAssigns,
+    ) -> Result<()> {
         let mut ev = Event::new(
             "ASSIGNS",
             &self.name,
             uuid(),
             "assigns:update",
-            json!({ "userId": user_id, "key": key, "value": value }),
+            json!({ "userId": user_id, "key": key, "value": value, "assigns": assigns }),
         );
         ev.node_id = self.node_id.clone();
         self.publish_event_to_pubsub(ev, "assigns:update").await
@@ -838,21 +861,18 @@ fn distributed_event_to_bytes(
             }
         }
         "PRESENCE_UPDATE" => {
-            out.insert(
-                "userId".to_owned(),
-                json!(
-                    event
-                        .payload
-                        .get("changed")
-                        .and_then(|v| v.get("userId"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                ),
-            );
+            let user_id = event
+                .payload
+                .get("changed")
+                .and_then(|v| v.get("userId"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            out.insert("userId".to_owned(), json!(user_id));
             out.insert(
                 "presence".to_owned(),
                 event.payload.get("changed").cloned().unwrap_or(json!({})),
             );
+            out.insert("event".to_owned(), json!(event.event));
         }
         "PRESENCE_REMOVED" => {
             out.insert(
@@ -866,6 +886,7 @@ fn distributed_event_to_bytes(
                         .unwrap_or("")
                 ),
             );
+            out.insert("event".to_owned(), json!(event.event));
         }
         "ASSIGNS_UPDATE" => {
             out.insert(
@@ -878,6 +899,11 @@ fn distributed_event_to_bytes(
             if let Some(value) = event.payload.get("value") {
                 out.insert("value".to_owned(), value.clone());
             }
+            out.insert(
+                "assigns".to_owned(),
+                event.payload.get("assigns").cloned().unwrap_or(json!({})),
+            );
+            out.insert("payload".to_owned(), event.payload.clone());
         }
         "EVICT_USER" | "USER_REMOVE" => {
             out.insert(
@@ -931,16 +957,42 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            from_user_id: value
+                .get("fromUserId")
+                .and_then(Value::as_str)
+                .unwrap_or("CHANNEL")
+                .to_owned(),
+            recipient_descriptor: value
+                .get("recipientDescriptor")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
         }),
-        "PRESENCE_UPDATE" => Some(Event {
-            action: "PRESENCE".to_owned(),
-            channel_name: channel,
-            request_id,
-            event: "UPDATE".to_owned(),
-            payload: json!({"presence": [], "changed": value.get("presence").cloned().unwrap_or(json!({}))}),
-            node_id,
-            recipients: Vec::new(),
-        }),
+        "PRESENCE_UPDATE" => {
+            let user_id = value.get("userId").cloned().unwrap_or(json!(""));
+            let mut changed = value.get("presence").cloned().unwrap_or(json!({}));
+            if let Some(obj) = changed.as_object_mut() {
+                obj.entry("userId".to_owned()).or_insert(user_id.clone());
+            }
+            Some(Event {
+                action: "PRESENCE".to_owned(),
+                channel_name: channel,
+                request_id,
+                event: value
+                    .get("event")
+                    .and_then(Value::as_str)
+                    .unwrap_or("UPDATE")
+                    .to_owned(),
+                payload: value
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(json!({"presence": [], "changed": changed})),
+                node_id,
+                recipients: Vec::new(),
+                from_user_id: String::new(),
+                recipient_descriptor: String::new(),
+            })
+        }
         "PRESENCE_REMOVED" => Some(Event {
             action: "PRESENCE".to_owned(),
             channel_name: channel,
@@ -949,20 +1001,24 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
             payload: json!({"presence": [], "changed": {"userId": value.get("userId").cloned().unwrap_or(json!(""))}}),
             node_id,
             recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
         }),
         "ASSIGNS_UPDATE" => Some(Event {
             action: "ASSIGNS".to_owned(),
             channel_name: channel,
             request_id,
             event: "assigns:update".to_owned(),
-            payload: json!({
+            payload: value.get("payload").cloned().unwrap_or(json!({
                 "userId": value.get("userId").cloned().unwrap_or(json!("")),
                 "key": value.get("key").cloned().unwrap_or(Value::Null),
                 "value": value.get("value").cloned().unwrap_or(Value::Null),
                 "assigns": value.get("assigns").cloned().unwrap_or(json!({})),
-            }),
+            })),
             node_id,
             recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
         }),
         "EVICT_USER" => Some(Event {
             action: "USER_COMMAND".to_owned(),
@@ -972,6 +1028,8 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
             payload: json!({"userId": value.get("userId").cloned().unwrap_or(json!("")), "reason": value.get("reason").cloned().unwrap_or(json!(""))}),
             node_id,
             recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
         }),
         "USER_REMOVE" => Some(Event {
             action: "USER_COMMAND".to_owned(),
@@ -981,6 +1039,8 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
             payload: json!({"userId": value.get("userId").cloned().unwrap_or(json!("")), "reason": value.get("reason").cloned().unwrap_or(json!(""))}),
             node_id,
             recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
         }),
         _ => None,
     }

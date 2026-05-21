@@ -75,8 +75,14 @@ func distributedBytesFromEvent(endpoint string, event Event, sender string, reci
 		env.Event = event.Event
 		env.Payload = event.Payload
 		if payload, ok := event.Payload.(map[string]interface{}); ok {
-			env.UserID, _ = payload["UserID"].(string)
-			env.Assigns = payload
+			env.UserID, _ = payload["userId"].(string)
+			if env.UserID == "" {
+				env.UserID, _ = payload["UserID"].(string)
+			}
+			env.Assigns = payload["assigns"]
+			if env.Assigns == nil {
+				env.Assigns = payload["Assigns"]
+			}
 		}
 	case "EVICT_USER", "USER_REMOVE":
 		env.Event = event.Event
@@ -142,12 +148,15 @@ func eventFromDistributedBytes(data []byte) (*Event, bool) {
 		ev.Action = broadcast
 		ev.Event = env.Event
 		ev.Payload = env.Payload
+		ev.FromUserID = env.FromUserID
 		if ids, ok := env.RecipientDescriptor.([]interface{}); ok {
 			for _, id := range ids {
 				if s, ok := id.(string); ok {
 					ev.Recipients = append(ev.Recipients, s)
 				}
 			}
+		} else if descriptor, ok := env.RecipientDescriptor.(string); ok {
+			ev.Recipient = descriptor
 		}
 	case "PRESENCE_UPDATE":
 		ev.Action = presence
@@ -173,9 +182,9 @@ func eventFromDistributedBytes(data []byte) (*Event, bool) {
 		if env.Payload != nil {
 			ev.Payload = env.Payload
 		} else if assignsMap, ok := env.Assigns.(map[string]interface{}); ok {
-			ev.Payload = assignsMap
+			ev.Payload = map[string]interface{}{"userId": env.UserID, "assigns": assignsMap}
 		} else {
-			ev.Payload = map[string]interface{}{"UserID": env.UserID, "Assigns": env.Assigns}
+			ev.Payload = map[string]interface{}{"userId": env.UserID, "assigns": env.Assigns}
 		}
 	case "EVICT_USER":
 		ev.Action = userCommand

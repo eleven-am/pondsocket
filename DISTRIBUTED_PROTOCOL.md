@@ -72,3 +72,46 @@ Implementations must ignore messages with their own `sourceNodeId`.
 
 These names match the existing client/common enums.
 
+## Presence
+
+Presence updates are distributed as:
+
+```json
+{
+  "type": "PRESENCE_UPDATE",
+  "userId": "user-1",
+  "event": "JOIN",
+  "presence": { "status": "online" }
+}
+```
+
+Presence removals are distributed as:
+
+```json
+{
+  "type": "PRESENCE_REMOVED",
+  "userId": "user-1",
+  "event": "LEAVE"
+}
+```
+
+Implementations may include a client-shaped `payload` for local compatibility,
+but `userId` and `presence` are the canonical cross-runtime fields.
+
+## Assigns
+
+Assign updates are distributed as:
+
+```json
+{
+  "type": "ASSIGNS_UPDATE",
+  "userId": "user-1",
+  "key": "role",
+  "value": "admin",
+  "assigns": { "role": "admin" }
+}
+```
+
+`assigns` is the canonical post-update assigns snapshot for the user. `key` and
+`value` are optional delta fields and exist so runtimes can process partial
+updates without losing compatibility.

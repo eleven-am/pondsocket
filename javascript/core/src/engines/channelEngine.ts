@@ -660,7 +660,24 @@ export class ChannelEngine {
     }
 
     #handleRemoteAssignsUpdate (message: AssignsUpdate): void {
-        this.#assignsCache.set(message.userId, message.assigns);
+        const current = this.#assignsCache.get(message.userId);
+
+        if (!current) {
+            return;
+        }
+
+        if (message.assigns) {
+            this.#assignsCache.set(message.userId, message.assigns);
+
+            return;
+        }
+
+        if (message.key) {
+            this.#assignsCache.set(message.userId, {
+                ...current,
+                [message.key]: message.value,
+            });
+        }
     }
 
     #handleRemoteEvictUser (message: EvictUser): void {
