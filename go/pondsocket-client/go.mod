@@ -1,4 +1,4 @@
-module github.com/eleven-am/pondsocket-client
+module github.com/eleven-am/pondsocket/go/pondsocket-client
 
 go 1.24.4
 

@@ -1,0 +1,21 @@
+[package]
+name = "pondsocket-client"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Async WebSocket client for PondSocket."
+readme = "../README.md"
+
+[dependencies]
+futures-util.workspace = true
+pondsocket-common = { path = "../pondsocket-common", version = "0.1.1" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true

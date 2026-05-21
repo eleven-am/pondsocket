@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"pondsocket"
+	pondsocket "github.com/eleven-am/pondsocket/go/pondsocket-client"
 )
 
 func main() {

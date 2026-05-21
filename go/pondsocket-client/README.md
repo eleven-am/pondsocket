@@ -16,7 +16,7 @@ A high-performance Go client for PondSocket real-time WebSocket communication fr
 ## Installation
 
 ```bash
-go get github.com/your-org/pondsocket-client
+go get github.com/eleven-am/pondsocket/go/pondsocket-client
 ```
 
 ## Quick Start
@@ -29,7 +29,7 @@ import (
     "log"
     "time"
     
-    "github.com/your-org/pondsocket-client"
+    pondsocket "github.com/eleven-am/pondsocket/go/pondsocket-client"
 )
 
 func main() {
