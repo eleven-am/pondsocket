@@ -496,21 +496,26 @@ export class ChannelEngine {
         const unsubscribe = await this.#backend.subscribeToChannel(this.#endpointId, this.#name, (message) => {
             this.#handleDistributedMessage(message);
         });
+
         if (this.#closed) {
             unsubscribe();
+
             return;
         }
+
         this.#distributedSubscription = unsubscribe;
     }
 
     #afterDistributedReady (callback: () => void): void {
         if (!this.#distributedReady) {
             callback();
+
             return;
         }
+
         this.#distributedReady.then(() => {
             if (!this.#closed) {
-                callback();
+                return callback();
             }
         }).catch(() => {});
     }

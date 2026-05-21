@@ -23,7 +23,7 @@
     "lint": "cd comnon && npm run lint && cd ../core && npm run lint && cd ../client && npm run lint && cd ../express && npm run lint"
   },
   "devDependencies": {
-    "eslint": "^9.39.3",
+    "eslint": "^9.39.4",
     "typescript": "^5.9.3"
   }
 }

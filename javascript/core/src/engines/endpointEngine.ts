@@ -192,12 +192,15 @@ export class EndpointEngine {
      */
     #leaveChannel (channel: string, socket: SocketCache) {
         const subscription = socket.channelSubscriptions?.get(channel);
+
         if (subscription) {
             subscription();
+
             return;
         }
 
         const engine = this.#retrieveChannel(channel);
+
         engine.removeUser(socket.clientId);
     }
 

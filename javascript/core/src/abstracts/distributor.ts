@@ -12,7 +12,8 @@ const DISTRIBUTED_PROTOCOL = 'pondsocket.distributed';
 const DISTRIBUTED_VERSION = 1;
 
 function distributedId (): string {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    return `${Date.now().toString(36)}-${Math.random().toString(36)
+        .slice(2)}`;
 }
 
 export class RedisDistributedBackend implements IDistributedBackend {
