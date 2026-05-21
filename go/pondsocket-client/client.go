@@ -338,10 +338,15 @@ func (c *PondClient) setConnectionState(connected bool) {
 	c.stateMu.Unlock()
 
 	if oldValue != connected {
-		select {
-		case c.connectionState <- connected:
-		default:
-			// Channel is full, skip
+		c.connectionSubsMu.RLock()
+		subs := make([]*boolSubscriber, 0, len(c.connectionSubs))
+		for _, sub := range c.connectionSubs {
+			subs = append(subs, sub)
+		}
+		c.connectionSubsMu.RUnlock()
+
+		for _, sub := range subs {
+			c.safeSendBool(sub, connected)
 		}
 	}
 }
@@ -511,6 +516,15 @@ func (c *PondClient) safeSendBool(sub *boolSubscriber, value bool) {
 	case <-sub.done:
 	case sub.ch <- value:
 	default:
+		select {
+		case <-sub.ch:
+		default:
+		}
+		select {
+		case <-sub.done:
+		case sub.ch <- value:
+		default:
+		}
 	}
 }
 
