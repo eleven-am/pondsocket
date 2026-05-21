@@ -159,10 +159,11 @@ class Channel:
         try:
             return await asyncio.wait_for(fut, timeout=wait_seconds)
         except TimeoutError as e:
-            self._pending_responses.pop(request_id, None)
             raise ResponseTimeoutError(
                 f"no response received for event {event!r} within {wait_seconds}s"
             ) from e
+        finally:
+            self._pending_responses.pop(request_id, None)
 
     def handle_event(self, event: ChannelEvent) -> None:
         if self._closed:

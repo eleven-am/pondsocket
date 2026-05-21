@@ -21,18 +21,45 @@ type Channel struct {
 	mu             sync.RWMutex
 	stateMu        sync.RWMutex
 	ctx            chan struct{}
+	closeOnce      sync.Once
+	cleanups       []func()
+	cleanupsMu     sync.Mutex
 
 	// Subscribers
-	eventSubs   map[int]chan ChannelEvent
+	eventSubs   map[int]*channelEventSubscriber
 	nextEventID int
 	eventSubsMu sync.RWMutex
-	stateSubs   map[int]chan ChannelState
+	stateSubs   map[int]*channelStateSubscriber
 	nextStateID int
 	stateSubsMu sync.RWMutex
 }
 
+type channelEventSubscriber struct {
+	ch   chan ChannelEvent
+	done chan struct{}
+	once sync.Once
+}
+
+func (s *channelEventSubscriber) close() {
+	s.once.Do(func() { close(s.done) })
+}
+
+type channelStateSubscriber struct {
+	ch   chan ChannelState
+	done chan struct{}
+	once sync.Once
+}
+
+func (s *channelStateSubscriber) close() {
+	s.once.Do(func() { close(s.done) })
+}
+
 // NewChannel creates a new channel instance
 func NewChannel(publisher func(ClientMessage), connectionChan <-chan bool, name string, params JoinParams) *Channel {
+	return NewChannelWithCleanup(publisher, connectionChan, nil, name, params)
+}
+
+func NewChannelWithCleanup(publisher func(ClientMessage), connectionChan <-chan bool, unsubscribeConnection func(), name string, params JoinParams) *Channel {
 	c := &Channel{
 		name:           name,
 		queue:          make([]ClientMessage, 0),
@@ -44,8 +71,11 @@ func NewChannel(publisher func(ClientMessage), connectionChan <-chan bool, name 
 		channelState:   make(chan ChannelState, 1),
 		currentState:   Idle,
 		ctx:            make(chan struct{}),
-		eventSubs:      make(map[int]chan ChannelEvent),
-		stateSubs:      make(map[int]chan ChannelState),
+		eventSubs:      make(map[int]*channelEventSubscriber),
+		stateSubs:      make(map[int]*channelStateSubscriber),
+	}
+	if unsubscribeConnection != nil {
+		c.cleanups = append(c.cleanups, unsubscribeConnection)
 	}
 
 	// Start event and state dispatchers
@@ -93,6 +123,9 @@ func (c *Channel) Join() {
 
 // Leave disconnects from the channel
 func (c *Channel) Leave() {
+	if c.State() == Closed {
+		return
+	}
 	message := ClientMessage{
 		Action:      LeaveChannel,
 		Event:       string(LeaveChannel),
@@ -102,7 +135,7 @@ func (c *Channel) Leave() {
 	}
 
 	c.publish(message)
-	c.setState(Closed)
+	c.close()
 }
 
 // SendMessage sends a message to the channel
@@ -122,27 +155,55 @@ func (c *Channel) SendMessage(event string, payload PondMessage) {
 func (c *Channel) SendForResponse(event string, payload PondMessage, timeout time.Duration) (<-chan PondMessage, error) {
 	requestID := uuid.New().String()
 	responseChan := make(chan PondMessage, 1)
+	var once sync.Once
+	finish := func() {
+		once.Do(func() {
+			close(responseChan)
+		})
+	}
 
-	unsubscribe := c.OnMessage(func(receivedEvent string, message PondMessage) {
-		// This is a simplified implementation - in a real scenario you'd match by request ID
-		if receivedEvent == event {
-			select {
-			case responseChan <- message:
-			default:
-			}
+	c.eventSubsMu.Lock()
+	sub := &channelEventSubscriber{ch: make(chan ChannelEvent, 100), done: make(chan struct{})}
+	id := c.nextEventID
+	c.nextEventID++
+	c.eventSubs[id] = sub
+	c.eventSubsMu.Unlock()
+
+	unsubscribe := func() {
+		c.eventSubsMu.Lock()
+		if existing, ok := c.eventSubs[id]; ok {
+			delete(c.eventSubs, id)
+			existing.close()
 		}
-	})
+		c.eventSubsMu.Unlock()
+	}
 
-	// Set up timeout
 	go func() {
 		timer := time.NewTimer(timeout)
 		defer timer.Stop()
+		defer unsubscribe()
 
-		select {
-		case <-responseChan:
-			unsubscribe()
-		case <-timer.C:
-			unsubscribe()
+		for {
+			select {
+			case received := <-sub.ch:
+				if received.Event == event && received.RequestID == requestID {
+					select {
+					case responseChan <- ToPondMessage(received.Payload):
+					default:
+					}
+					finish()
+					return
+				}
+			case <-sub.done:
+				finish()
+				return
+			case <-timer.C:
+				finish()
+				return
+			case <-c.ctx:
+				finish()
+				return
+			}
 		}
 	}()
 
@@ -161,7 +222,7 @@ func (c *Channel) SendForResponse(event string, payload PondMessage, timeout tim
 // OnMessage subscribes to all messages on the channel
 func (c *Channel) OnMessage(callback EventHandler) func() {
 	c.eventSubsMu.Lock()
-	sub := make(chan ChannelEvent, 100)
+	sub := &channelEventSubscriber{ch: make(chan ChannelEvent, 100), done: make(chan struct{})}
 	id := c.nextEventID
 	c.nextEventID++
 	c.eventSubs[id] = sub
@@ -169,10 +230,17 @@ func (c *Channel) OnMessage(callback EventHandler) func() {
 
 	// Start listener goroutine
 	go func() {
-		for event := range sub {
-			if event.Action != Presence {
-				payload := ToPondMessage(event.Payload)
-				callback(event.Event, payload)
+		for {
+			select {
+			case event := <-sub.ch:
+				if event.Action != Presence {
+					payload := ToPondMessage(event.Payload)
+					callback(event.Event, payload)
+				}
+			case <-sub.done:
+				return
+			case <-c.ctx:
+				return
 			}
 		}
 	}()
@@ -182,7 +250,7 @@ func (c *Channel) OnMessage(callback EventHandler) func() {
 		c.eventSubsMu.Lock()
 		if existing, ok := c.eventSubs[id]; ok {
 			delete(c.eventSubs, id)
-			close(existing)
+			existing.close()
 		}
 		c.eventSubsMu.Unlock()
 	}
@@ -234,7 +302,7 @@ func (c *Channel) OnUsersChange(callback func([]PondPresence)) func() {
 // OnChannelStateChange subscribes to channel state changes
 func (c *Channel) OnChannelStateChange(callback ChannelStateHandler) func() {
 	c.stateSubsMu.Lock()
-	sub := make(chan ChannelState, 1)
+	sub := &channelStateSubscriber{ch: make(chan ChannelState, 1), done: make(chan struct{})}
 	id := c.nextStateID
 	c.nextStateID++
 	c.stateSubs[id] = sub
@@ -247,8 +315,15 @@ func (c *Channel) OnChannelStateChange(callback ChannelStateHandler) func() {
 
 	// Start listener goroutine
 	go func() {
-		for state := range sub {
-			callback(state)
+		for {
+			select {
+			case state := <-sub.ch:
+				callback(state)
+			case <-sub.done:
+				return
+			case <-c.ctx:
+				return
+			}
 		}
 	}()
 
@@ -257,32 +332,92 @@ func (c *Channel) OnChannelStateChange(callback ChannelStateHandler) func() {
 		c.stateSubsMu.Lock()
 		if existing, ok := c.stateSubs[id]; ok {
 			delete(c.stateSubs, id)
-			close(existing)
+			existing.close()
 		}
 		c.stateSubsMu.Unlock()
 	}
 }
 
 // Acknowledge acknowledges that the channel has been joined
-func (c *Channel) Acknowledge(eventChan <-chan ChannelEvent) {
+func (c *Channel) Acknowledge(eventChan <-chan ChannelEvent, unsubscribe ...func()) {
 	c.setState(Joined)
-	c.init(eventChan)
+	var cleanup func()
+	if len(unsubscribe) > 0 {
+		cleanup = unsubscribe[0]
+	}
+	c.init(eventChan, cleanup)
 	c.emptyQueue()
 }
 
 // init initializes the channel's event handling
-func (c *Channel) init(eventChan <-chan ChannelEvent) {
+func (c *Channel) init(eventChan <-chan ChannelEvent, unsubscribe func()) {
+	c.cleanupsMu.Lock()
+	if unsubscribe != nil {
+		c.cleanups = append(c.cleanups, unsubscribe)
+	}
+	c.cleanupsMu.Unlock()
+
 	go func() {
-		for event := range eventChan {
-			if event.ChannelName == c.name && c.State() == Joined {
-				select {
-				case c.eventChan <- event:
-				default:
-					// Channel is full, skip
+		for {
+			select {
+			case event, ok := <-eventChan:
+				if !ok {
+					return
 				}
+				if event.ChannelName == c.name && c.State() == Joined {
+					select {
+					case c.eventChan <- event:
+					case <-c.ctx:
+						return
+					default:
+						// Channel is full, skip
+					}
+				}
+			case <-c.ctx:
+				return
 			}
 		}
 	}()
+}
+
+func (c *Channel) close() {
+	c.closeOnce.Do(func() {
+		c.setState(Closed)
+
+		c.stateSubsMu.RLock()
+		stateSubs := make([]*channelStateSubscriber, 0, len(c.stateSubs))
+		for _, sub := range c.stateSubs {
+			stateSubs = append(stateSubs, sub)
+		}
+		c.stateSubsMu.RUnlock()
+		for _, sub := range stateSubs {
+			safeSendChannelState(sub, Closed)
+		}
+
+		close(c.ctx)
+
+		c.cleanupsMu.Lock()
+		cleanups := append([]func(){}, c.cleanups...)
+		c.cleanups = nil
+		c.cleanupsMu.Unlock()
+		for _, cleanup := range cleanups {
+			cleanup()
+		}
+
+		c.eventSubsMu.Lock()
+		for id, sub := range c.eventSubs {
+			delete(c.eventSubs, id)
+			sub.close()
+		}
+		c.eventSubsMu.Unlock()
+
+		c.stateSubsMu.Lock()
+		for id, sub := range c.stateSubs {
+			delete(c.stateSubs, id)
+			sub.close()
+		}
+		c.stateSubsMu.Unlock()
+	})
 }
 
 // setState updates the channel state and notifies subscribers
@@ -327,7 +462,7 @@ func (c *Channel) emptyQueue() {
 // subscribeToPresence subscribes to presence events
 func (c *Channel) subscribeToPresence(callback func(PresenceEventTypes, PresencePayload)) func() {
 	c.eventSubsMu.Lock()
-	sub := make(chan ChannelEvent, 100)
+	sub := &channelEventSubscriber{ch: make(chan ChannelEvent, 100), done: make(chan struct{})}
 	id := c.nextEventID
 	c.nextEventID++
 	c.eventSubs[id] = sub
@@ -335,12 +470,19 @@ func (c *Channel) subscribeToPresence(callback func(PresenceEventTypes, Presence
 
 	// Start listener goroutine
 	go func() {
-		for event := range sub {
-			if event.Action == Presence {
-				payload, err := event.GetPresencePayload()
-				if err == nil {
-					callback(PresenceEventTypes(event.Event), *payload)
+		for {
+			select {
+			case event := <-sub.ch:
+				if event.Action == Presence {
+					payload, err := event.GetPresencePayload()
+					if err == nil {
+						callback(PresenceEventTypes(event.Event), *payload)
+					}
 				}
+			case <-sub.done:
+				return
+			case <-c.ctx:
+				return
 			}
 		}
 	}()
@@ -350,7 +492,7 @@ func (c *Channel) subscribeToPresence(callback func(PresenceEventTypes, Presence
 		c.eventSubsMu.Lock()
 		if existing, ok := c.eventSubs[id]; ok {
 			delete(c.eventSubs, id)
-			close(existing)
+			existing.close()
 		}
 		c.eventSubsMu.Unlock()
 	}
@@ -371,7 +513,7 @@ func (c *Channel) dispatchEvents() {
 			}
 
 			c.eventSubsMu.RLock()
-			subs := make([]chan ChannelEvent, 0, len(c.eventSubs))
+			subs := make([]*channelEventSubscriber, 0, len(c.eventSubs))
 			for _, sub := range c.eventSubs {
 				subs = append(subs, sub)
 			}
@@ -392,7 +534,7 @@ func (c *Channel) dispatchStateChanges() {
 		select {
 		case state := <-c.channelState:
 			c.stateSubsMu.RLock()
-			subs := make([]chan ChannelState, 0, len(c.stateSubs))
+			subs := make([]*channelStateSubscriber, 0, len(c.stateSubs))
 			for _, sub := range c.stateSubs {
 				subs = append(subs, sub)
 			}
@@ -424,28 +566,18 @@ func (c *Channel) handleConnectionChanges() {
 	}
 }
 
-func safeSendChannelEvent(ch chan ChannelEvent, event ChannelEvent) {
-	defer func() {
-		if recover() != nil {
-			// Subscriber closed, ignore
-		}
-	}()
-
+func safeSendChannelEvent(sub *channelEventSubscriber, event ChannelEvent) {
 	select {
-	case ch <- event:
+	case <-sub.done:
+	case sub.ch <- event:
 	default:
 	}
 }
 
-func safeSendChannelState(ch chan ChannelState, state ChannelState) {
-	defer func() {
-		if recover() != nil {
-			// Subscriber closed, ignore
-		}
-	}()
-
+func safeSendChannelState(sub *channelStateSubscriber, state ChannelState) {
 	select {
-	case ch <- state:
+	case <-sub.done:
+	case sub.ch <- state:
 	default:
 	}
 }

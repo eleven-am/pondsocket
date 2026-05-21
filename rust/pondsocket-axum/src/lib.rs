@@ -149,12 +149,18 @@ async fn read_loop(
         };
         match message {
             Message::Text(text) => {
+                if text.len() > endpoint.max_message_size() {
+                    break;
+                }
                 let Ok(event) = parse_inbound_text(&text) else {
                     continue;
                 };
                 let _ = endpoint.handle_message(event, transport.clone()).await;
             }
             Message::Binary(bytes) => {
+                if bytes.len() > endpoint.max_message_size() {
+                    break;
+                }
                 let Ok(text) = String::from_utf8(bytes.to_vec()) else {
                     continue;
                 };

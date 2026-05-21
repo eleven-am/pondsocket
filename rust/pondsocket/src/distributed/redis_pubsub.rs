@@ -3,6 +3,7 @@ use redis::AsyncCommands;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use crate::errors::{Result, unavailable};
@@ -11,6 +12,7 @@ use crate::pubsub::{PubSub, PubSubHandler, match_topic};
 pub struct RedisPubSub {
     client: redis::Client,
     subscriptions: Arc<RwLock<HashMap<String, Vec<PubSubHandler>>>>,
+    listeners: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
 }
 
 impl RedisPubSub {
@@ -26,17 +28,26 @@ impl RedisPubSub {
         Ok(Self {
             client,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            listeners: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     async fn ensure_listener(&self, pattern: String) -> Result<()> {
+        if self.listeners.read().await.contains_key(&pattern) {
+            return Ok(());
+        }
         let client = self.client.clone();
         let subscriptions = self.subscriptions.clone();
-        tokio::spawn(async move {
+        let listener_pattern = pattern.clone();
+        let handle = tokio::spawn(async move {
             let Ok(mut pubsub) = client.get_async_pubsub().await else {
                 return;
             };
-            if pubsub.psubscribe(to_redis_pattern(&pattern)).await.is_err() {
+            if pubsub
+                .psubscribe(to_redis_pattern(&listener_pattern))
+                .await
+                .is_err()
+            {
                 return;
             }
             let mut stream = pubsub.on_message();
@@ -55,6 +66,10 @@ impl RedisPubSub {
                 }
             }
         });
+        let mut listeners = self.listeners.write().await;
+        if let Some(existing) = listeners.insert(pattern, handle) {
+            existing.abort();
+        }
         Ok(())
     }
 }
@@ -74,6 +89,9 @@ impl PubSub for RedisPubSub {
 
     async fn unsubscribe(&self, pattern: &str) -> Result<()> {
         self.subscriptions.write().await.remove(pattern);
+        if let Some(handle) = self.listeners.write().await.remove(pattern) {
+            handle.abort();
+        }
         Ok(())
     }
 
@@ -92,6 +110,9 @@ impl PubSub for RedisPubSub {
 
     async fn close(&self) -> Result<()> {
         self.subscriptions.write().await.clear();
+        for (_, handle) in self.listeners.write().await.drain() {
+            handle.abort();
+        }
         Ok(())
     }
 }

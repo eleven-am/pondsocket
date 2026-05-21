@@ -269,10 +269,12 @@ func (c *Channel) GetAssigns() map[string]map[string]interface{} {
 	select {
 	case aggregated := <-coordinator.completeChan:
 		c.removeAssignsSyncCoordinator(requestID)
-		result := make(map[string]map[string]interface{})
+		result := c.getLocalAssigns()
 		for userID, assigns := range aggregated {
 			if assignsMap, ok := assigns.(map[string]interface{}); ok {
-				result[userID] = assignsMap
+				if _, existsLocally := result[userID]; !existsLocally {
+					result[userID] = copyStringInterfaceMap(assignsMap)
+				}
 			}
 		}
 		return result
@@ -290,13 +292,20 @@ func (c *Channel) getLocalAssigns() map[string]map[string]interface{} {
 
 	result := make(map[string]map[string]interface{})
 	for userID, userAssigns := range assigns {
-		userAssignsCopy := make(map[string]interface{})
-		for k, v := range userAssigns {
-			userAssignsCopy[k] = v
-		}
-		result[userID] = userAssignsCopy
+		result[userID] = copyStringInterfaceMap(userAssigns)
 	}
 	return result
+}
+
+func copyStringInterfaceMap(input map[string]interface{}) map[string]interface{} {
+	if input == nil {
+		return nil
+	}
+	copied := make(map[string]interface{}, len(input))
+	for k, v := range input {
+		copied[k] = v
+	}
+	return copied
 }
 
 // GetPresence returns a map of all tracked users' presence data in the channel.
@@ -352,7 +361,13 @@ func (c *Channel) GetPresence() map[string]interface{} {
 	select {
 	case aggregated := <-coordinator.completeChan:
 		c.removeSyncCoordinator(requestID)
-		return aggregated
+		result := c.presence.GetAll()
+		for userID, presenceData := range aggregated {
+			if _, existsLocally := result[userID]; !existsLocally {
+				result[userID] = presenceData
+			}
+		}
+		return result
 	case <-time.After(500 * time.Millisecond):
 		c.removeSyncCoordinator(requestID)
 		return c.presence.GetAll()
@@ -554,10 +569,6 @@ func (c *Channel) Close() error {
 		delete(c.assignsSyncCoordinators, requestID)
 	}
 	c.assignsSyncCoordinatorMutex.Unlock()
-
-	time.Sleep(10 * time.Millisecond)
-
-	close(c.channel)
 
 	if c.pubsub != nil && c.endpointPath != "" {
 		cleanEndpoint := c.endpointPath
@@ -1183,9 +1194,6 @@ func (c *Channel) handleRemoteAssignsEvent(event *Event) {
 	}
 	assigns, err := c.store.Read(userID)
 	if err != nil {
-		assigns = make(map[string]interface{})
-		assigns[key] = value
-		_ = c.store.Create(userID, assigns)
 		return
 	}
 
@@ -1308,9 +1316,6 @@ func (c *Channel) handleSyncTimeout(coordinator *syncCoordinator) {
 		}
 		c.removeSyncCoordinator(coordinator.requestID)
 
-	case <-coordinator.completeChan:
-		c.removeSyncCoordinator(coordinator.requestID)
-
 	case <-c.ctx.Done():
 		c.removeSyncCoordinator(coordinator.requestID)
 	}
@@ -1324,9 +1329,6 @@ func (c *Channel) handleAssignsSyncTimeout(coordinator *syncCoordinator) {
 		if aggregated != nil {
 			c.sendAssignsSyncComplete(coordinator.requestID, coordinator.requesterUserID, aggregated)
 		}
-		c.removeAssignsSyncCoordinator(coordinator.requestID)
-
-	case <-coordinator.completeChan:
 		c.removeAssignsSyncCoordinator(coordinator.requestID)
 
 	case <-c.ctx.Done():

@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -193,32 +195,40 @@ func TestPondClient_OnConnectionChange(t *testing.T) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	connected := false
+	states := make(chan bool, 4)
 	unsubscribe := client.OnConnectionChange(func(state bool) {
-		connected = state
+		states <- state
 	})
 	defer unsubscribe()
 
 	// Initially should receive false
-	time.Sleep(50 * time.Millisecond)
-	if connected != false {
-		t.Error("Expected initial connection state to be false")
+	select {
+	case connected := <-states:
+		if connected != false {
+			t.Error("Expected initial connection state to be false")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Expected initial connection state")
 	}
 
 	// Simulate connection change
 	client.setConnectionState(true)
-	time.Sleep(50 * time.Millisecond)
 
-	if connected != true {
-		t.Error("Expected connection state to be true after change")
+	select {
+	case connected := <-states:
+		if connected != true {
+			t.Error("Expected connection state to be true after change")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Expected connection state change")
 	}
 }
 
 func TestPondClient_Reconnection(t *testing.T) {
-	reconnectCount := 0
+	var reconnectCount atomic.Int32
 
 	server := createMockServer(t, func(conn *websocket.Conn) {
-		reconnectCount++
+		reconnectCount.Add(1)
 
 		// Send connection event
 		connEvent := ChannelEvent{
@@ -253,8 +263,8 @@ func TestPondClient_Reconnection(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Should have attempted reconnection
-	if reconnectCount < 2 {
-		t.Errorf("Expected at least 2 connection attempts, got %d", reconnectCount)
+	if count := reconnectCount.Load(); count < 2 {
+		t.Errorf("Expected at least 2 connection attempts, got %d", count)
 	}
 
 	client.Disconnect()
@@ -262,6 +272,7 @@ func TestPondClient_Reconnection(t *testing.T) {
 
 func TestPondClient_MessageHandling(t *testing.T) {
 	receivedEvents := make([]ChannelEvent, 0)
+	var receivedEventsMu sync.Mutex
 
 	server := createMockServer(t, func(conn *websocket.Conn) {
 		// Send connection event
@@ -297,7 +308,9 @@ func TestPondClient_MessageHandling(t *testing.T) {
 	eventChan := client.subscribeToEvents()
 	go func() {
 		for event := range eventChan {
+			receivedEventsMu.Lock()
 			receivedEvents = append(receivedEvents, event)
+			receivedEventsMu.Unlock()
 		}
 	}()
 
@@ -312,8 +325,11 @@ func TestPondClient_MessageHandling(t *testing.T) {
 	client.Disconnect()
 
 	// Should have received at least the connection event
-	if len(receivedEvents) < 1 {
-		t.Errorf("Expected at least 1 event, got %d", len(receivedEvents))
+	receivedEventsMu.Lock()
+	receivedCount := len(receivedEvents)
+	receivedEventsMu.Unlock()
+	if receivedCount < 1 {
+		t.Errorf("Expected at least 1 event, got %d", receivedCount)
 	}
 }
 

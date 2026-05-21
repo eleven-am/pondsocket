@@ -4,6 +4,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::contexts::{EventContext, LeaveContext, OutgoingContext};
 use crate::errors::{Result, conflict, internal, not_found};
@@ -91,6 +93,7 @@ pub struct Channel {
     leave_handler: Option<Arc<dyn LeaveHandler>>,
     dispatch_tx: mpsc::Sender<DispatchItem>,
     dispatch_rx: RwLock<Option<mpsc::Receiver<DispatchItem>>>,
+    dispatch_task: RwLock<Option<JoinHandle<()>>>,
     dispatch_semaphore: Arc<Semaphore>,
     active: RwLock<bool>,
 }
@@ -112,7 +115,9 @@ impl Channel {
             name: config.name,
             endpoint_path: config.endpoint_path,
             node_id: config.options.node_id.clone(),
-            dispatch_semaphore: Arc::new(Semaphore::new(config.options.dispatch_concurrency)),
+            dispatch_semaphore: Arc::new(Semaphore::new(
+                config.options.dispatch_concurrency.max(1),
+            )),
             options: config.options,
             pubsub: config.pubsub,
             connections: RwLock::new(HashMap::new()),
@@ -123,6 +128,7 @@ impl Channel {
             leave_handler: config.leave_handler,
             dispatch_tx,
             dispatch_rx: RwLock::new(Some(dispatch_rx)),
+            dispatch_task: RwLock::new(None),
             active: RwLock::new(false),
         })
     }
@@ -132,7 +138,7 @@ impl Channel {
         self.subscribe_to_pubsub().await?;
         if let Some(mut rx) = self.dispatch_rx.write().await.take() {
             let channel = self.clone();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 while let Some(item) = rx.recv().await {
                     if !*channel.active.read().await {
                         break;
@@ -140,6 +146,7 @@ impl Channel {
                     channel.dispatch_item(item).await;
                 }
             });
+            *self.dispatch_task.write().await = Some(task);
         }
         if let Some(hooks) = &self.options.hooks {
             if let Some(metrics) = &hooks.metrics {
@@ -152,6 +159,9 @@ impl Channel {
     pub async fn close(&self) -> Result<()> {
         *self.active.write().await = false;
         self.unsubscribe_from_pubsub().await?;
+        if let Some(task) = self.dispatch_task.write().await.take() {
+            task.abort();
+        }
         self.connections.write().await.clear();
         self.assigns.write().await.clear();
         self.presence.write().await.clear();
@@ -452,13 +462,11 @@ impl Channel {
             ev.recipients = pubsub_recipients;
         }
         ev.node_id = self.node_id.clone();
-        self.dispatch_tx
-            .send(DispatchItem {
-                event: ev.clone(),
-                recipients,
-            })
-            .await
-            .map_err(|_| internal(&self.name, "channel dispatch queue closed"))?;
+        self.enqueue_dispatch(DispatchItem {
+            event: ev.clone(),
+            recipients,
+        })
+        .await?;
         if action == ServerAction::Broadcast {
             self.publish_event_to_pubsub(ev, "message").await?;
         }
@@ -466,15 +474,110 @@ impl Channel {
     }
 
     async fn send_direct(&self, user_ids: &[String], event: Event) -> Result<()> {
-        let connections = self.connections.read().await;
-        for user_id in user_ids {
-            if let Some(transport) = connections.get(user_id) {
-                if transport.is_active().await {
-                    let _ = transport.send_event(event.clone()).await;
-                }
+        let transports = {
+            let connections = self.connections.read().await;
+            user_ids
+                .iter()
+                .filter_map(|user_id| connections.get(user_id).cloned())
+                .collect::<Vec<_>>()
+        };
+        for transport in transports {
+            if transport.is_active().await {
+                let _ = transport.send_event(event.clone()).await;
             }
         }
         Ok(())
+    }
+
+    async fn enqueue_dispatch(&self, item: DispatchItem) -> Result<()> {
+        timeout(
+            self.options.internal_queue_timeout,
+            self.dispatch_tx.send(item),
+        )
+        .await
+        .map_err(|_| internal(&self.name, "channel dispatch queue timed out"))?
+        .map_err(|_| internal(&self.name, "channel dispatch queue closed"))
+    }
+
+    async fn enqueue_dispatch_best_effort(&self, item: DispatchItem) {
+        let _ = self.enqueue_dispatch(item).await;
+    }
+
+    async fn local_presence_snapshot(&self) -> (Vec<pondsocket_common::PondPresence>, Vec<String>) {
+        let presence = self.presence.read().await;
+        (
+            presence.values().cloned().collect::<Vec<_>>(),
+            presence.keys().cloned().collect::<Vec<_>>(),
+        )
+    }
+
+    async fn handle_remote_presence(&self, event: &mut Event) -> Result<Vec<String>> {
+        let changed = event
+            .payload
+            .get("changed")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let user_id = changed
+            .get("userId")
+            .or_else(|| changed.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if let Some(user_id) = user_id {
+            let mut presence = self.presence.write().await;
+            if event.event == "LEAVE" {
+                presence.remove(&user_id);
+            } else {
+                presence.insert(user_id, changed);
+            }
+        }
+        let (snapshot, recipients) = self.local_presence_snapshot().await;
+        event.payload["presence"] = json!(snapshot);
+        Ok(recipients)
+    }
+
+    async fn dispatch_local_or_timeout(&self, event: Event, recipients: Vec<String>) -> Result<()> {
+        if recipients.is_empty() {
+            return Ok(());
+        }
+        self.enqueue_dispatch(DispatchItem { event, recipients })
+            .await
+    }
+
+    async fn dispatch_local_best_effort(&self, event: Event, recipients: Vec<String>) {
+        if recipients.is_empty() {
+            return;
+        }
+        self.enqueue_dispatch_best_effort(DispatchItem { event, recipients })
+            .await;
+    }
+
+    async fn dispatch_pubsub_event(self: &Arc<Self>, mut event: Event) -> Result<()> {
+        let recipients = if event.action == "PRESENCE" {
+            self.handle_remote_presence(&mut event).await?
+        } else if event.action == "ASSIGNS" {
+            self.handle_remote_assigns(event).await?;
+            return Ok(());
+        } else if event.action == "USER_COMMAND" {
+            self.handle_remote_user_command(event).await?;
+            return Ok(());
+        } else if !event.recipients.is_empty() {
+            let local = self.connections.read().await;
+            event
+                .recipients
+                .iter()
+                .filter(|id| local.contains_key(id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.connections
+                .read()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        self.dispatch_local_or_timeout(event, recipients).await
     }
 
     async fn publish_presence_change(
@@ -482,20 +585,7 @@ impl Channel {
         event_type: PresenceEventType,
         changed: pondsocket_common::PondPresence,
     ) -> Result<()> {
-        let snapshot = self
-            .presence
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let recipients = self
-            .presence
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let (snapshot, recipients) = self.local_presence_snapshot().await;
         let mut ev = Event::new(
             "PRESENCE",
             &self.name,
@@ -504,15 +594,8 @@ impl Channel {
             json!({ "presence": snapshot, "changed": changed }),
         );
         ev.node_id = self.node_id.clone();
-        if !recipients.is_empty() {
-            let _ = self
-                .dispatch_tx
-                .send(DispatchItem {
-                    event: ev.clone(),
-                    recipients,
-                })
-                .await;
-        }
+        self.dispatch_local_best_effort(ev.clone(), recipients)
+            .await;
         self.publish_event_to_pubsub(
             ev,
             &format!(
@@ -618,42 +701,7 @@ impl Channel {
         if event.channel_name != self.name {
             return Ok(());
         }
-        let recipients = if event.action == "PRESENCE" {
-            self.presence
-                .read()
-                .await
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-        } else if event.action == "ASSIGNS" {
-            self.handle_remote_assigns(event).await?;
-            return Ok(());
-        } else if event.action == "USER_COMMAND" {
-            self.handle_remote_user_command(event).await?;
-            return Ok(());
-        } else if !event.recipients.is_empty() {
-            let local = self.connections.read().await;
-            event
-                .recipients
-                .iter()
-                .filter(|id| local.contains_key(id.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            self.connections
-                .read()
-                .await
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        if !recipients.is_empty() {
-            let _ = self
-                .dispatch_tx
-                .send(DispatchItem { event, recipients })
-                .await;
-        }
-        Ok(())
+        self.dispatch_pubsub_event(event).await
     }
 
     async fn publish_assign_update(&self, user_id: &str, key: &str, value: Value) -> Result<()> {
@@ -687,12 +735,15 @@ impl Channel {
         let Some(user_id) = event.payload.get("userId").and_then(Value::as_str) else {
             return Ok(());
         };
-        let Some(key) = event.payload.get("key").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let value = event.payload.get("value").cloned().unwrap_or(Value::Null);
         if let Some(assigns) = self.assigns.write().await.get_mut(user_id) {
-            assigns.insert(key.to_owned(), value);
+            if let Some(key) = event.payload.get("key").and_then(Value::as_str) {
+                let value = event.payload.get("value").cloned().unwrap_or(Value::Null);
+                assigns.insert(key.to_owned(), value);
+            } else if let Some(remote_assigns) =
+                event.payload.get("assigns").and_then(Value::as_object)
+            {
+                assigns.extend(remote_assigns.clone());
+            }
         }
         Ok(())
     }
@@ -821,7 +872,12 @@ fn distributed_event_to_bytes(
                 "userId".to_owned(),
                 event.payload.get("userId").cloned().unwrap_or(json!("")),
             );
-            out.insert("assigns".to_owned(), event.payload.clone());
+            if let Some(key) = event.payload.get("key") {
+                out.insert("key".to_owned(), key.clone());
+            }
+            if let Some(value) = event.payload.get("value") {
+                out.insert("value".to_owned(), value.clone());
+            }
         }
         "EVICT_USER" | "USER_REMOVE" => {
             out.insert(
@@ -899,7 +955,12 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
             channel_name: channel,
             request_id,
             event: "assigns:update".to_owned(),
-            payload: json!({"userId": value.get("userId").cloned().unwrap_or(json!("")), "assigns": value.get("assigns").cloned().unwrap_or(json!({}))}),
+            payload: json!({
+                "userId": value.get("userId").cloned().unwrap_or(json!("")),
+                "key": value.get("key").cloned().unwrap_or(Value::Null),
+                "value": value.get("value").cloned().unwrap_or(Value::Null),
+                "assigns": value.get("assigns").cloned().unwrap_or(json!({})),
+            }),
             node_id,
             recipients: Vec::new(),
         }),
@@ -930,4 +991,54 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn internal_queue_timeout_is_enforced() {
+        let options = Options {
+            internal_queue_buffer: 1,
+            internal_queue_timeout: Duration::from_millis(1),
+            ..Options::default()
+        };
+        let channel = Channel::new(ChannelConfig {
+            name: "/chat/1".to_owned(),
+            endpoint_path: "/".to_owned(),
+            options,
+            pubsub: None,
+            event_handlers: Vec::new(),
+            outgoing_handlers: Vec::new(),
+            leave_handler: None,
+        });
+        channel
+            .send_event(
+                ServerAction::System,
+                "ONE",
+                json!({}),
+                vec!["u1".to_owned()],
+                Some("r1".to_owned()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = channel
+            .send_event(
+                ServerAction::System,
+                "TWO",
+                json!({}),
+                vec!["u1".to_owned()],
+                Some("r2".to_owned()),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, 500);
+        assert!(err.message.contains("timed out"));
+    }
 }

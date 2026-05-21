@@ -27,6 +27,8 @@ export abstract class BaseClient {
 
     protected _connectionTimeoutId: ReturnType<typeof setTimeout> | undefined;
 
+    protected _reconnectTimeoutId: ReturnType<typeof setTimeout> | undefined;
+
     protected readonly _broadcaster: Subject<ChannelEvent>;
 
     protected readonly _connectionState: BehaviorSubject<ConnectionState>;
@@ -62,6 +64,13 @@ export abstract class BaseClient {
         }
     }
 
+    protected _clearReconnectTimeout () {
+        if (this._reconnectTimeoutId) {
+            clearTimeout(this._reconnectTimeoutId);
+            this._reconnectTimeoutId = undefined;
+        }
+    }
+
     protected _scheduleReconnect () {
         if (this._disconnecting) {
             return;
@@ -74,7 +83,12 @@ export abstract class BaseClient {
 
         this._reconnectAttempts++;
 
-        setTimeout(() => {
+        this._clearReconnectTimeout();
+        this._reconnectTimeoutId = setTimeout(() => {
+            this._reconnectTimeoutId = undefined;
+            if (this._disconnecting) {
+                return;
+            }
             this.connect();
         }, delay);
     }

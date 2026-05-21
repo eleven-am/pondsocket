@@ -100,6 +100,14 @@ class PresenceClient:
         async with self._lock:
             return list(self._store.keys())
 
+    async def set_remote(self, user_id: str, data: PondPresence) -> None:
+        async with self._lock:
+            self._store[user_id] = data
+
+    async def discard(self, user_id: str) -> None:
+        async with self._lock:
+            self._store.pop(user_id, None)
+
     async def values(self) -> list[PondPresence]:
         async with self._lock:
             return [dict(v) for v in self._store.values()]

@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 
 use crate::contexts::{ConnectionContext, ConnectionDecision, IncomingConnection, JoinContext};
-use crate::errors::{Result, forbidden, not_found};
+use crate::errors::{Result, conflict, forbidden, not_found};
 use crate::lobby::Lobby;
 use crate::parser::parse;
 use crate::pubsub::PubSub;
@@ -134,30 +134,44 @@ impl Endpoint {
     }
 
     pub async fn register_transport(&self, transport: Arc<dyn Transport>) -> Result<()> {
-        self.check_max_connections().await?;
-        self.connections
-            .write()
-            .await
-            .insert(transport.id().to_owned(), transport.clone());
+        let user_id = transport.id().to_owned();
+        {
+            let mut connections = self.connections.write().await;
+            if connections.contains_key(&user_id) {
+                return Err(conflict(&self.path, "connection id already registered"));
+            }
+            if self.options.max_connections > 0 && connections.len() >= self.options.max_connections
+            {
+                return Err(forbidden("GATEWAY", "Maximum connections reached"));
+            }
+            connections.insert(user_id.clone(), transport.clone());
+        }
         self.connect_times
             .write()
             .await
-            .insert(transport.id().to_owned(), Instant::now());
+            .insert(user_id.clone(), Instant::now());
         self.send_connect_event(transport.clone()).await?;
         if let Some(hooks) = &self.options.hooks {
             if let Some(metrics) = &hooks.metrics {
-                metrics.connection_opened(transport.id(), &self.path);
+                metrics.connection_opened(&user_id, &self.path);
             }
             if let Some(hook) = &hooks.on_connect {
-                hook.call(transport.id()).await;
+                hook.call(&user_id).await;
             }
         }
         Ok(())
     }
 
     pub async fn unregister_transport(&self, user_id: &str) -> Result<()> {
-        for reg in self.channel_registrations.read().await.iter() {
-            for channel in reg.lobby.list_channels().await {
+        let lobbies = self
+            .channel_registrations
+            .read()
+            .await
+            .iter()
+            .map(|reg| reg.lobby.clone())
+            .collect::<Vec<_>>();
+        for lobby in lobbies {
+            for channel in lobby.list_channels().await {
                 if channel.has_user(user_id).await {
                     channel.remove_user(user_id, "connection_closed").await?;
                 }
@@ -309,15 +323,6 @@ impl Endpoint {
             .await
     }
 
-    async fn check_max_connections(&self) -> Result<()> {
-        if self.options.max_connections > 0
-            && self.connections.read().await.len() >= self.options.max_connections
-        {
-            return Err(forbidden("GATEWAY", "Maximum connections reached"));
-        }
-        Ok(())
-    }
-
     pub async fn get_transport(&self, user_id: &str) -> Option<Arc<dyn Transport>> {
         self.connections.read().await.get(user_id).cloned()
     }
@@ -330,13 +335,32 @@ impl Endpoint {
     }
 
     pub async fn close(&self) -> Result<()> {
-        for reg in self.channel_registrations.read().await.iter() {
-            reg.lobby.close().await?;
+        let lobbies = self
+            .channel_registrations
+            .read()
+            .await
+            .iter()
+            .map(|reg| reg.lobby.clone())
+            .collect::<Vec<_>>();
+        for lobby in lobbies {
+            lobby.close().await?;
         }
-        for transport in self.connections.read().await.values() {
+        let transports = self
+            .connections
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for transport in transports {
             let _ = transport.close().await;
         }
         self.connections.write().await.clear();
+        self.connect_times.write().await.clear();
         Ok(())
+    }
+
+    pub fn max_message_size(&self) -> usize {
+        self.options.max_message_size
     }
 }

@@ -77,7 +77,10 @@ func (l *LocalPubSub) runSubscription(ctx context.Context, sub subscription) {
 		select {
 		case <-ctx.Done():
 			return
-		case msg := <-sub.ch:
+		case msg, ok := <-sub.ch:
+			if !ok {
+				return
+			}
 			go sub.handler(msg.Topic, msg.Data)
 		}
 	}

@@ -74,6 +74,10 @@ export class ChannelEngine {
 
     readonly #name: string;
 
+    #closed: boolean = false;
+
+    #distributedReady: Promise<void> | null = null;
+
     constructor (public parent: LobbyEngine, name: string, backend: IDistributedBackend | null = null) {
         this.#name = name;
         this.#backend = backend;
@@ -81,7 +85,7 @@ export class ChannelEngine {
         this.#endpointId = parent.parent.path;
 
         if (this.#backend) {
-            this.#setupDistributedSubscription().catch(() => {});
+            this.#distributedReady = this.#setupDistributedSubscription().catch(() => {});
             this.#setupHeartbeatTracking();
         }
     }
@@ -114,7 +118,7 @@ export class ChannelEngine {
         this.#assignsCache.set(userId, assigns);
         this.#buildSubscriber(userId, onMessage);
         if (isFirstUser && this.#backend) {
-            this.#requestChannelState();
+            this.#afterDistributedReady(() => this.#requestChannelState());
         }
 
         this.#broadcastToNodes({
@@ -374,6 +378,7 @@ export class ChannelEngine {
     }
 
     close (): void {
+        this.#closed = true;
         this.#userSubscriptions.forEach((unsubscribe) => unsubscribe());
         this.#userSubscriptions.clear();
 
@@ -488,9 +493,26 @@ export class ChannelEngine {
             return;
         }
 
-        this.#distributedSubscription = await this.#backend.subscribeToChannel(this.#endpointId, this.#name, (message) => {
+        const unsubscribe = await this.#backend.subscribeToChannel(this.#endpointId, this.#name, (message) => {
             this.#handleDistributedMessage(message);
         });
+        if (this.#closed) {
+            unsubscribe();
+            return;
+        }
+        this.#distributedSubscription = unsubscribe;
+    }
+
+    #afterDistributedReady (callback: () => void): void {
+        if (!this.#distributedReady) {
+            callback();
+            return;
+        }
+        this.#distributedReady.then(() => {
+            if (!this.#closed) {
+                callback();
+            }
+        }).catch(() => {});
     }
 
     #handleDistributedMessage (message: DistributedChannelMessage): void {
@@ -748,6 +770,9 @@ export class ChannelEngine {
         }
 
         try {
+            if (this.#closed) {
+                return;
+            }
             await this.#backend.broadcast(this.#endpointId, this.#name, message);
         } catch (_) {
             void 0;

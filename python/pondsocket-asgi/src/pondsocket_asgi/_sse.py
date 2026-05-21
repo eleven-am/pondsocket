@@ -6,7 +6,7 @@ from pondsocket.wire import event_to_json
 
 def event_to_sse_frame(event: Event) -> bytes:
     body = event_to_json(event)
-    name = event.event or "message"
+    name = (event.event or "message").replace("\r", " ").replace("\n", " ")
     return f"event: {name}\ndata: {body}\n\n".encode()
 
 

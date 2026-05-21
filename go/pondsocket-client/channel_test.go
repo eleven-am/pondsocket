@@ -210,12 +210,58 @@ func TestChannel_SendForResponse(t *testing.T) {
 		t.Errorf("Expected event 'ping', got %s", publishedMessage.Event)
 	}
 
-	// Test timeout
+	// Test timeout cleanup
 	select {
-	case <-responseChan:
-		t.Error("Expected timeout, but received response")
+	case _, ok := <-responseChan:
+		if ok {
+			t.Error("Expected timeout to close response channel without a response")
+		}
 	case <-time.After(1500 * time.Millisecond):
-		// Expected timeout
+		t.Error("Expected response channel to close on timeout")
+	}
+}
+
+func TestChannel_SendForResponseCorrelatesRequestID(t *testing.T) {
+	var publishedMessage ClientMessage
+
+	publisher := func(msg ClientMessage) {
+		publishedMessage = msg
+	}
+
+	connectionChan := make(chan bool, 1)
+	channel := NewChannel(publisher, connectionChan, "lobby", JoinParams{})
+	channel.setState(Joined)
+
+	responseChan, err := channel.SendForResponse("ping", PondMessage{"data": "ping"}, time.Second)
+	if err != nil {
+		t.Fatalf("Failed to send message for response: %v", err)
+	}
+
+	channel.eventChan <- ChannelEvent{
+		Action:      System,
+		Event:       "ping",
+		Payload:     PondMessage{"data": "wrong"},
+		ChannelName: "lobby",
+		RequestID:   "different-request",
+	}
+	channel.eventChan <- ChannelEvent{
+		Action:      System,
+		Event:       "ping",
+		Payload:     PondMessage{"data": "pong"},
+		ChannelName: "lobby",
+		RequestID:   publishedMessage.RequestID,
+	}
+
+	select {
+	case response, ok := <-responseChan:
+		if !ok {
+			t.Fatal("Expected correlated response before channel close")
+		}
+		if response["data"] != "pong" {
+			t.Errorf("Expected pong response, got %v", response["data"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Timed out waiting for correlated response")
 	}
 }
 
@@ -273,12 +319,10 @@ func TestChannel_OnMessageEvent(t *testing.T) {
 	connectionChan := make(chan bool, 1)
 	channel := NewChannel(publisher, connectionChan, "lobby", JoinParams{})
 
-	var receivedPayload PondMessage
-	var callbackCalled bool
+	receivedPayload := make(chan PondMessage, 1)
 
 	unsubscribe := channel.OnMessageEvent("chat", func(payload PondMessage) {
-		receivedPayload = payload
-		callbackCalled = true
+		receivedPayload <- payload
 	})
 	defer unsubscribe()
 
@@ -296,18 +340,16 @@ func TestChannel_OnMessageEvent(t *testing.T) {
 		t.Error("Failed to send event to channel")
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if !callbackCalled {
-		t.Error("Expected callback to be called for matching event")
-	}
-
-	if receivedPayload["text"] != "Hello" {
-		t.Errorf("Expected payload text 'Hello', got %v", receivedPayload["text"])
+	select {
+	case payload := <-receivedPayload:
+		if payload["text"] != "Hello" {
+			t.Errorf("Expected payload text 'Hello', got %v", payload["text"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Expected callback to be called for matching event")
 	}
 
 	// Send non-matching event
-	callbackCalled = false
 	otherEvent := ChannelEvent{
 		Action:      System,
 		Event:       "other",
@@ -321,10 +363,10 @@ func TestChannel_OnMessageEvent(t *testing.T) {
 		t.Error("Failed to send event to channel")
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if callbackCalled {
+	select {
+	case <-receivedPayload:
 		t.Error("Expected callback not to be called for non-matching event")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -333,38 +375,33 @@ func TestChannel_OnChannelStateChange(t *testing.T) {
 	connectionChan := make(chan bool, 1)
 	channel := NewChannel(publisher, connectionChan, "lobby", JoinParams{})
 
-	var receivedState ChannelState
-	var callbackCalled bool
+	states := make(chan ChannelState, 4)
 
 	unsubscribe := channel.OnChannelStateChange(func(state ChannelState) {
-		receivedState = state
-		callbackCalled = true
+		states <- state
 	})
 	defer unsubscribe()
 
 	// Should receive current state immediately
-	time.Sleep(100 * time.Millisecond)
-
-	if !callbackCalled {
-		t.Error("Expected callback to be called immediately with current state")
-	}
-
-	if receivedState != Idle {
-		t.Errorf("Expected initial state Idle, got %s", receivedState)
+	select {
+	case receivedState := <-states:
+		if receivedState != Idle {
+			t.Errorf("Expected initial state Idle, got %s", receivedState)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Expected callback to be called immediately with current state")
 	}
 
 	// Change state
-	callbackCalled = false
 	channel.setState(Joined)
 
-	time.Sleep(100 * time.Millisecond)
-
-	if !callbackCalled {
-		t.Error("Expected callback to be called after state change")
-	}
-
-	if receivedState != Joined {
-		t.Errorf("Expected state Joined, got %s", receivedState)
+	select {
+	case receivedState := <-states:
+		if receivedState != Joined {
+			t.Errorf("Expected state Joined, got %s", receivedState)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Expected callback to be called after state change")
 	}
 }
 

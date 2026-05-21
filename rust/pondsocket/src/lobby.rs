@@ -83,6 +83,10 @@ impl Lobby {
         if let Some(channel) = self.get_channel(name).await {
             return Ok(channel);
         }
+        let mut channels = self.channels.write().await;
+        if let Some(channel) = channels.get(name) {
+            return Ok(channel.clone());
+        }
         let channel = Channel::new(ChannelConfig {
             name: name.to_owned(),
             endpoint_path: self.endpoint_path.clone(),
@@ -93,8 +97,8 @@ impl Lobby {
             leave_handler: self.leave_handler.read().await.clone(),
         });
         channel.start().await?;
-        let mut channels = self.channels.write().await;
-        Ok(channels.entry(name.to_owned()).or_insert(channel).clone())
+        channels.insert(name.to_owned(), channel.clone());
+        Ok(channel)
     }
 
     pub async fn list_channels(&self) -> Vec<Arc<Channel>> {

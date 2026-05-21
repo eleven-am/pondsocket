@@ -44,6 +44,7 @@ export class SSEClient extends BaseClient {
     }
 
     public connect () {
+        this._clearReconnectTimeout();
         this._disconnecting = false;
         this._connectionId = undefined;
         this._connectionState.publish(ConnectionState.CONNECTING);
@@ -108,6 +109,7 @@ export class SSEClient extends BaseClient {
 
     public disconnect () {
         this._clearConnectionTimeout();
+        this._clearReconnectTimeout();
         this._disconnecting = true;
         this._connectionState.publish(ConnectionState.DISCONNECTED);
 

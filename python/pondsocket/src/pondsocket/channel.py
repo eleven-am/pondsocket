@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
@@ -128,6 +129,9 @@ class Channel:
             self._active = False
             if self._dispatch_task is not None and not self._dispatch_task.done():
                 self._dispatch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._dispatch_task
+            self._dispatch_task = None
         await self._unsubscribe_from_pubsub()
         self._fire_metric_channel_destroyed()
         await self._fire_on_destroy()
@@ -164,6 +168,7 @@ class Channel:
         self, user_id: str, reason: str = LeaveReason.EXPLICIT_LEAVE.value
     ) -> None:
         if not await self._connections.discard(user_id):
+            await self._publish_user_command("user:remove", user_id, reason)
             return
         assigns = await self._assigns.get(user_id, {}) or {}
         presence: PondPresence | None = None
@@ -210,6 +215,15 @@ class Channel:
         current = dict(current)
         current[key] = value
         await self._assigns.update(user_id, current)
+        ev = Event(
+            action=InternalActions.ASSIGNS.value,
+            channel_name=self.name,
+            request_id=uuid(),
+            event="assigns:update",
+            payload={"userId": user_id, "key": key, "value": value},
+            node_id=self.node_id,
+        )
+        await self._publish_event_to_pubsub(ev, "assigns:update")
 
     async def get_assigns(self) -> dict[str, PondAssigns]:
         snap = await self._assigns.snapshot()
@@ -228,6 +242,9 @@ class Channel:
         await self._presence.untrack(user_id)
 
     async def evict_user(self, user_id: str, reason: str) -> None:
+        if not await self._connections.has(user_id):
+            await self._publish_user_command("user:evict", user_id, reason)
+            return
         ev = Event(
             action=ServerActions.SYSTEM.value,
             channel_name=self.name,
@@ -363,6 +380,7 @@ class Channel:
             event=event_type.value,
             payload={"presence": presence_snapshot, "changed": changed},
             node_id=self.node_id,
+            user_id=changed_user_id,
         )
         recipients = await self._presence.keys()
         if recipients:
@@ -395,6 +413,15 @@ class Channel:
             payload=payload,
             node_id=self.node_id,
         )
+        match recipients:
+            case AllUsers():
+                ev.recipient_descriptor = "ALL_USERS"
+            case AllExceptSender(sender_id=sender):
+                ev.recipient_descriptor = "ALL_EXCEPT_SENDER"
+                ev.from_user_id = sender
+            case ToUsers(user_ids=ids):
+                ev.recipient_descriptor = list(ids)
+                ev.recipients = list(ids)
         resolved = await self._resolve_recipients(recipients)
         if resolved:
             await self._enqueue_dispatch(ev, resolved)
@@ -515,15 +542,95 @@ class Channel:
         if not self._active:
             return
         if event.action == ServerActions.BROADCAST.value:
-            recipients = await self._connections.keys()
+            recipients = await self._resolve_distributed_recipients(event)
             if recipients:
                 await self._enqueue_dispatch(event, recipients)
             return
         if event.action == ServerActions.PRESENCE.value:
+            await self._merge_remote_presence(event)
             recipients = await self._presence.keys()
             if recipients:
                 await self._enqueue_dispatch(event, recipients)
             return
+        if event.action == InternalActions.ASSIGNS.value:
+            await self._handle_remote_assigns(event)
+            return
+        if event.action == InternalActions.USER_COMMAND.value:
+            await self._handle_remote_user_command(event)
+            return
+
+    async def _resolve_distributed_recipients(self, event: Event) -> list[str]:
+        local = await self._connections.keys()
+        descriptor = event.recipient_descriptor
+        if isinstance(descriptor, list):
+            wanted = {str(item) for item in descriptor}
+            return [uid for uid in local if uid in wanted]
+        if descriptor == "ALL_EXCEPT_SENDER":
+            return [uid for uid in local if uid != event.from_user_id]
+        return local
+
+    async def _merge_remote_presence(self, event: Event) -> None:
+        if not isinstance(event.payload, dict):
+            return
+        changed = event.payload.get("changed")
+        user_id = ""
+        if isinstance(changed, dict):
+            raw_id = event.user_id or changed.get("userId") or changed.get("id")
+            user_id = str(raw_id) if raw_id else ""
+        if not user_id:
+            return
+        if event.event == PresenceEventTypes.LEAVE.value:
+            await self._presence.discard(user_id)
+            return
+        if isinstance(changed, dict):
+            presence = {k: v for k, v in changed.items() if k not in {"userId", "id"}}
+            if not presence:
+                presence = dict(changed)
+            await self._presence.set_remote(user_id, presence)
+
+    async def _handle_remote_assigns(self, event: Event) -> None:
+        if not isinstance(event.payload, dict):
+            return
+        user_id = str(event.payload.get("userId") or "")
+        key = event.payload.get("key")
+        if not user_id or not isinstance(key, str):
+            return
+        if not await self._assigns.has(user_id):
+            return
+        current = await self._assigns.get(user_id, {}) or {}
+        updated = dict(current)
+        updated[key] = event.payload.get("value")
+        await self._assigns.update(user_id, updated)
+
+    async def _handle_remote_user_command(self, event: Event) -> None:
+        if not isinstance(event.payload, dict):
+            return
+        user_id = str(event.payload.get("userId") or "")
+        reason = str(event.payload.get("reason") or "remote command")
+        if not user_id or not await self._connections.has(user_id):
+            return
+        if event.event == "user:evict":
+            ev = Event(
+                action=ServerActions.SYSTEM.value,
+                channel_name=self.name,
+                request_id=uuid(),
+                event="EVICTED",
+                payload={"reason": reason},
+                node_id=self.node_id,
+            )
+            await self._send_direct([user_id], ev)
+        await self.remove_user(user_id, reason=reason)
+
+    async def _publish_user_command(self, command: str, user_id: str, reason: str) -> None:
+        ev = Event(
+            action=InternalActions.USER_COMMAND.value,
+            channel_name=self.name,
+            request_id=uuid(),
+            event=command,
+            payload={"userId": user_id, "reason": reason},
+            node_id=self.node_id,
+        )
+        await self._publish_event_to_pubsub(ev, command)
 
     def _fire_metric_channel_created(self) -> None:
         hooks = self._options.hooks
@@ -622,23 +729,39 @@ def _event_to_distributed_bytes(event: Event, subtype: str, endpoint: str) -> by
     if message_type == "USER_MESSAGE":
         envelope.update(
             {
-                "fromUserId": "CHANNEL",
+                "fromUserId": event.from_user_id,
                 "event": event.event,
                 "payload": event.payload if event.payload is not None else {},
                 "requestId": event.request_id,
-                "recipientDescriptor": "ALL_USERS",
+                "recipientDescriptor": event.recipient_descriptor,
             }
         )
     elif message_type == "PRESENCE_UPDATE":
         payload = event.payload if isinstance(event.payload, dict) else {}
         envelope["event"] = event.event
-        envelope["userId"] = ""
+        changed = payload.get("changed", {})
+        if event.user_id:
+            envelope["userId"] = event.user_id
+        elif isinstance(changed, dict):
+            envelope["userId"] = str(changed.get("userId") or changed.get("id") or "")
+        else:
+            envelope["userId"] = ""
         envelope["presence"] = payload.get("changed", {})
+        envelope["payload"] = payload
     elif message_type == "PRESENCE_REMOVED":
-        envelope["userId"] = ""
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        changed = payload.get("changed", {})
+        if event.user_id:
+            envelope["userId"] = event.user_id
+        elif isinstance(changed, dict):
+            envelope["userId"] = str(changed.get("userId") or changed.get("id") or "")
+        else:
+            envelope["userId"] = ""
+        envelope["payload"] = payload
     elif message_type == "ASSIGNS_UPDATE":
         envelope["userId"] = event.payload.get("userId", "") if isinstance(event.payload, dict) else ""
         envelope["assigns"] = event.payload if isinstance(event.payload, dict) else {}
+        envelope["payload"] = event.payload if isinstance(event.payload, dict) else {}
     elif message_type in {"EVICT_USER", "USER_REMOVE"}:
         payload = event.payload if isinstance(event.payload, dict) else {}
         envelope["userId"] = payload.get("userId", "")
@@ -666,6 +789,9 @@ def _distributed_bytes_to_event(data: bytes) -> Event | None:
         return None
     request_id = str(raw.get("requestId") or uuid())
     if message_type == "USER_MESSAGE":
+        descriptor = raw.get("recipientDescriptor") or "ALL_USERS"
+        if isinstance(descriptor, list):
+            descriptor = [str(item) for item in descriptor]
         return Event(
             action=ServerActions.BROADCAST.value,
             channel_name=channel_name,
@@ -673,32 +799,40 @@ def _distributed_bytes_to_event(data: bytes) -> Event | None:
             event=str(raw.get("event") or ""),
             payload=raw.get("payload") if raw.get("payload") is not None else {},
             node_id=node_id,
+            recipients=descriptor if isinstance(descriptor, list) else [],
+            recipient_descriptor=descriptor,
+            from_user_id=str(raw.get("fromUserId") or "CHANNEL"),
         )
     if message_type == "PRESENCE_UPDATE":
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else None
         return Event(
             action=ServerActions.PRESENCE.value,
             channel_name=channel_name,
             request_id=request_id,
             event=str(raw.get("event") or PresenceEventTypes.UPDATE.value),
-            payload={"presence": [], "changed": raw.get("presence") or {}},
+            payload=payload or {"presence": [], "changed": raw.get("presence") or {}},
             node_id=node_id,
+            user_id=str(raw.get("userId") or ""),
         )
     if message_type == "PRESENCE_REMOVED":
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else None
         return Event(
             action=ServerActions.PRESENCE.value,
             channel_name=channel_name,
             request_id=request_id,
             event=PresenceEventTypes.LEAVE.value,
-            payload={"presence": [], "changed": {"userId": raw.get("userId") or ""}},
+            payload=payload or {"presence": [], "changed": {"userId": raw.get("userId") or ""}},
             node_id=node_id,
+            user_id=str(raw.get("userId") or ""),
         )
     if message_type == "ASSIGNS_UPDATE":
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else None
         return Event(
             action=InternalActions.ASSIGNS.value,
             channel_name=channel_name,
             request_id=request_id,
             event="assigns:update",
-            payload={"userId": raw.get("userId") or "", "assigns": raw.get("assigns") or {}},
+            payload=payload or {"userId": raw.get("userId") or "", "assigns": raw.get("assigns") or {}},
             node_id=node_id,
         )
     if message_type in {"EVICT_USER", "USER_REMOVE"}:

@@ -13,6 +13,7 @@ export abstract class WebSocketClient extends BaseClient {
     protected _lastMessageTime: number = 0;
 
     public connect () {
+        this._clearReconnectTimeout();
         this._disconnecting = false;
         this._connectionState.publish(ConnectionState.CONNECTING);
 
@@ -35,12 +36,6 @@ export abstract class WebSocketClient extends BaseClient {
             this._lastMessageTime = Date.now();
 
             if (this._options.pingInterval) {
-                this._pingIntervalId = setInterval(() => {
-                    if (socket.readyState === WebSocket.OPEN) {
-                        socket.send(JSON.stringify({ action: 'ping' }));
-                    }
-                }, this._options.pingInterval);
-
                 this._schedulePongTimeout(socket);
             }
         };
@@ -74,6 +69,7 @@ export abstract class WebSocketClient extends BaseClient {
 
     public disconnect () {
         this._clearConnectionTimeout();
+        this._clearReconnectTimeout();
         this._clearPingInterval();
         this._clearPongTimeout();
         this._disconnecting = true;

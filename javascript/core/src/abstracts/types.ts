@@ -53,6 +53,7 @@ export interface SocketCache {
     socket: WebSocket;
     assigns: PondAssigns;
     subscriptions: Set<Unsubscribe>;
+    channelSubscriptions?: Map<string, Unsubscribe>;
 }
 
 export interface ConnectionResponseOptions {
@@ -91,4 +92,3 @@ export interface LeaveEvent {
 }
 
 export type LeaveCallback = (event: LeaveEvent) => void;
-
