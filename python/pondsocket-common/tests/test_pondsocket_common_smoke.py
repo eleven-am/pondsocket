@@ -4,4 +4,4 @@ import pondsocket_common
 
 
 def test_package_imports() -> None:
-    assert pondsocket_common.__version__ == "0.0.2"
+    assert pondsocket_common.__version__ == "0.0.3"

@@ -735,7 +735,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pondsocket"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "pondsocket-axum"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "pondsocket-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

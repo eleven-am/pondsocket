@@ -24,7 +24,7 @@ from .types import (
     Publisher,
 )
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 __all__ = [
     "DEFAULT_BASE_RECONNECT_DELAY",
