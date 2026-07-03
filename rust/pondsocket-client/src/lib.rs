@@ -73,6 +73,7 @@ struct ClientInner {
     url: String,
     options: ClientOptions,
     state: watch::Sender<ConnectionState>,
+    conn_events: broadcast::Sender<ConnectionState>,
     channels: Mutex<HashMap<String, Channel>>,
     outbound: Mutex<Option<mpsc::Sender<ClientMessage>>>,
     read_task: Mutex<Option<JoinHandle<()>>>,
@@ -93,6 +94,7 @@ struct ChannelInner {
     presence: Mutex<Vec<PondPresence>>,
     queue: Mutex<VecDeque<ClientMessage>>,
     pending: Mutex<HashMap<String, oneshot::Sender<PondMessage>>>,
+    conn_task: Mutex<Option<JoinHandle<()>>>,
     closed: Mutex<bool>,
 }
 
@@ -108,12 +110,14 @@ impl PondClient {
     ) -> Result<Self> {
         let url = resolve_url(endpoint.as_ref(), params.as_ref())?;
         let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let (conn_events, _) = broadcast::channel(16);
 
         Ok(Self {
             inner: Arc::new(ClientInner {
                 url,
                 options,
                 state,
+                conn_events,
                 channels: Mutex::new(HashMap::new()),
                 outbound: Mutex::new(None),
                 read_task: Mutex::new(None),
@@ -156,9 +160,27 @@ impl PondClient {
                 presence: Mutex::new(Vec::new()),
                 queue: Mutex::new(VecDeque::new()),
                 pending: Mutex::new(HashMap::new()),
+                conn_task: Mutex::new(None),
                 closed: Mutex::new(false),
             }),
         };
+
+        let watcher = channel.clone();
+        let mut conn_rx = self.inner.conn_events.subscribe();
+        let handle = tokio::spawn(async move {
+            loop {
+                match conn_rx.recv().await {
+                    Ok(state) => watcher.on_connection_change(state).await,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                if *watcher.inner.closed.lock().await {
+                    break;
+                }
+            }
+        });
+        *channel.inner.conn_task.lock().await = Some(handle);
+
         channels.insert(name, channel.clone());
         channel
     }
@@ -167,7 +189,7 @@ impl PondClient {
         if self.state() != ConnectionState::Disconnected {
             return Ok(());
         }
-        self.inner.state.send_replace(ConnectionState::Connecting);
+        self.inner.set_connection_state(ConnectionState::Connecting);
         let connect = connect_async(&self.inner.url);
         let (socket, _) = tokio::time::timeout(self.inner.options.connection_timeout, connect)
             .await
@@ -206,14 +228,13 @@ impl PondClient {
                 };
                 inner.route_event(event).await;
             }
-            inner.state.send_replace(ConnectionState::Disconnected);
+            inner.set_connection_state(ConnectionState::Disconnected);
             *inner.outbound.lock().await = None;
         });
 
         *self.inner.read_task.lock().await = Some(read_task);
         *self.inner.write_task.lock().await = Some(write_task);
-        self.inner.state.send_replace(ConnectionState::Connected);
-        self.inner.rejoin_stalled_channels().await;
+        self.inner.set_connection_state(ConnectionState::Connected);
         Ok(())
     }
 
@@ -225,7 +246,7 @@ impl PondClient {
             task.abort();
         }
         *self.inner.outbound.lock().await = None;
-        self.inner.state.send_replace(ConnectionState::Disconnected);
+        self.inner.set_connection_state(ConnectionState::Disconnected);
         let channels: Vec<Channel> = self.inner.channels.lock().await.values().cloned().collect();
         for channel in channels {
             channel.force_close().await;
@@ -258,16 +279,11 @@ impl ClientInner {
         }
     }
 
-    async fn rejoin_stalled_channels(&self) {
-        let channels: Vec<Channel> = self.channels.lock().await.values().cloned().collect();
-        for channel in channels {
-            let state = channel.state();
-            if state == ChannelState::Joining
-                || state == ChannelState::Joined
-                || state == ChannelState::Stalled
-            {
-                channel.join().await;
-            }
+    fn set_connection_state(&self, state: ConnectionState) {
+        let changed = *self.state.borrow() != state;
+        self.state.send_replace(state);
+        if changed {
+            let _ = self.conn_events.send(state);
         }
     }
 }
@@ -385,6 +401,25 @@ impl Channel {
         queue.push_back(message);
     }
 
+    async fn on_connection_change(&self, state: ConnectionState) {
+        if *self.inner.closed.lock().await {
+            return;
+        }
+        match state {
+            ConnectionState::Disconnected => {
+                if self.state() == ChannelState::Joined {
+                    self.inner.state.send_replace(ChannelState::Stalled);
+                }
+            }
+            ConnectionState::Connected => {
+                if self.state() == ChannelState::Stalled {
+                    self.join().await;
+                }
+            }
+            ConnectionState::Connecting => {}
+        }
+    }
+
     async fn handle_event(&self, event: ChannelEvent) {
         if *self.inner.closed.lock().await {
             return;
@@ -446,6 +481,9 @@ impl Channel {
         self.inner.state.send_replace(ChannelState::Closed);
         self.inner.queue.lock().await.clear();
         self.inner.pending.lock().await.clear();
+        if let Some(handle) = self.inner.conn_task.lock().await.take() {
+            handle.abort();
+        }
     }
 
     fn join_message(&self) -> ClientMessage {
@@ -622,5 +660,130 @@ mod tests {
             }
         );
         assert_eq!(users, vec![changed]);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::accept_async;
+
+    async fn serve_session(
+        stream: TcpStream,
+        joins: Arc<AtomicUsize>,
+        conn_id: u64,
+        mut kill: broadcast::Receiver<()>,
+    ) {
+        let Ok(ws) = accept_async(stream).await else {
+            return;
+        };
+        let (mut writer, mut reader) = ws.split();
+        loop {
+            tokio::select! {
+                _ = kill.recv() => {
+                    let _ = writer.close().await;
+                    return;
+                }
+                frame = reader.next() => {
+                    let message = match frame {
+                        Some(Ok(Message::Text(text))) => text.to_string(),
+                        Some(Ok(_)) => continue,
+                        _ => return,
+                    };
+                    let Ok(request) = serde_json::from_str::<ClientMessage>(&message) else {
+                        continue;
+                    };
+                    if request.action != ClientAction::JoinChannel {
+                        continue;
+                    }
+                    joins.fetch_add(1, Ordering::SeqCst);
+                    let ack = ServerMessage {
+                        action: ServerAction::System,
+                        event: event_name(EventName::Acknowledge),
+                        channel_name: request.channel_name.clone(),
+                        request_id: request.request_id.clone(),
+                        payload: Map::new(),
+                    };
+                    let _ = writer
+                        .send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
+                        .await;
+                    let mut payload = Map::new();
+                    payload.insert("conn".to_owned(), Value::from(conn_id));
+                    let greeting = ServerMessage {
+                        action: ServerAction::Broadcast,
+                        event: "greeting".to_owned(),
+                        channel_name: request.channel_name.clone(),
+                        request_id: uuid(),
+                        payload,
+                    };
+                    let _ = writer
+                        .send(Message::Text(serde_json::to_string(&greeting).unwrap().into()))
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_state(channel: &Channel, target: ChannelState) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while channel.state() != target {
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for {target:?}, still {:?}", channel.state());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn recv_greeting(events: &mut broadcast::Receiver<ChannelEvent>) -> u64 {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+                Ok(Ok(ChannelEvent::Message(message))) if message.event == "greeting" => {
+                    return message.payload.get("conn").and_then(Value::as_u64).unwrap();
+                }
+                Ok(Ok(_)) => {}
+                other => panic!("expected greeting event, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejoins_channel_after_socket_drop_and_keeps_receiving_events() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let joins = Arc::new(AtomicUsize::new(0));
+        let (kill, _) = broadcast::channel::<()>(4);
+
+        let server_joins = Arc::clone(&joins);
+        let server_kill = kill.clone();
+        tokio::spawn(async move {
+            let mut conn_id = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                conn_id += 1;
+                tokio::spawn(serve_session(
+                    stream,
+                    Arc::clone(&server_joins),
+                    conn_id,
+                    server_kill.subscribe(),
+                ));
+            }
+        });
+
+        let url = format!("ws://{addr}/socket");
+        let client = PondClient::new(&url, None).unwrap();
+        client.connect().await.unwrap();
+        let channel = client.create_channel("room", None).await;
+        let mut events = channel.subscribe_events();
+        channel.join().await;
+
+        wait_for_state(&channel, ChannelState::Joined).await;
+        assert_eq!(recv_greeting(&mut events).await, 1);
+        assert_eq!(joins.load(Ordering::SeqCst), 1);
+
+        kill.send(()).unwrap();
+        wait_for_state(&channel, ChannelState::Stalled).await;
+
+        client.connect().await.unwrap();
+        wait_for_state(&channel, ChannelState::Joined).await;
+        assert_eq!(joins.load(Ordering::SeqCst), 2);
+
+        assert_eq!(recv_greeting(&mut events).await, 2);
     }
 }
