@@ -29,7 +29,7 @@
     "pipeline": "npm run lint:fix && npm run lint && npm run build && npm run push"
   },
   "dependencies": {
-    "@eleven-am/pondsocket": "^0.1.216"
+    "@eleven-am/pondsocket": "^0.1.217"
   },
   "devDependencies": {
     "@eslint/compat": "^1.4.0",

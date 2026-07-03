@@ -1425,6 +1425,215 @@ describe('ChannelEngine distributed', () => {
         });
     });
 
+    describe('USER_REMOVE', () => {
+        it('should broadcast USER_REMOVE via requestUserRemoval', async () => {
+            channelEngine.addUser('user1', {}, jest.fn());
+            mockBackend.broadcastCalls = [];
+
+            channelEngine.requestUserRemoval('remote-user');
+
+            await Promise.resolve();
+
+            const msg = mockBackend.broadcastCalls.find(
+                (m) => m.type === DistributedMessageType.USER_REMOVE,
+            );
+
+            expect(msg).toBeDefined();
+            expect((msg as any).userId).toBe('remote-user');
+        });
+
+        it('should remove a local user and broadcast USER_LEFT on remote USER_REMOVE', async () => {
+            channelEngine.addUser('user1', {}, jest.fn());
+            channelEngine.addUser('user2', {}, jest.fn());
+            mockBackend.broadcastCalls = [];
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_REMOVE,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'user1',
+            });
+
+            await Promise.resolve();
+
+            expect(channelEngine.users.has('user1')).toBe(false);
+
+            const leftMsg = mockBackend.broadcastCalls.find(
+                (m) => m.type === DistributedMessageType.USER_LEFT,
+            );
+
+            expect(leftMsg).toBeDefined();
+            expect((leftMsg as any).userId).toBe('user1');
+        });
+
+        it('should drop a remote-tracked user without broadcasting USER_LEFT', async () => {
+            channelEngine.addUser('local-user', {}, jest.fn());
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_JOINED,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+                assigns: { role: 'user' },
+                presence: { status: 'online' },
+            });
+
+            expect(channelEngine.users.has('remote-user')).toBe(true);
+            mockBackend.broadcastCalls = [];
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_REMOVE,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+            });
+
+            await Promise.resolve();
+
+            expect(channelEngine.users.has('remote-user')).toBe(false);
+            expect(channelEngine.getPresence()['remote-user']).toBeUndefined();
+
+            const leftMsg = mockBackend.broadcastCalls.find(
+                (m) => m.type === DistributedMessageType.USER_LEFT,
+            );
+
+            expect(leftMsg).toBeUndefined();
+        });
+    });
+
+    describe('USER_GET_REQUEST / USER_GET_RESPONSE', () => {
+        it('should answer USER_GET_REQUEST for a local user with assigns and presence', async () => {
+            channelEngine.addUser('user1', { role: 'admin' }, jest.fn());
+            channelEngine.trackPresence('user1', { status: 'online' });
+            mockBackend.broadcastCalls = [];
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_GET_REQUEST,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'user1',
+                requestId: 'lookup-1',
+                fromNode: 'remote-node',
+            });
+
+            await Promise.resolve();
+
+            const response = mockBackend.broadcastCalls.find(
+                (m) => m.type === DistributedMessageType.USER_GET_RESPONSE,
+            );
+
+            expect(response).toBeDefined();
+            expect((response as any).userId).toBe('user1');
+            expect((response as any).requestId).toBe('lookup-1');
+            expect((response as any).assigns).toEqual({ role: 'admin' });
+            expect((response as any).presence).toEqual({ status: 'online' });
+        });
+
+        it('should not answer USER_GET_REQUEST when the user is not local', async () => {
+            channelEngine.addUser('local-user', {}, jest.fn());
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_JOINED,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+                assigns: {},
+                presence: {},
+            });
+            mockBackend.broadcastCalls = [];
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_GET_REQUEST,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'other-node',
+                userId: 'remote-user',
+                requestId: 'lookup-2',
+                fromNode: 'other-node',
+            });
+
+            await Promise.resolve();
+
+            const response = mockBackend.broadcastCalls.find(
+                (m) => m.type === DistributedMessageType.USER_GET_RESPONSE,
+            );
+
+            expect(response).toBeUndefined();
+        });
+
+        it('should resolve getUserAcrossNodes when a matching USER_GET_RESPONSE arrives', async () => {
+            channelEngine.addUser('user1', {}, jest.fn());
+            mockBackend.broadcastCalls = [];
+
+            const pending = channelEngine.getUserAcrossNodes('remote-user');
+
+            await Promise.resolve();
+
+            const request = mockBackend.broadcastCalls.find(
+                (m) => m.type === DistributedMessageType.USER_GET_REQUEST,
+            );
+
+            expect(request).toBeDefined();
+            expect((request as any).userId).toBe('remote-user');
+            expect((request as any).fromNode).toBeDefined();
+
+            const requestId = (request as any).requestId;
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_GET_RESPONSE,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+                requestId,
+                assigns: { role: 'viewer' },
+                presence: { status: 'away' },
+            });
+
+            const result = await pending;
+
+            expect(result).toEqual({
+                id: 'remote-user',
+                assigns: { role: 'viewer' },
+                presence: { status: 'away' },
+            });
+        });
+
+        it('should resolve getUserAcrossNodes to null on timeout', async () => {
+            channelEngine.addUser('user1', {}, jest.fn());
+
+            const pending = channelEngine.getUserAcrossNodes('remote-user', 1_000);
+
+            jest.advanceTimersByTime(1_000);
+
+            const result = await pending;
+
+            expect(result).toBeNull();
+        });
+
+        it('should ignore USER_GET_RESPONSE with an unknown requestId', () => {
+            channelEngine.addUser('user1', {}, jest.fn());
+
+            expect(() => {
+                mockBackend.simulateMessage({
+                    type: DistributedMessageType.USER_GET_RESPONSE,
+                    endpointName: 'String',
+                    channelName,
+                    sourceNodeId: 'remote-node',
+                    userId: 'remote-user',
+                    requestId: 'never-requested',
+                    assigns: {},
+                    presence: {},
+                });
+            }).not.toThrow();
+        });
+    });
+
     describe('heartbeat tracking and stale node cleanup', () => {
         it('should track heartbeats from other nodes', () => {
             channelEngine.addUser('local-user', {}, jest.fn());

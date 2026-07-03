@@ -1,16 +1,17 @@
 use async_trait::async_trait;
 use pondsocket_common::{PondAssigns, PresenceEventType, ServerAction, uuid};
-use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::contexts::{EventContext, LeaveContext, OutgoingContext};
 use crate::errors::{Result, conflict, internal, not_found};
 use crate::parser::parse;
-use crate::pubsub::{PubSub, format_topic};
+use crate::pubsub::{PubSub, format_heartbeat_topic, format_topic};
 use crate::transport::Transport;
 use crate::types::{Event, Options, User};
 
@@ -96,6 +97,10 @@ pub struct Channel {
     dispatch_task: RwLock<Option<JoinHandle<()>>>,
     dispatch_semaphore: Arc<Semaphore>,
     active: RwLock<bool>,
+    node_last_seen: RwLock<HashMap<String, Instant>>,
+    node_users: RwLock<HashMap<String, HashSet<String>>>,
+    heartbeat_task: RwLock<Option<JoinHandle<()>>>,
+    stale_task: RwLock<Option<JoinHandle<()>>>,
 }
 
 pub struct ChannelConfig {
@@ -130,12 +135,17 @@ impl Channel {
             dispatch_rx: RwLock::new(Some(dispatch_rx)),
             dispatch_task: RwLock::new(None),
             active: RwLock::new(false),
+            node_last_seen: RwLock::new(HashMap::new()),
+            node_users: RwLock::new(HashMap::new()),
+            heartbeat_task: RwLock::new(None),
+            stale_task: RwLock::new(None),
         })
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         *self.active.write().await = true;
         self.subscribe_to_pubsub().await?;
+        self.start_liveness().await?;
         if let Some(mut rx) = self.dispatch_rx.write().await.take() {
             let channel = self.clone();
             let task = tokio::spawn(async move {
@@ -162,9 +172,17 @@ impl Channel {
         if let Some(task) = self.dispatch_task.write().await.take() {
             task.abort();
         }
+        if let Some(task) = self.heartbeat_task.write().await.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stale_task.write().await.take() {
+            task.abort();
+        }
         self.connections.write().await.clear();
         self.assigns.write().await.clear();
         self.presence.write().await.clear();
+        self.node_last_seen.write().await.clear();
+        self.node_users.write().await.clear();
         if let Some(hooks) = &self.options.hooks {
             if let Some(metrics) = &hooks.metrics {
                 metrics.channel_destroyed(&self.name);
@@ -192,12 +210,17 @@ impl Channel {
         }
         let assigns = transport.clone_assigns().await;
         connections.insert(user_id.clone(), transport);
-        self.assigns.write().await.insert(user_id.clone(), assigns);
+        drop(connections);
+        self.assigns
+            .write()
+            .await
+            .insert(user_id.clone(), assigns.clone());
         if let Some(hooks) = &self.options.hooks {
             if let Some(metrics) = &hooks.metrics {
                 metrics.channel_joined(&user_id, &self.name);
             }
         }
+        let _ = self.publish_user_joined(&user_id, &assigns).await;
         Ok(())
     }
 
@@ -216,6 +239,7 @@ impl Channel {
             self.publish_presence_change(user_id, PresenceEventType::Leave, old)
                 .await?;
         }
+        let _ = self.publish_user_left(user_id).await;
         let user = User {
             id: user_id.to_owned(),
             assigns,
@@ -263,15 +287,21 @@ impl Channel {
     }
 
     pub async fn update_assign(&self, user_id: &str, key: &str, value: Value) -> Result<()> {
-        let mut assigns = self.assigns.write().await;
-        let Some(current) = assigns.get_mut(user_id) else {
-            drop(assigns);
-            let mut remote_assigns = Map::new();
+        if !self.connections.read().await.contains_key(user_id) {
+            let mut remote_assigns = self
+                .assigns
+                .read()
+                .await
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default();
             remote_assigns.insert(key.to_owned(), value.clone());
             self.publish_assign_update(user_id, key, value, remote_assigns)
                 .await?;
             return Err(not_found(&self.name, "user not in channel"));
-        };
+        }
+        let mut assigns = self.assigns.write().await;
+        let current = assigns.entry(user_id.to_owned()).or_default();
         current.insert(key.to_owned(), value.clone());
         let updated_assigns = current.clone();
         drop(assigns);
@@ -332,6 +362,8 @@ impl Channel {
             recipients,
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -349,6 +381,8 @@ impl Channel {
             user_ids.to_vec(),
             None,
             Some(user_ids.to_vec()),
+            None,
+            None,
         )
         .await
     }
@@ -369,6 +403,8 @@ impl Channel {
             recipients,
             None,
             None,
+            Some("ALL_EXCEPT_SENDER".to_owned()),
+            Some(sender_id.to_owned()),
         )
         .await
     }
@@ -444,6 +480,7 @@ impl Channel {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_event(
         &self,
         action: ServerAction,
@@ -452,6 +489,8 @@ impl Channel {
         recipients: Vec<String>,
         request_id: Option<String>,
         pubsub_recipients: Option<Vec<String>>,
+        recipient_descriptor: Option<String>,
+        sender: Option<String>,
     ) -> Result<()> {
         if recipients.is_empty() {
             return Ok(());
@@ -465,6 +504,12 @@ impl Channel {
         );
         if let Some(pubsub_recipients) = pubsub_recipients {
             ev.recipients = pubsub_recipients;
+        }
+        if let Some(recipient_descriptor) = recipient_descriptor {
+            ev.recipient_descriptor = recipient_descriptor;
+        }
+        if let Some(sender) = sender {
+            ev.from_user_id = sender;
         }
         ev.node_id = self.node_id.clone();
         self.enqueue_dispatch(DispatchItem {
@@ -566,6 +611,18 @@ impl Channel {
         } else if event.action == "USER_COMMAND" {
             self.handle_remote_user_command(event).await?;
             return Ok(());
+        } else if event.action == "STATE_REQUEST" {
+            self.handle_state_request().await?;
+            return Ok(());
+        } else if event.action == "STATE_RESPONSE" {
+            self.handle_state_response(event).await;
+            return Ok(());
+        } else if event.action == "USER_JOINED" {
+            self.handle_remote_user_joined(event).await;
+            return Ok(());
+        } else if event.action == "USER_LEFT" {
+            self.handle_remote_user_left(event).await;
+            return Ok(());
         } else if !event.recipients.is_empty() {
             let local = self.connections.read().await;
             event
@@ -661,8 +718,12 @@ impl Channel {
         self.endpoint_path.trim_start_matches('/').to_owned()
     }
 
+    fn namespace(&self) -> &str {
+        &self.options.namespace
+    }
+
     fn pubsub_pattern(&self) -> String {
-        format_topic(&self.clean_endpoint(), &self.name, ".*")
+        format_topic(self.namespace(), &self.clean_endpoint(), &self.name)
     }
 
     async fn subscribe_to_pubsub(self: &Arc<Self>) -> Result<()> {
@@ -691,6 +752,9 @@ impl Channel {
             if !self.endpoint_path.is_empty() {
                 let _ = pubsub.unsubscribe(&self.pubsub_pattern()).await;
             }
+            let _ = pubsub
+                .unsubscribe(&format_heartbeat_topic(self.namespace()))
+                .await;
         }
         Ok(())
     }
@@ -702,7 +766,7 @@ impl Channel {
         if self.endpoint_path.is_empty() {
             return Ok(());
         }
-        let topic = format_topic(&self.clean_endpoint(), &self.name, subtype);
+        let topic = format_topic(self.namespace(), &self.clean_endpoint(), &self.name);
         let bytes = distributed_event_to_bytes(&event, subtype, &self.clean_endpoint())
             .map_err(|e| internal(&self.name, e.to_string()))?;
         pubsub.publish(&topic, bytes).await
@@ -799,9 +863,350 @@ impl Channel {
                     self.remove_user(user_id, reason).await?;
                 }
             }
+            "user:get_request" => {
+                if self.has_user(user_id).await {
+                    let assigns = self
+                        .assigns
+                        .read()
+                        .await
+                        .get(user_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let presence = self
+                        .presence
+                        .read()
+                        .await
+                        .get(user_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let request_id = event
+                        .payload
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&event.request_id)
+                        .to_owned();
+                    self.publish_user_get_response(user_id, &request_id, assigns, presence)
+                        .await?;
+                }
+            }
+            "user:get_response" => {
+                if !self.has_user(user_id).await {
+                    if let Some(assigns) = event.payload.get("assigns").and_then(Value::as_object) {
+                        self.assigns
+                            .write()
+                            .await
+                            .insert(user_id.to_owned(), assigns.clone());
+                    }
+                    if let Some(presence) = event.payload.get("presence").and_then(Value::as_object)
+                        && !presence.is_empty()
+                    {
+                        self.presence
+                            .write()
+                            .await
+                            .insert(user_id.to_owned(), presence.clone());
+                    }
+                    self.track_node_user(&event.node_id, user_id).await;
+                }
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    async fn start_liveness(self: &Arc<Self>) -> Result<()> {
+        let Some(pubsub) = self.pubsub.clone() else {
+            return Ok(());
+        };
+        let heartbeat_topic = format_heartbeat_topic(self.namespace());
+
+        let handler_channel = self.clone();
+        pubsub
+            .subscribe(
+                &heartbeat_topic,
+                Arc::new(move |_topic, data| {
+                    let channel = handler_channel.clone();
+                    tokio::spawn(async move {
+                        channel.handle_heartbeat(data).await;
+                    });
+                }),
+            )
+            .await?;
+
+        let interval = self.options.heartbeat_interval;
+        let hb_channel = self.clone();
+        let hb_pubsub = pubsub.clone();
+        let hb_topic = heartbeat_topic.clone();
+        let node_id = self.node_id.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            loop {
+                if !*hb_channel.active.read().await {
+                    break;
+                }
+                let bytes = heartbeat_to_bytes(&node_id);
+                let _ = hb_pubsub.publish(&hb_topic, bytes).await;
+                sleep(interval).await;
+            }
+        });
+        *self.heartbeat_task.write().await = Some(heartbeat_task);
+
+        let timeout_duration = self.options.heartbeat_timeout;
+        let stale_channel = self.clone();
+        let stale_task = tokio::spawn(async move {
+            loop {
+                sleep(timeout_duration).await;
+                if !*stale_channel.active.read().await {
+                    break;
+                }
+                stale_channel.cleanup_stale_nodes().await;
+            }
+        });
+        *self.stale_task.write().await = Some(stale_task);
+
+        self.request_channel_state().await;
+        Ok(())
+    }
+
+    async fn handle_heartbeat(&self, data: Vec<u8>) {
+        if let Some(node) = parse_heartbeat_node(&data)
+            && node != self.node_id
+        {
+            self.node_last_seen
+                .write()
+                .await
+                .insert(node, Instant::now());
+        }
+    }
+
+    async fn cleanup_stale_nodes(&self) {
+        let timeout_duration = self.options.heartbeat_timeout;
+        let now = Instant::now();
+        let stale = self
+            .node_last_seen
+            .read()
+            .await
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) >= timeout_duration)
+            .map(|(node, _)| node.clone())
+            .collect::<Vec<_>>();
+        for node in stale {
+            let users = self.node_users.write().await.remove(&node);
+            if let Some(users) = users {
+                let mut assigns = self.assigns.write().await;
+                let mut presence = self.presence.write().await;
+                for user in users {
+                    assigns.remove(&user);
+                    presence.remove(&user);
+                }
+            }
+            self.node_last_seen.write().await.remove(&node);
+        }
+    }
+
+    async fn track_node_user(&self, node_id: &str, user_id: &str) {
+        if node_id.is_empty() {
+            return;
+        }
+        self.node_users
+            .write()
+            .await
+            .entry(node_id.to_owned())
+            .or_default()
+            .insert(user_id.to_owned());
+        self.node_last_seen
+            .write()
+            .await
+            .entry(node_id.to_owned())
+            .or_insert_with(Instant::now);
+    }
+
+    async fn untrack_node_user(&self, node_id: &str, user_id: &str) {
+        if node_id.is_empty() {
+            return;
+        }
+        let mut nodes = self.node_users.write().await;
+        if let Some(users) = nodes.get_mut(node_id) {
+            users.remove(user_id);
+            if users.is_empty() {
+                nodes.remove(node_id);
+            }
+        }
+    }
+
+    async fn request_channel_state(&self) {
+        let mut ev = Event::new(
+            "STATE_REQUEST",
+            &self.name,
+            uuid(),
+            "state:request",
+            json!({ "fromNode": self.node_id }),
+        );
+        ev.node_id = self.node_id.clone();
+        let _ = self.publish_event_to_pubsub(ev, "state:request").await;
+    }
+
+    async fn handle_state_request(&self) -> Result<()> {
+        let ids = self
+            .connections
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let assigns = self.assigns.read().await;
+        let presence = self.presence.read().await;
+        let users = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "assigns": assigns.get(id).cloned().unwrap_or_default(),
+                    "presence": presence.get(id).cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(assigns);
+        drop(presence);
+        let mut ev = Event::new(
+            "STATE_RESPONSE",
+            &self.name,
+            uuid(),
+            "state:response",
+            json!({ "users": users }),
+        );
+        ev.node_id = self.node_id.clone();
+        self.publish_event_to_pubsub(ev, "state:response").await
+    }
+
+    async fn handle_state_response(&self, event: Event) {
+        let Some(users) = event.payload.get("users").and_then(Value::as_array) else {
+            return;
+        };
+        for user in users {
+            let Some(id) = user.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if self.connections.read().await.contains_key(id) {
+                continue;
+            }
+            let assigns = user
+                .get("assigns")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            self.assigns.write().await.insert(id.to_owned(), assigns);
+            if let Some(presence) = user.get("presence").and_then(Value::as_object)
+                && !presence.is_empty()
+            {
+                self.presence
+                    .write()
+                    .await
+                    .insert(id.to_owned(), presence.clone());
+            }
+            self.track_node_user(&event.node_id, id).await;
+        }
+    }
+
+    async fn handle_remote_user_joined(&self, event: Event) {
+        let Some(id) = event.payload.get("userId").and_then(Value::as_str) else {
+            return;
+        };
+        if self.connections.read().await.contains_key(id) {
+            return;
+        }
+        let assigns = event
+            .payload
+            .get("assigns")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        self.assigns
+            .write()
+            .await
+            .insert(id.to_owned(), assigns);
+        if let Some(presence) = event.payload.get("presence").and_then(Value::as_object)
+            && !presence.is_empty()
+        {
+            self.presence
+                .write()
+                .await
+                .insert(id.to_owned(), presence.clone());
+        }
+        self.track_node_user(&event.node_id, id).await;
+    }
+
+    async fn handle_remote_user_left(&self, event: Event) {
+        let Some(id) = event.payload.get("userId").and_then(Value::as_str) else {
+            return;
+        };
+        if self.connections.read().await.contains_key(id) {
+            return;
+        }
+        self.assigns.write().await.remove(id);
+        self.presence.write().await.remove(id);
+        self.untrack_node_user(&event.node_id, id).await;
+    }
+
+    async fn publish_user_joined(&self, user_id: &str, assigns: &PondAssigns) -> Result<()> {
+        let mut ev = Event::new(
+            "USER_JOINED",
+            &self.name,
+            uuid(),
+            "user:joined",
+            json!({ "userId": user_id, "presence": {}, "assigns": assigns }),
+        );
+        ev.node_id = self.node_id.clone();
+        self.publish_event_to_pubsub(ev, "user:joined").await
+    }
+
+    async fn publish_user_left(&self, user_id: &str) -> Result<()> {
+        let mut ev = Event::new(
+            "USER_LEFT",
+            &self.name,
+            uuid(),
+            "user:left",
+            json!({ "userId": user_id }),
+        );
+        ev.node_id = self.node_id.clone();
+        self.publish_event_to_pubsub(ev, "user:left").await
+    }
+
+    pub async fn request_user(&self, user_id: &str) -> Result<()> {
+        let request_id = uuid();
+        let mut ev = Event::new(
+            "USER_COMMAND",
+            &self.name,
+            request_id.clone(),
+            "user:get_request",
+            json!({ "userId": user_id, "requestId": request_id, "fromNode": self.node_id }),
+        );
+        ev.node_id = self.node_id.clone();
+        self.publish_event_to_pubsub(ev, "user:get_request").await
+    }
+
+    async fn publish_user_get_response(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        assigns: PondAssigns,
+        presence: pondsocket_common::PondPresence,
+    ) -> Result<()> {
+        let mut ev = Event::new(
+            "USER_COMMAND",
+            &self.name,
+            request_id.to_owned(),
+            "user:get_response",
+            json!({
+                "userId": user_id,
+                "requestId": request_id,
+                "assigns": assigns,
+                "presence": presence,
+            }),
+        );
+        ev.node_id = self.node_id.clone();
+        self.publish_event_to_pubsub(ev, "user:get_response").await
     }
 }
 
@@ -837,6 +1242,11 @@ fn distributed_event_to_bytes(
         "USER_COMMAND" if event.event == "user:get_request" => "USER_GET_REQUEST",
         "USER_COMMAND" if event.event == "user:get_response" => "USER_GET_RESPONSE",
         "USER_COMMAND" => "EVICT_USER",
+        "STATE_REQUEST" => "STATE_REQUEST",
+        "STATE_RESPONSE" => "STATE_RESPONSE",
+        "USER_JOINED" => "USER_JOINED",
+        "USER_LEFT" => "USER_LEFT",
+        "HEARTBEAT" => "NODE_HEARTBEAT",
         _ => "USER_MESSAGE",
     };
     let mut out = serde_json::Map::new();
@@ -850,29 +1260,33 @@ fn distributed_event_to_bytes(
     out.insert("timestamp".to_owned(), json!(now_ms()));
     match message_type {
         "USER_MESSAGE" => {
-            out.insert("fromUserId".to_owned(), json!("CHANNEL"));
+            let from = if event.from_user_id.is_empty() {
+                "CHANNEL"
+            } else {
+                event.from_user_id.as_str()
+            };
+            out.insert("fromUserId".to_owned(), json!(from));
             out.insert("event".to_owned(), json!(event.event));
             out.insert("payload".to_owned(), event.payload.clone());
             out.insert("requestId".to_owned(), json!(event.request_id));
-            if event.recipients.is_empty() {
-                out.insert("recipientDescriptor".to_owned(), json!("ALL_USERS"));
+            let descriptor = if event.recipient_descriptor == "ALL_EXCEPT_SENDER" {
+                json!("ALL_EXCEPT_SENDER")
+            } else if !event.recipients.is_empty() {
+                json!(event.recipients)
             } else {
-                out.insert("recipientDescriptor".to_owned(), json!(event.recipients));
-            }
+                json!("ALL_USERS")
+            };
+            out.insert("recipientDescriptor".to_owned(), descriptor);
         }
         "PRESENCE_UPDATE" => {
-            let user_id = event
-                .payload
-                .get("changed")
-                .and_then(|v| v.get("userId"))
+            let changed = event.payload.get("changed").cloned().unwrap_or(json!({}));
+            let user_id = changed
+                .get("userId")
                 .and_then(Value::as_str)
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_owned();
             out.insert("userId".to_owned(), json!(user_id));
-            out.insert(
-                "presence".to_owned(),
-                event.payload.get("changed").cloned().unwrap_or(json!({})),
-            );
-            out.insert("event".to_owned(), json!(event.event));
+            out.insert("presence".to_owned(), changed);
         }
         "PRESENCE_REMOVED" => {
             out.insert(
@@ -886,26 +1300,18 @@ fn distributed_event_to_bytes(
                         .unwrap_or("")
                 ),
             );
-            out.insert("event".to_owned(), json!(event.event));
         }
         "ASSIGNS_UPDATE" => {
             out.insert(
                 "userId".to_owned(),
                 event.payload.get("userId").cloned().unwrap_or(json!("")),
             );
-            if let Some(key) = event.payload.get("key") {
-                out.insert("key".to_owned(), key.clone());
-            }
-            if let Some(value) = event.payload.get("value") {
-                out.insert("value".to_owned(), value.clone());
-            }
             out.insert(
                 "assigns".to_owned(),
                 event.payload.get("assigns").cloned().unwrap_or(json!({})),
             );
-            out.insert("payload".to_owned(), event.payload.clone());
         }
-        "EVICT_USER" | "USER_REMOVE" => {
+        "EVICT_USER" => {
             out.insert(
                 "userId".to_owned(),
                 event.payload.get("userId").cloned().unwrap_or(json!("")),
@@ -914,6 +1320,81 @@ fn distributed_event_to_bytes(
                 "reason".to_owned(),
                 event.payload.get("reason").cloned().unwrap_or(json!("")),
             );
+        }
+        "USER_REMOVE" => {
+            out.insert(
+                "userId".to_owned(),
+                event.payload.get("userId").cloned().unwrap_or(json!("")),
+            );
+        }
+        "USER_GET_REQUEST" => {
+            out.insert(
+                "userId".to_owned(),
+                event.payload.get("userId").cloned().unwrap_or(json!("")),
+            );
+            out.insert("requestId".to_owned(), json!(event.request_id));
+            out.insert(
+                "fromNode".to_owned(),
+                event
+                    .payload
+                    .get("fromNode")
+                    .cloned()
+                    .unwrap_or(json!(event.node_id)),
+            );
+        }
+        "USER_GET_RESPONSE" => {
+            out.insert(
+                "userId".to_owned(),
+                event.payload.get("userId").cloned().unwrap_or(json!("")),
+            );
+            out.insert("requestId".to_owned(), json!(event.request_id));
+            out.insert(
+                "assigns".to_owned(),
+                event.payload.get("assigns").cloned().unwrap_or(json!({})),
+            );
+            out.insert(
+                "presence".to_owned(),
+                event.payload.get("presence").cloned().unwrap_or(json!({})),
+            );
+        }
+        "USER_JOINED" => {
+            out.insert(
+                "userId".to_owned(),
+                event.payload.get("userId").cloned().unwrap_or(json!("")),
+            );
+            out.insert(
+                "presence".to_owned(),
+                event.payload.get("presence").cloned().unwrap_or(json!({})),
+            );
+            out.insert(
+                "assigns".to_owned(),
+                event.payload.get("assigns").cloned().unwrap_or(json!({})),
+            );
+        }
+        "USER_LEFT" => {
+            out.insert(
+                "userId".to_owned(),
+                event.payload.get("userId").cloned().unwrap_or(json!("")),
+            );
+        }
+        "STATE_REQUEST" => {
+            out.insert(
+                "fromNode".to_owned(),
+                event
+                    .payload
+                    .get("fromNode")
+                    .cloned()
+                    .unwrap_or(json!(event.node_id)),
+            );
+        }
+        "STATE_RESPONSE" => {
+            out.insert(
+                "users".to_owned(),
+                event.payload.get("users").cloned().unwrap_or(json!([])),
+            );
+        }
+        "NODE_HEARTBEAT" => {
+            out.insert("nodeId".to_owned(), json!(event.node_id));
         }
         _ => {
             out.insert("payload".to_owned(), event.payload.clone());
@@ -978,15 +1459,8 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
                 action: "PRESENCE".to_owned(),
                 channel_name: channel,
                 request_id,
-                event: value
-                    .get("event")
-                    .and_then(Value::as_str)
-                    .unwrap_or("UPDATE")
-                    .to_owned(),
-                payload: value
-                    .get("payload")
-                    .cloned()
-                    .unwrap_or(json!({"presence": [], "changed": changed})),
+                event: "UPDATE".to_owned(),
+                payload: json!({"presence": [], "changed": changed}),
                 node_id,
                 recipients: Vec::new(),
                 from_user_id: String::new(),
@@ -1009,12 +1483,12 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
             channel_name: channel,
             request_id,
             event: "assigns:update".to_owned(),
-            payload: value.get("payload").cloned().unwrap_or(json!({
+            payload: json!({
                 "userId": value.get("userId").cloned().unwrap_or(json!("")),
                 "key": value.get("key").cloned().unwrap_or(Value::Null),
                 "value": value.get("value").cloned().unwrap_or(Value::Null),
                 "assigns": value.get("assigns").cloned().unwrap_or(json!({})),
-            })),
+            }),
             node_id,
             recipients: Vec::new(),
             from_user_id: String::new(),
@@ -1036,7 +1510,97 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
             channel_name: channel,
             request_id,
             event: "user:remove".to_owned(),
-            payload: json!({"userId": value.get("userId").cloned().unwrap_or(json!("")), "reason": value.get("reason").cloned().unwrap_or(json!(""))}),
+            payload: json!({"userId": value.get("userId").cloned().unwrap_or(json!(""))}),
+            node_id,
+            recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
+        }),
+        "USER_GET_REQUEST" => Some(Event {
+            action: "USER_COMMAND".to_owned(),
+            channel_name: channel,
+            request_id: request_id.clone(),
+            event: "user:get_request".to_owned(),
+            payload: json!({
+                "userId": value.get("userId").cloned().unwrap_or(json!("")),
+                "requestId": request_id,
+                "fromNode": value.get("fromNode").cloned().unwrap_or(json!("")),
+            }),
+            node_id,
+            recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
+        }),
+        "USER_GET_RESPONSE" => Some(Event {
+            action: "USER_COMMAND".to_owned(),
+            channel_name: channel,
+            request_id: request_id.clone(),
+            event: "user:get_response".to_owned(),
+            payload: json!({
+                "userId": value.get("userId").cloned().unwrap_or(json!("")),
+                "requestId": request_id,
+                "assigns": value.get("assigns").cloned().unwrap_or(json!({})),
+                "presence": value.get("presence").cloned().unwrap_or(json!({})),
+            }),
+            node_id,
+            recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
+        }),
+        "USER_JOINED" => Some(Event {
+            action: "USER_JOINED".to_owned(),
+            channel_name: channel,
+            request_id,
+            event: "user:joined".to_owned(),
+            payload: json!({
+                "userId": value.get("userId").cloned().unwrap_or(json!("")),
+                "presence": value.get("presence").cloned().unwrap_or(json!({})),
+                "assigns": value.get("assigns").cloned().unwrap_or(json!({})),
+            }),
+            node_id,
+            recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
+        }),
+        "USER_LEFT" => Some(Event {
+            action: "USER_LEFT".to_owned(),
+            channel_name: channel,
+            request_id,
+            event: "user:left".to_owned(),
+            payload: json!({ "userId": value.get("userId").cloned().unwrap_or(json!("")) }),
+            node_id,
+            recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
+        }),
+        "STATE_REQUEST" => Some(Event {
+            action: "STATE_REQUEST".to_owned(),
+            channel_name: channel,
+            request_id,
+            event: "state:request".to_owned(),
+            payload: json!({ "fromNode": value.get("fromNode").cloned().unwrap_or(json!("")) }),
+            node_id,
+            recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
+        }),
+        "STATE_RESPONSE" => Some(Event {
+            action: "STATE_RESPONSE".to_owned(),
+            channel_name: channel,
+            request_id,
+            event: "state:response".to_owned(),
+            payload: json!({ "users": value.get("users").cloned().unwrap_or(json!([])) }),
+            node_id,
+            recipients: Vec::new(),
+            from_user_id: String::new(),
+            recipient_descriptor: String::new(),
+        }),
+        "NODE_HEARTBEAT" => Some(Event {
+            action: "HEARTBEAT".to_owned(),
+            channel_name: channel,
+            request_id,
+            event: "heartbeat".to_owned(),
+            payload: json!({ "nodeId": value.get("nodeId").cloned().unwrap_or(json!("")) }),
             node_id,
             recipients: Vec::new(),
             from_user_id: String::new(),
@@ -1044,6 +1608,26 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
         }),
         _ => None,
     }
+}
+
+fn heartbeat_to_bytes(node_id: &str) -> Vec<u8> {
+    let mut ev = Event::new(
+        "HEARTBEAT",
+        "__heartbeat__",
+        uuid(),
+        "heartbeat",
+        json!({ "nodeId": node_id }),
+    );
+    ev.node_id = node_id.to_owned();
+    distributed_event_to_bytes(&ev, "heartbeat", "__heartbeat__").unwrap_or_default()
+}
+
+fn parse_heartbeat_node(data: &[u8]) -> Option<String> {
+    let event = distributed_bytes_to_event(data)?;
+    if event.action != "HEARTBEAT" {
+        return None;
+    }
+    Some(event.node_id)
 }
 
 fn now_ms() -> u128 {
@@ -1082,6 +1666,8 @@ mod tests {
                 vec!["u1".to_owned()],
                 Some("r1".to_owned()),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1094,11 +1680,321 @@ mod tests {
                 vec!["u1".to_owned()],
                 Some("r2".to_owned()),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap_err();
 
         assert_eq!(err.code, 500);
         assert!(err.message.contains("timed out"));
+    }
+
+    fn encode(event: &Event, subtype: &str) -> Value {
+        let bytes = distributed_event_to_bytes(event, subtype, "api").unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn base(action: &str, event_name: &str, payload: Value) -> Event {
+        let mut ev = Event::new(action, "/chat/1", "req-1", event_name, payload);
+        ev.node_id = "node-a".to_owned();
+        ev
+    }
+
+    fn assert_envelope(wire: &Value, expected_type: &str) {
+        assert_eq!(wire["protocol"], "pondsocket.distributed");
+        assert_eq!(wire["version"], 1);
+        assert_eq!(wire["type"], expected_type);
+        assert!(wire["messageId"].as_str().is_some());
+        assert_eq!(wire["sourceNodeId"], "node-a");
+        assert_eq!(wire["endpointName"], "api");
+        assert_eq!(wire["channelName"], "/chat/1");
+        assert!(wire["timestamp"].as_i64().is_some());
+    }
+
+    #[test]
+    fn round_trip_user_message_all_users() {
+        let ev = base("BROADCAST", "message", json!({ "text": "hi" }));
+        let wire = encode(&ev, "message");
+        assert_envelope(&wire, "USER_MESSAGE");
+        assert_eq!(wire["fromUserId"], "CHANNEL");
+        assert_eq!(wire["event"], "message");
+        assert_eq!(wire["payload"]["text"], "hi");
+        assert_eq!(wire["requestId"], "req-1");
+        assert_eq!(wire["recipientDescriptor"], "ALL_USERS");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "BROADCAST");
+        assert_eq!(decoded.event, "message");
+        assert_eq!(decoded.payload["text"], "hi");
+        assert_eq!(decoded.node_id, "node-a");
+        assert_eq!(decoded.recipient_descriptor, "ALL_USERS");
+        assert!(decoded.recipients.is_empty());
+    }
+
+    #[test]
+    fn recipient_descriptor_all_except_sender() {
+        let mut ev = base("BROADCAST", "message", json!({ "text": "hi" }));
+        ev.recipient_descriptor = "ALL_EXCEPT_SENDER".to_owned();
+        ev.from_user_id = "u1".to_owned();
+        let wire = encode(&ev, "message");
+        assert_eq!(wire["recipientDescriptor"], "ALL_EXCEPT_SENDER");
+        assert_eq!(wire["fromUserId"], "u1");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.recipient_descriptor, "ALL_EXCEPT_SENDER");
+        assert_eq!(decoded.from_user_id, "u1");
+        assert!(decoded.recipients.is_empty());
+    }
+
+    #[test]
+    fn recipient_descriptor_explicit_ids() {
+        let mut ev = base("BROADCAST", "message", json!({ "text": "hi" }));
+        ev.recipients = vec!["u1".to_owned(), "u2".to_owned()];
+        let wire = encode(&ev, "message");
+        assert_eq!(wire["recipientDescriptor"], json!(["u1", "u2"]));
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.recipients, vec!["u1".to_owned(), "u2".to_owned()]);
+    }
+
+    #[test]
+    fn round_trip_presence_update() {
+        let ev = base(
+            "PRESENCE",
+            "UPDATE",
+            json!({ "presence": [], "changed": { "userId": "u1", "status": "online" } }),
+        );
+        let wire = encode(&ev, "presence:update");
+        assert_envelope(&wire, "PRESENCE_UPDATE");
+        assert_eq!(wire["userId"], "u1");
+        assert_eq!(wire["presence"]["status"], "online");
+        assert!(wire.get("event").is_none());
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "PRESENCE");
+        assert_eq!(decoded.event, "UPDATE");
+        assert_eq!(decoded.payload["changed"]["userId"], "u1");
+        assert_eq!(decoded.payload["changed"]["status"], "online");
+    }
+
+    #[test]
+    fn round_trip_presence_removed() {
+        let ev = base(
+            "PRESENCE",
+            "LEAVE",
+            json!({ "presence": [], "changed": { "userId": "u1" } }),
+        );
+        let wire = encode(&ev, "presence:leave");
+        assert_envelope(&wire, "PRESENCE_REMOVED");
+        assert_eq!(wire["userId"], "u1");
+        assert!(wire.get("event").is_none());
+        assert!(wire.get("presence").is_none());
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "PRESENCE");
+        assert_eq!(decoded.event, "LEAVE");
+        assert_eq!(decoded.payload["changed"]["userId"], "u1");
+    }
+
+    #[test]
+    fn round_trip_assigns_update() {
+        let ev = base(
+            "ASSIGNS",
+            "assigns:update",
+            json!({ "userId": "u1", "assigns": { "role": "admin" } }),
+        );
+        let wire = encode(&ev, "assigns:update");
+        assert_envelope(&wire, "ASSIGNS_UPDATE");
+        assert_eq!(wire["userId"], "u1");
+        assert_eq!(wire["assigns"]["role"], "admin");
+        assert!(wire.get("key").is_none());
+        assert!(wire.get("value").is_none());
+        assert!(wire.get("payload").is_none());
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "ASSIGNS");
+        assert_eq!(decoded.event, "assigns:update");
+        assert_eq!(decoded.payload["userId"], "u1");
+        assert_eq!(decoded.payload["assigns"]["role"], "admin");
+    }
+
+    #[test]
+    fn round_trip_evict_user() {
+        let ev = base(
+            "USER_COMMAND",
+            "user:evict",
+            json!({ "userId": "u1", "reason": "spam" }),
+        );
+        let wire = encode(&ev, "user:evict");
+        assert_envelope(&wire, "EVICT_USER");
+        assert_eq!(wire["userId"], "u1");
+        assert_eq!(wire["reason"], "spam");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "USER_COMMAND");
+        assert_eq!(decoded.event, "user:evict");
+        assert_eq!(decoded.payload["userId"], "u1");
+        assert_eq!(decoded.payload["reason"], "spam");
+    }
+
+    #[test]
+    fn round_trip_user_remove() {
+        let ev = base(
+            "USER_COMMAND",
+            "user:remove",
+            json!({ "userId": "u1", "reason": "gone" }),
+        );
+        let wire = encode(&ev, "user:remove");
+        assert_envelope(&wire, "USER_REMOVE");
+        assert_eq!(wire["userId"], "u1");
+        assert!(wire.get("reason").is_none());
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "USER_COMMAND");
+        assert_eq!(decoded.event, "user:remove");
+        assert_eq!(decoded.payload["userId"], "u1");
+    }
+
+    #[test]
+    fn round_trip_user_get_request() {
+        let mut ev = base(
+            "USER_COMMAND",
+            "user:get_request",
+            json!({ "userId": "u1", "fromNode": "node-a" }),
+        );
+        ev.request_id = "lookup-1".to_owned();
+        let wire = encode(&ev, "user:get_request");
+        assert_envelope(&wire, "USER_GET_REQUEST");
+        assert_eq!(wire["userId"], "u1");
+        assert_eq!(wire["requestId"], "lookup-1");
+        assert_eq!(wire["fromNode"], "node-a");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "USER_COMMAND");
+        assert_eq!(decoded.event, "user:get_request");
+        assert_eq!(decoded.request_id, "lookup-1");
+        assert_eq!(decoded.payload["userId"], "u1");
+        assert_eq!(decoded.payload["fromNode"], "node-a");
+    }
+
+    #[test]
+    fn round_trip_user_get_response() {
+        let mut ev = base(
+            "USER_COMMAND",
+            "user:get_response",
+            json!({ "userId": "u1", "assigns": { "role": "admin" }, "presence": { "status": "online" } }),
+        );
+        ev.request_id = "lookup-1".to_owned();
+        let wire = encode(&ev, "user:get_response");
+        assert_envelope(&wire, "USER_GET_RESPONSE");
+        assert_eq!(wire["userId"], "u1");
+        assert_eq!(wire["requestId"], "lookup-1");
+        assert_eq!(wire["assigns"]["role"], "admin");
+        assert_eq!(wire["presence"]["status"], "online");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.event, "user:get_response");
+        assert_eq!(decoded.request_id, "lookup-1");
+        assert_eq!(decoded.payload["assigns"]["role"], "admin");
+        assert_eq!(decoded.payload["presence"]["status"], "online");
+    }
+
+    #[test]
+    fn round_trip_user_joined() {
+        let ev = base(
+            "USER_JOINED",
+            "user:joined",
+            json!({ "userId": "u1", "presence": {}, "assigns": { "role": "admin" } }),
+        );
+        let wire = encode(&ev, "user:joined");
+        assert_envelope(&wire, "USER_JOINED");
+        assert_eq!(wire["userId"], "u1");
+        assert_eq!(wire["assigns"]["role"], "admin");
+        assert_eq!(wire["presence"], json!({}));
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "USER_JOINED");
+        assert_eq!(decoded.payload["userId"], "u1");
+        assert_eq!(decoded.payload["assigns"]["role"], "admin");
+    }
+
+    #[test]
+    fn round_trip_user_left() {
+        let ev = base("USER_LEFT", "user:left", json!({ "userId": "u1" }));
+        let wire = encode(&ev, "user:left");
+        assert_envelope(&wire, "USER_LEFT");
+        assert_eq!(wire["userId"], "u1");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "USER_LEFT");
+        assert_eq!(decoded.payload["userId"], "u1");
+    }
+
+    #[test]
+    fn round_trip_state_request() {
+        let ev = base(
+            "STATE_REQUEST",
+            "state:request",
+            json!({ "fromNode": "node-a" }),
+        );
+        let wire = encode(&ev, "state:request");
+        assert_envelope(&wire, "STATE_REQUEST");
+        assert_eq!(wire["fromNode"], "node-a");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "STATE_REQUEST");
+        assert_eq!(decoded.payload["fromNode"], "node-a");
+    }
+
+    #[test]
+    fn round_trip_state_response() {
+        let ev = base(
+            "STATE_RESPONSE",
+            "state:response",
+            json!({ "users": [ { "id": "u1", "assigns": { "role": "admin" }, "presence": { "status": "online" } } ] }),
+        );
+        let wire = encode(&ev, "state:response");
+        assert_envelope(&wire, "STATE_RESPONSE");
+        assert_eq!(wire["users"][0]["id"], "u1");
+        assert!(wire["users"][0].get("userId").is_none());
+        assert_eq!(wire["users"][0]["assigns"]["role"], "admin");
+        assert_eq!(wire["users"][0]["presence"]["status"], "online");
+
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "STATE_RESPONSE");
+        assert_eq!(decoded.payload["users"][0]["id"], "u1");
+    }
+
+    #[test]
+    fn round_trip_node_heartbeat() {
+        let bytes = heartbeat_to_bytes("node-a");
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["type"], "NODE_HEARTBEAT");
+        assert_eq!(wire["protocol"], "pondsocket.distributed");
+        assert_eq!(wire["version"], 1);
+        assert_eq!(wire["sourceNodeId"], "node-a");
+        assert_eq!(wire["nodeId"], "node-a");
+        assert_eq!(wire["endpointName"], "__heartbeat__");
+        assert_eq!(wire["channelName"], "__heartbeat__");
+
+        assert_eq!(parse_heartbeat_node(&bytes).as_deref(), Some("node-a"));
+        let decoded = distributed_bytes_to_event(&bytes).unwrap();
+        assert_eq!(decoded.action, "HEARTBEAT");
+        assert_eq!(decoded.node_id, "node-a");
     }
 }

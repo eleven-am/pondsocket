@@ -10,6 +10,7 @@ from .endpoint import (
     Endpoint,
 )
 from .errors import PondError
+from .heartbeat import HeartbeatCoordinator
 from .parser import parse
 from .pubsub import PubSub
 from .transport import Transport
@@ -23,7 +24,7 @@ class EndpointMatch:
 
 
 class PondSocket:
-    __slots__ = ("_endpoints", "_options", "_pubsub")
+    __slots__ = ("_distributed", "_endpoints", "_options", "_pubsub")
 
     def __init__(
         self,
@@ -36,6 +37,16 @@ class PondSocket:
             base_options = replace(base_options, node_id=uuid())
         self._options = base_options
         self._pubsub = pubsub
+        self._distributed: HeartbeatCoordinator | None = None
+        if pubsub is not None:
+            self._distributed = HeartbeatCoordinator(
+                pubsub,
+                base_options.node_id,
+                namespace=base_options.namespace,
+                key_prefix=base_options.key_prefix,
+                interval=base_options.heartbeat_interval,
+                timeout=base_options.heartbeat_timeout,
+            )
         self._endpoints: list[Endpoint] = []
 
     @property
@@ -61,6 +72,7 @@ class PondSocket:
             connection_handler=handler,
             options=self._options,
             pubsub=self._pubsub,
+            heartbeat=self._distributed,
             connection_middlewares=list(middlewares),
         )
         self._endpoints.append(endpoint)
@@ -79,6 +91,8 @@ class PondSocket:
         for endpoint in self._endpoints:
             await endpoint.close()
         self._endpoints.clear()
+        if self._distributed is not None:
+            await self._distributed.close()
 
     async def find_transport(self, user_id: str) -> Transport | None:
         for endpoint in self._endpoints:

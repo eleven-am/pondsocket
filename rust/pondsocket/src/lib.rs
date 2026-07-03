@@ -9,6 +9,7 @@ pub mod parser;
 pub mod pubsub;
 pub mod server;
 pub mod transport;
+pub mod typed;
 pub mod types;
 pub mod wire;
 
@@ -22,12 +23,15 @@ pub use lobby::Lobby;
 pub use pubsub::{LocalPubSub, PubSub, format_topic, match_topic};
 pub use server::{EndpointMatch, PondSocket};
 pub use transport::{MemoryTransport, Transport};
+pub use typed::{BoxHandlerFuture, TypedChannel, TypedEventContext, TypedJoinContext, TypedLobby};
 pub use types::{Event, Options, Route, TransportType, User};
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
     use async_trait::async_trait;
+    use pondsocket_common::{PondEvent, PondSchema};
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -326,7 +330,7 @@ mod integration_tests {
         let b = b.unwrap();
 
         assert!(Arc::ptr_eq(&a, &b));
-        assert_eq!(pubsub.subscribe_count.load(Ordering::SeqCst), 1);
+        assert_eq!(pubsub.subscribe_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -391,5 +395,273 @@ mod integration_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_node_state_sync_assigns_and_stale_cleanup() {
+        let pubsub = Arc::new(LocalPubSub::new(200));
+        let opts_a = Options {
+            node_id: "node-a".to_owned(),
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_timeout: Duration::from_millis(300),
+            ..Options::default()
+        };
+        let opts_b = Options {
+            node_id: "node-b".to_owned(),
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_timeout: Duration::from_millis(300),
+            ..Options::default()
+        };
+        let pond_a = PondSocket::new(opts_a, Some(pubsub.clone()));
+        let pond_b = PondSocket::new(opts_b, Some(pubsub));
+        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await;
+        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await;
+        let lobby_a = endpoint_a.create_channel("/chat/:room", AcceptJoin).await;
+        let lobby_b = endpoint_b.create_channel("/chat/:room", AcceptJoin).await;
+
+        let tb = Arc::new(MemoryTransport::new(
+            "b",
+            pondsocket_common::PondAssigns::new(),
+        ));
+        endpoint_b.register_transport(tb.clone()).await.unwrap();
+        let _ = tb.recv().await;
+        endpoint_b
+            .handle_message(
+                Event::new("JOIN_CHANNEL", "/chat/1", "jb", "JOIN_CHANNEL", json!({})),
+                tb.clone(),
+            )
+            .await
+            .unwrap();
+        let channel_b = lobby_b.get_channel("/chat/1").await.unwrap();
+
+        let channel_a = lobby_a.get_or_create_channel("/chat/1").await.unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let assigns = channel_a.get_assigns().await;
+                let presence = channel_a.get_presence().await;
+                if assigns.contains_key("b") && presence.contains_key("b") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("node A should learn user b via STATE_REQUEST/STATE_RESPONSE");
+
+        channel_b
+            .update_assign("b", "role", json!("admin"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if channel_a
+                    .get_assigns()
+                    .await
+                    .get("b")
+                    .and_then(|assigns| assigns.get("role"))
+                    == Some(&json!("admin"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("assigns update should propagate to node A");
+
+        endpoint_b.close().await.unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let assigns = channel_a.get_assigns().await;
+                let presence = channel_a.get_presence().await;
+                if !assigns.contains_key("b") && !presence.contains_key("b") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stale node B users should be evicted from node A after heartbeat timeout");
+    }
+
+    #[tokio::test]
+    async fn distributed_presence_propagates_across_nodes() {
+        let pubsub = Arc::new(LocalPubSub::new(200));
+        let opts_a = Options {
+            node_id: "node-a".to_owned(),
+            ..Options::default()
+        };
+        let opts_b = Options {
+            node_id: "node-b".to_owned(),
+            ..Options::default()
+        };
+        let pond_a = PondSocket::new(opts_a, Some(pubsub.clone()));
+        let pond_b = PondSocket::new(opts_b, Some(pubsub));
+        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await;
+        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await;
+        let lobby_a = endpoint_a.create_channel("/chat/:room", AcceptJoin).await;
+        let _lobby_b = endpoint_b.create_channel("/chat/:room", AcceptJoin).await;
+
+        let ta = Arc::new(MemoryTransport::new(
+            "a",
+            pondsocket_common::PondAssigns::new(),
+        ));
+        endpoint_a.register_transport(ta.clone()).await.unwrap();
+        let _ = ta.recv().await;
+        endpoint_a
+            .handle_message(
+                Event::new("JOIN_CHANNEL", "/chat/1", "ja", "JOIN_CHANNEL", json!({})),
+                ta.clone(),
+            )
+            .await
+            .unwrap();
+        let channel_a = lobby_a.get_channel("/chat/1").await.unwrap();
+
+        let tb = Arc::new(MemoryTransport::new(
+            "b",
+            pondsocket_common::PondAssigns::new(),
+        ));
+        endpoint_b.register_transport(tb.clone()).await.unwrap();
+        let _ = tb.recv().await;
+        endpoint_b
+            .handle_message(
+                Event::new("JOIN_CHANNEL", "/chat/1", "jb", "JOIN_CHANNEL", json!({})),
+                tb.clone(),
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if channel_a.get_presence().await.contains_key("b") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("node A should receive node B's presence update");
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct ChatPayload {
+        text: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct AckPayload {
+        ok: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Presence {
+        user_id: String,
+        status: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Assigns {
+        role: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct JoinParams {
+        token: String,
+    }
+
+    struct Chat;
+    struct ChatSchema;
+
+    impl PondEvent for Chat {
+        type Payload = ChatPayload;
+        type Response = AckPayload;
+
+        const NAME: &'static str = "chat";
+    }
+
+    impl PondSchema for ChatSchema {
+        type Presence = Presence;
+        type Assigns = Assigns;
+        type JoinParams = JoinParams;
+    }
+
+    #[tokio::test]
+    async fn typed_channel_api_wraps_dynamic_runtime() {
+        let pond = PondSocket::with_defaults();
+        let endpoint = pond.create_endpoint("/", AcceptConn).await;
+        let lobby = endpoint
+            .create_typed_channel::<ChatSchema, _>("/chat/:room", |mut ctx| {
+                Box::pin(async move {
+                    let params = ctx.join_params()?;
+                    assert_eq!(params.token, "secret");
+                    ctx.accept(&Assigns {
+                        role: "member".to_owned(),
+                    })
+                    .await?;
+                    ctx.track(&Presence {
+                        user_id: ctx.user_id().to_owned(),
+                        status: "online".to_owned(),
+                    })
+                    .await
+                })
+            })
+            .await;
+        lobby
+            .on::<Chat, _>(|mut ctx| {
+                Box::pin(async move {
+                    let payload = ctx.payload()?;
+                    assert_eq!(payload.text, "hello");
+                    ctx.reply::<Chat>(&AckPayload { ok: true }).await
+                })
+            })
+            .await;
+
+        let transport = Arc::new(MemoryTransport::new(
+            "typed-user",
+            pondsocket_common::PondAssigns::new(),
+        ));
+        endpoint
+            .register_transport(transport.clone())
+            .await
+            .unwrap();
+        let _ = transport.recv().await;
+        endpoint
+            .handle_message(
+                Event::new(
+                    "JOIN_CHANNEL",
+                    "/chat/typed",
+                    "join-typed",
+                    "JOIN_CHANNEL",
+                    json!({ "token": "secret" }),
+                ),
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(transport.recv().await.unwrap().event, "ACKNOWLEDGE");
+        assert_eq!(transport.recv().await.unwrap().event, "JOIN");
+
+        endpoint
+            .handle_message(
+                Event::new(
+                    "BROADCAST",
+                    "/chat/typed",
+                    "msg-typed",
+                    "chat",
+                    json!({ "text": "hello" }),
+                ),
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+        let reply = transport.recv().await.unwrap();
+        assert_eq!(reply.event, "chat");
+        assert_eq!(reply.payload["ok"], true);
+
+        let channel = lobby.get_channel("/chat/typed").await.unwrap();
+        let presence = channel.get_presence().await.unwrap();
+        assert_eq!(presence["typed-user"].status, "online");
     }
 }

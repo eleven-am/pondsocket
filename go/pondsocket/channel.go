@@ -13,73 +13,91 @@ import (
 	"github.com/google/uuid"
 )
 
-type syncCoordinator struct {
-	requestID       string
-	requesterUserID string
-	responses       map[string]map[string]interface{}
-	timeout         time.Duration
-	completeChan    chan map[string]interface{}
-	mutex           sync.RWMutex
-	completed       bool
-}
-
 type Channel struct {
-	name                        string
-	endpointPath                string
-	presence                    *presenceClient
-	leave                       *LeaveEventHandler
-	leaveMiddlewares            []LeaveMiddleware
-	store                       *store[map[string]interface{}]
-	channel                     chan internalEvent
-	connections                 *store[Transport]
-	middleware                  *middleware[*messageEvent, *Channel]
-	outgoing                    *middleware[*OutgoingContext, interface{}]
-	onDestroy                   func() error
-	pubsub                      PubSub
-	nodeID                      string
-	ctx                         context.Context
-	cancel                      context.CancelFunc
-	mutex                       sync.RWMutex
-	syncCoordinators            map[string]*syncCoordinator
-	assignsSyncCoordinators     map[string]*syncCoordinator
-	userGetCoordinators         map[string]chan *User
-	syncCoordinatorMutex        sync.RWMutex
-	assignsSyncCoordinatorMutex sync.RWMutex
-	userGetCoordinatorMutex     sync.RWMutex
-	internalQueueTimeout        time.Duration
-	hooks                       *Hooks
-	dispatchSem                 chan struct{}
+	name                    string
+	endpointPath            string
+	namespace               string
+	presence                *presenceClient
+	leave                   *LeaveEventHandler
+	leaveMiddlewares        []LeaveMiddleware
+	store                   *store[map[string]interface{}]
+	channel                 chan internalEvent
+	connections             *store[Transport]
+	middleware              *middleware[*messageEvent, *Channel]
+	outgoing                *middleware[*OutgoingContext, interface{}]
+	onDestroy               func() error
+	pubsub                  PubSub
+	nodeID                  string
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	mutex                   sync.RWMutex
+	userGetCoordinators     map[string]chan *User
+	userGetCoordinatorMutex sync.RWMutex
+	remoteAssigns           map[string]map[string]interface{}
+	nodeUsers               map[string]map[string]struct{}
+	nodeLastSeen            map[string]int64
+	distMutex               sync.RWMutex
+	heartbeatInterval       time.Duration
+	heartbeatTimeout        time.Duration
+	internalQueueTimeout    time.Duration
+	hooks                   *Hooks
+	dispatchSem             chan struct{}
 }
 
 func newChannel(ctx context.Context, options options) *Channel {
 	channelCtx, cancel := context.WithCancel(ctx)
 
+	namespace := options.Namespace
+	if namespace == "" {
+		namespace = defaultNamespace
+	}
+
 	c := Channel{
-		name:                    options.Name,
-		store:                   newStore[map[string]interface{}](),
-		outgoing:                options.Outgoing,
-		connections:             newStore[Transport](),
-		channel:                 make(chan internalEvent, 128),
-		middleware:              options.Middleware,
-		leave:                   options.Leave,
-		leaveMiddlewares:        options.LeaveMiddlewares,
-		onDestroy:               options.OnDestroy,
-		pubsub:                  options.PubSub,
-		hooks:                   options.Hooks,
-		nodeID:                  uuid.NewString(),
-		ctx:                     channelCtx,
-		cancel:                  cancel,
-		syncCoordinators:        make(map[string]*syncCoordinator),
-		assignsSyncCoordinators: make(map[string]*syncCoordinator),
-		userGetCoordinators:     make(map[string]chan *User),
-		internalQueueTimeout:    options.InternalQueueTimeout,
-		dispatchSem:             make(chan struct{}, 32),
+		name:                 options.Name,
+		namespace:            namespace,
+		store:                newStore[map[string]interface{}](),
+		outgoing:             options.Outgoing,
+		connections:          newStore[Transport](),
+		channel:              make(chan internalEvent, 128),
+		middleware:           options.Middleware,
+		leave:                options.Leave,
+		leaveMiddlewares:     options.LeaveMiddlewares,
+		onDestroy:            options.OnDestroy,
+		pubsub:               options.PubSub,
+		hooks:                options.Hooks,
+		nodeID:               uuid.NewString(),
+		ctx:                  channelCtx,
+		cancel:               cancel,
+		userGetCoordinators:  make(map[string]chan *User),
+		remoteAssigns:        make(map[string]map[string]interface{}),
+		nodeUsers:            make(map[string]map[string]struct{}),
+		nodeLastSeen:         make(map[string]int64),
+		heartbeatInterval:    30 * time.Second,
+		heartbeatTimeout:     90 * time.Second,
+		internalQueueTimeout: options.InternalQueueTimeout,
+		dispatchSem:          make(chan struct{}, 32),
 	}
 	c.presence = newPresence(&c)
 
 	c.handleMessageEvents()
 
 	return &c
+}
+
+func (c *Channel) cleanEndpoint() string {
+	ep := c.endpointPath
+	if len(ep) > 0 && ep[0] == '/' {
+		return ep[1:]
+	}
+	return ep
+}
+
+func (c *Channel) channelTopic() string {
+	return formatTopicNS(c.namespace, c.cleanEndpoint(), c.name)
+}
+
+func (c *Channel) heartbeatTopic() string {
+	return formatHeartbeatTopic(c.namespace)
 }
 
 func (c *Channel) Name() string {
@@ -126,6 +144,8 @@ func (c *Channel) removeUserLocal(user *User, userID, reason string) error {
 	if combinedErr != nil {
 		return wrapF(combinedErr, "failed to fully remove user %s resources", userID)
 	}
+
+	c.publishUserLeft(userID)
 
 	if c.leave != nil && user != nil {
 		go func(u User, channelName string, leaveReason string) {
@@ -252,39 +272,21 @@ func (c *Channel) GetAssigns() map[string]map[string]interface{} {
 		return nil
 	}
 
+	result := c.getLocalAssigns()
+
 	if c.pubsub == nil || c.endpointPath == "" {
-		return c.getLocalAssigns()
-	}
-
-	requestID := c.requestAssignsSync("system")
-	if requestID == "" {
-		return c.getLocalAssigns()
-	}
-
-	coordinator := c.getAssignsSyncCoordinator(requestID)
-	if coordinator == nil {
-		return c.getLocalAssigns()
-	}
-
-	select {
-	case aggregated := <-coordinator.completeChan:
-		c.removeAssignsSyncCoordinator(requestID)
-		result := c.getLocalAssigns()
-		for userID, assigns := range aggregated {
-			if assignsMap, ok := assigns.(map[string]interface{}); ok {
-				if _, existsLocally := result[userID]; !existsLocally {
-					result[userID] = copyStringInterfaceMap(assignsMap)
-				}
-			}
-		}
 		return result
-	case <-time.After(500 * time.Millisecond):
-		c.removeAssignsSyncCoordinator(requestID)
-		return c.getLocalAssigns()
-	case <-c.ctx.Done():
-		c.removeAssignsSyncCoordinator(requestID)
-		return nil
 	}
+
+	c.distMutex.RLock()
+	for userID, remote := range c.remoteAssigns {
+		if _, existsLocally := result[userID]; !existsLocally {
+			result[userID] = copyStringInterfaceMap(remote)
+		}
+	}
+	c.distMutex.RUnlock()
+
+	return result
 }
 
 func (c *Channel) getLocalAssigns() map[string]map[string]interface{} {
@@ -320,61 +322,7 @@ func (c *Channel) GetPresence() map[string]interface{} {
 		return nil
 	}
 
-	if c.pubsub == nil || c.endpointPath == "" {
-		return c.presence.GetAll()
-	}
-
-	requestID := uuid.NewString()
-	coordinator := c.addSyncCoordinator(requestID, "system")
-
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-
-	payload := presencePayload{
-		Event:     syncRequest,
-		RequestID: requestID,
-	}
-	evt := Event{
-		Action:      presence,
-		ChannelName: c.name,
-		RequestId:   requestID,
-		Payload:     payload,
-		Event:       string(syncRequest),
-		NodeID:      c.nodeID,
-	}
-	topic := formatTopic(cleanEndpoint, c.name, string(syncRequest))
-
-	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
-	if err != nil {
-		c.removeSyncCoordinator(requestID)
-		return c.presence.GetAll()
-	}
-
-	go func() {
-		if err := c.pubsub.Publish(topic, data); err != nil {
-			c.reportError("pubsub_publish", err)
-		}
-	}()
-
-	select {
-	case aggregated := <-coordinator.completeChan:
-		c.removeSyncCoordinator(requestID)
-		result := c.presence.GetAll()
-		for userID, presenceData := range aggregated {
-			if _, existsLocally := result[userID]; !existsLocally {
-				result[userID] = presenceData
-			}
-		}
-		return result
-	case <-time.After(500 * time.Millisecond):
-		c.removeSyncCoordinator(requestID)
-		return c.presence.GetAll()
-	case <-c.ctx.Done():
-		c.removeSyncCoordinator(requestID)
-		return nil
-	}
+	return c.presence.GetAll()
 }
 
 // Track starts tracking presence for a user with the provided presence data.
@@ -556,30 +504,11 @@ func (c *Channel) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	c.syncCoordinatorMutex.Lock()
-
-	for requestID := range c.syncCoordinators {
-		delete(c.syncCoordinators, requestID)
-	}
-	c.syncCoordinatorMutex.Unlock()
-
-	c.assignsSyncCoordinatorMutex.Lock()
-
-	for requestID := range c.assignsSyncCoordinators {
-		delete(c.assignsSyncCoordinators, requestID)
-	}
-	c.assignsSyncCoordinatorMutex.Unlock()
-
 	if c.pubsub != nil && c.endpointPath != "" {
-		cleanEndpoint := c.endpointPath
-		if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-			cleanEndpoint = cleanEndpoint[1:]
-		}
-		pattern := formatTopic(cleanEndpoint, c.name, "")
-
-		if err := c.pubsub.Unsubscribe(pattern); err != nil {
+		if err := c.pubsub.Unsubscribe(c.channelTopic()); err != nil {
 			errs = append(errs, err)
 		}
+		_ = c.pubsub.Unsubscribe(c.heartbeatTopic())
 	}
 
 	return combine(errs...)
@@ -613,7 +542,38 @@ func (c *Channel) addUser(user Transport) error {
 	}
 	user.OnClose(c.onConnectionClose)
 
+	c.publishUserJoined(user.GetID(), assignsToAdd)
+
 	return nil
+}
+
+func (c *Channel) publishUserJoined(userID string, assigns map[string]interface{}) {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+	if assigns == nil {
+		assigns = map[string]interface{}{}
+	}
+	data, err := encodeUserJoined(c.cleanEndpoint(), c.name, c.nodeID, userID, map[string]interface{}{}, assigns)
+	if err != nil {
+		return
+	}
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
+}
+
+func (c *Channel) publishUserLeft(userID string) {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+	data, err := encodeUserLeft(c.cleanEndpoint(), c.name, c.nodeID, userID)
+	if err != nil {
+		return
+	}
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
 }
 
 func (c *Channel) broadcast(senderUserID string, event *Event) error {
@@ -677,7 +637,7 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 			cleanEndpoint = cleanEndpoint[1:]
 		}
 
-		topic := formatTopic(cleanEndpoint, c.name, event.Event)
+		topic := formatTopicNS(c.namespace, cleanEndpoint, c.name)
 
 		eventForPubSub := event
 		eventForPubSub.NodeID = c.nodeID
@@ -933,133 +893,396 @@ func (c *Channel) subscribeToPubSub() {
 	if c.pubsub == nil || c.endpointPath == "" {
 		return
 	}
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-	pattern := formatTopic(cleanEndpoint, c.name, "")
 
-	err := c.pubsub.Subscribe(pattern, func(topic string, data []byte) {
+	err := c.pubsub.Subscribe(c.channelTopic(), func(topic string, data []byte) {
 		if err := c.checkState(); err != nil {
 			return
 		}
-
-		event, ok := eventFromDistributedBytes(data)
-		if !ok {
-			return
-		}
-
-		if event.NodeID == c.nodeID {
-			return
-		}
-		if event.Action == assigns {
-			c.handleRemoteAssignsEvent(event)
-			return
-		}
-
-		if event.Action == userCommand {
-			c.handleRemoteUserCommand(event)
-			return
-		}
-
-		var recipientIDs *array[string]
-		if event.Action == presence {
-			if event.Event == string(syncResponse) {
-				c.handleSyncResponse(event)
-				return
-			}
-
-			c.handleRemotePresenceEvent(event)
-			c.presence.mutex.RLock()
-			trackedUsers := c.presence.store.Keys()
-			c.presence.mutex.RUnlock()
-			connectedUsers := c.connections.Keys()
-			recipientIDs = trackedUsers.filter(func(userID string) bool {
-				return connectedUsers.some(func(connID string) bool {
-					return connID == userID
-				})
-			})
-		} else {
-			connectedUsers := c.connections.Keys()
-			if len(event.Recipients) > 0 {
-				specifiedIDs := fromSlice(event.Recipients)
-				recipientIDs = connectedUsers.filter(func(connID string) bool {
-					return specifiedIDs.some(func(targetID string) bool {
-						return targetID == connID
-					})
-				})
-			} else if event.Recipient == "ALL_EXCEPT_SENDER" {
-				recipientIDs = connectedUsers.filter(func(connID string) bool {
-					return connID != event.FromUserID
-				})
-			} else {
-				recipientIDs = connectedUsers
-			}
-		}
-		if recipientIDs == nil || recipientIDs.length() == 0 {
-			return
-		}
-		internalEv := internalEvent{
-			Event:      *event,
-			Recipients: recipientIDs,
-		}
-		select {
-		case c.channel <- internalEv:
-		case <-c.ctx.Done():
-		default:
-		}
+		c.handleDistributedMessage(data)
 	})
-
 	if err != nil {
 		c.reportError("pubsub_subscribe", err)
+	}
+
+	hbErr := c.pubsub.Subscribe(c.heartbeatTopic(), func(topic string, data []byte) {
+		if err := c.checkState(); err != nil {
+			return
+		}
+		env, ok := decodeEnvelope(data)
+		if !ok || env.Type != msgNodeHeartbeat {
+			return
+		}
+		nodeID := env.NodeID
+		if nodeID == "" {
+			nodeID = env.SourceNodeID
+		}
+		if nodeID == "" || nodeID == c.nodeID {
+			return
+		}
+		c.recordHeartbeat(nodeID)
+	})
+	if hbErr != nil {
+		c.reportError("pubsub_subscribe", hbErr)
+	}
+
+	c.startHeartbeat()
+	c.requestChannelState()
+}
+
+func (c *Channel) handleDistributedMessage(data []byte) {
+	env, ok := decodeEnvelope(data)
+	if !ok {
+		return
+	}
+	if env.SourceNodeID == c.nodeID {
+		return
+	}
+
+	switch env.Type {
+	case msgStateRequest:
+		go c.handleStateRequest(env)
+		return
+	case msgStateResponse:
+		c.handleStateResponse(env)
+		return
+	case msgUserJoined:
+		c.handleRemoteUserJoined(env)
+		return
+	case msgUserLeft:
+		c.handleRemoteUserLeft(env)
+		return
+	case msgNodeHeartbeat:
+		c.recordHeartbeat(env.NodeID)
+		return
+	}
+
+	event, ok := eventFromEnvelope(env)
+	if !ok {
+		return
+	}
+
+	if event.Action == assigns {
+		c.handleRemoteAssignsEvent(event)
+		return
+	}
+
+	if event.Action == userCommand {
+		c.handleRemoteUserCommand(event)
+		return
+	}
+
+	var recipientIDs *array[string]
+	if event.Action == presence {
+		c.handleRemotePresenceEvent(event)
+		c.presence.mutex.RLock()
+		trackedUsers := c.presence.store.Keys()
+		c.presence.mutex.RUnlock()
+		connectedUsers := c.connections.Keys()
+		recipientIDs = trackedUsers.filter(func(userID string) bool {
+			return connectedUsers.some(func(connID string) bool {
+				return connID == userID
+			})
+		})
+	} else {
+		connectedUsers := c.connections.Keys()
+		if len(event.Recipients) > 0 {
+			specifiedIDs := fromSlice(event.Recipients)
+			recipientIDs = connectedUsers.filter(func(connID string) bool {
+				return specifiedIDs.some(func(targetID string) bool {
+					return targetID == connID
+				})
+			})
+		} else if event.Recipient == "ALL_EXCEPT_SENDER" {
+			recipientIDs = connectedUsers.filter(func(connID string) bool {
+				return connID != event.FromUserID
+			})
+		} else {
+			recipientIDs = connectedUsers
+		}
+	}
+	if recipientIDs == nil || recipientIDs.length() == 0 {
+		return
+	}
+	internalEv := internalEvent{
+		Event:      *event,
+		Recipients: recipientIDs,
+	}
+	select {
+	case c.channel <- internalEv:
+	case <-c.ctx.Done():
+	default:
 	}
 }
 
 func (c *Channel) handleRemotePresenceEvent(event *Event) {
 	payload, ok := event.Payload.(map[string]interface{})
-
 	if !ok {
 		return
 	}
-	eventType, _ := payload["event"].(string)
 	userID, _ := payload["userId"].(string)
-	change := payload["change"]
-	if eventType != string(syncRequest) && userID == "" {
+	if userID == "" {
 		return
 	}
-	switch presenceEventType(eventType) {
-	case join:
-		if change != nil {
-			c.presence.mutex.Lock()
-			_ = c.presence.store.Create(userID, change)
-			c.presence.mutex.Unlock()
-		}
-	case update:
-		if change != nil {
-			c.presence.mutex.Lock()
-			_ = c.presence.store.Update(userID, change)
-			c.presence.mutex.Unlock()
-		}
-	case leave:
+	change := payload["change"]
+
+	if event.Event == string(leave) {
 		c.presence.mutex.Lock()
-
 		_ = c.presence.store.Delete(userID)
-
 		c.presence.mutex.Unlock()
-
-	case syncRequest:
-		go c.handlePresenceSyncRequest(event)
+		c.untrackNodeUser(event.NodeID, userID)
+		return
 	}
+
+	if change != nil {
+		c.presence.mutex.Lock()
+		if _, err := c.presence.store.Read(userID); err == nil {
+			_ = c.presence.store.Update(userID, change)
+		} else {
+			_ = c.presence.store.Create(userID, change)
+		}
+		c.presence.mutex.Unlock()
+	}
+	c.trackNodeUser(event.NodeID, userID)
+}
+
+func (c *Channel) requestChannelState() {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+	data, err := encodeStateRequest(c.cleanEndpoint(), c.name, c.nodeID)
+	if err != nil {
+		return
+	}
+	go func() {
+		if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
+			c.reportError("pubsub_publish", err)
+		}
+	}()
+}
+
+func (c *Channel) localUsersSnapshot() []distributedUser {
+	assignsMap := c.store.List()
+	users := make([]distributedUser, 0, len(assignsMap))
+	for userID, userAssigns := range assignsMap {
+		var presenceData interface{} = map[string]interface{}{}
+		if p, err := c.presence.Get(userID); err == nil && p != nil {
+			presenceData = p
+		}
+		users = append(users, distributedUser{
+			ID:       userID,
+			Assigns:  copyStringInterfaceMap(userAssigns),
+			Presence: presenceData,
+		})
+	}
+	return users
+}
+
+func (c *Channel) handleStateRequest(env *distributedEnvelope) {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+	users := c.localUsersSnapshot()
+	if len(users) == 0 {
+		return
+	}
+	data, err := encodeStateResponse(c.cleanEndpoint(), c.name, c.nodeID, users)
+	if err != nil {
+		return
+	}
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
+}
+
+func (c *Channel) handleStateResponse(env *distributedEnvelope) {
+	for _, user := range env.Users {
+		if user.ID == "" {
+			continue
+		}
+		if _, err := c.store.Read(user.ID); err == nil {
+			continue
+		}
+		if assignsMap, ok := user.Assigns.(map[string]interface{}); ok {
+			c.setRemoteAssigns(user.ID, assignsMap)
+		}
+		if presenceMap, ok := user.Presence.(map[string]interface{}); ok && len(presenceMap) > 0 {
+			c.presence.mutex.Lock()
+			if _, err := c.presence.store.Read(user.ID); err == nil {
+				_ = c.presence.store.Update(user.ID, presenceMap)
+			} else {
+				_ = c.presence.store.Create(user.ID, presenceMap)
+			}
+			c.presence.mutex.Unlock()
+		}
+		c.trackNodeUser(env.SourceNodeID, user.ID)
+	}
+}
+
+func (c *Channel) handleRemoteUserJoined(env *distributedEnvelope) {
+	if env.UserID == "" {
+		return
+	}
+	if _, err := c.store.Read(env.UserID); err == nil {
+		return
+	}
+	if assignsMap, ok := env.Assigns.(map[string]interface{}); ok {
+		c.setRemoteAssigns(env.UserID, assignsMap)
+	} else {
+		c.setRemoteAssigns(env.UserID, map[string]interface{}{})
+	}
+	if presenceMap, ok := env.Presence.(map[string]interface{}); ok && len(presenceMap) > 0 {
+		c.presence.mutex.Lock()
+		if _, err := c.presence.store.Read(env.UserID); err == nil {
+			_ = c.presence.store.Update(env.UserID, presenceMap)
+		} else {
+			_ = c.presence.store.Create(env.UserID, presenceMap)
+		}
+		c.presence.mutex.Unlock()
+	}
+	c.trackNodeUser(env.SourceNodeID, env.UserID)
+}
+
+func (c *Channel) handleRemoteUserLeft(env *distributedEnvelope) {
+	if env.UserID == "" {
+		return
+	}
+	c.removeRemoteAssigns(env.UserID)
+	c.untrackNodeUser(env.SourceNodeID, env.UserID)
+	c.presence.mutex.Lock()
+	_ = c.presence.store.Delete(env.UserID)
+	c.presence.mutex.Unlock()
+}
+
+func (c *Channel) setRemoteAssigns(userID string, assigns map[string]interface{}) {
+	c.distMutex.Lock()
+	c.remoteAssigns[userID] = copyStringInterfaceMap(assigns)
+	c.distMutex.Unlock()
+}
+
+func (c *Channel) removeRemoteAssigns(userID string) {
+	c.distMutex.Lock()
+	delete(c.remoteAssigns, userID)
+	c.distMutex.Unlock()
+}
+
+func (c *Channel) trackNodeUser(nodeID, userID string) {
+	if nodeID == "" || nodeID == c.nodeID {
+		return
+	}
+	c.distMutex.Lock()
+	users := c.nodeUsers[nodeID]
+	if users == nil {
+		users = make(map[string]struct{})
+		c.nodeUsers[nodeID] = users
+	}
+	users[userID] = struct{}{}
+	if _, ok := c.nodeLastSeen[nodeID]; !ok {
+		c.nodeLastSeen[nodeID] = time.Now().UnixMilli()
+	}
+	c.distMutex.Unlock()
+}
+
+func (c *Channel) untrackNodeUser(nodeID, userID string) {
+	if nodeID == "" {
+		return
+	}
+	c.distMutex.Lock()
+	if users := c.nodeUsers[nodeID]; users != nil {
+		delete(users, userID)
+		if len(users) == 0 {
+			delete(c.nodeUsers, nodeID)
+		}
+	}
+	c.distMutex.Unlock()
+}
+
+func (c *Channel) recordHeartbeat(nodeID string) {
+	if nodeID == "" || nodeID == c.nodeID {
+		return
+	}
+	c.distMutex.Lock()
+	c.nodeLastSeen[nodeID] = time.Now().UnixMilli()
+	c.distMutex.Unlock()
+}
+
+func (c *Channel) startHeartbeat() {
+	c.publishHeartbeat()
+	go func() {
+		ticker := time.NewTicker(c.heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-ticker.C:
+				c.publishHeartbeat()
+			}
+		}
+	}()
+	go func() {
+		ticker := time.NewTicker(c.heartbeatTimeout)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-ticker.C:
+				c.cleanupStaleNodes()
+			}
+		}
+	}()
+}
+
+func (c *Channel) publishHeartbeat() {
+	if c.pubsub == nil || c.endpointPath == "" {
+		return
+	}
+	if err := c.checkState(); err != nil {
+		return
+	}
+	data, err := encodeHeartbeat("__heartbeat__", "__heartbeat__", c.nodeID)
+	if err != nil {
+		return
+	}
+	if err := c.pubsub.Publish(c.heartbeatTopic(), data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
+}
+
+func (c *Channel) cleanupStaleNodes() {
+	now := time.Now().UnixMilli()
+	timeout := c.heartbeatTimeout.Milliseconds()
+
+	c.distMutex.Lock()
+	staleUsers := make([]string, 0)
+	for nodeID, lastSeen := range c.nodeLastSeen {
+		if now-lastSeen < timeout {
+			continue
+		}
+		if users := c.nodeUsers[nodeID]; users != nil {
+			for userID := range users {
+				staleUsers = append(staleUsers, userID)
+				delete(c.remoteAssigns, userID)
+			}
+			delete(c.nodeUsers, nodeID)
+		}
+		delete(c.nodeLastSeen, nodeID)
+	}
+	c.distMutex.Unlock()
+
+	if len(staleUsers) == 0 {
+		return
+	}
+	c.presence.mutex.Lock()
+	for _, userID := range staleUsers {
+		_ = c.presence.store.Delete(userID)
+	}
+	c.presence.mutex.Unlock()
 }
 
 func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interface{}) {
 	if err := c.checkState(); err != nil {
 		return
-	}
-
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
 	}
 
 	assignsPayload := map[string]interface{}{
@@ -1085,14 +1308,13 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 		Payload:     assignsPayload,
 		NodeID:      c.nodeID,
 	}
-	topic := formatTopic(cleanEndpoint, c.name, "assigns:update")
 
-	data, err := distributedBytesFromEvent(cleanEndpoint, event, "CHANNEL", "ALL_USERS")
+	data, err := distributedBytesFromEvent(c.cleanEndpoint(), event, "CHANNEL", "ALL_USERS")
 
 	if err != nil {
 		return
 	}
-	if err := c.pubsub.Publish(topic, data); err != nil {
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
 		c.reportError("pubsub_publish", err)
 	}
 }
@@ -1100,11 +1322,6 @@ func (c *Channel) broadcastAssignsUpdate(userID string, key string, value interf
 func (c *Channel) publishUserCommand(commandType userCommandType, userID string, reason string) error {
 	if c.pubsub == nil || c.endpointPath == "" {
 		return notFound(c.name, "PubSub not configured for remote user command")
-	}
-
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
 	}
 
 	payload := map[string]interface{}{
@@ -1121,14 +1338,12 @@ func (c *Channel) publishUserCommand(commandType userCommandType, userID string,
 		NodeID:      c.nodeID,
 	}
 
-	topic := formatTopic(cleanEndpoint, c.name, string(commandType))
-
-	data, err := distributedBytesFromEvent(cleanEndpoint, event, "CHANNEL", "ALL_USERS")
+	data, err := distributedBytesFromEvent(c.cleanEndpoint(), event, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		return wrapF(err, "failed to marshal user command event")
 	}
 
-	if err := c.pubsub.Publish(topic, data); err != nil {
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
 		c.reportError("pubsub_publish", err)
 		return wrapF(err, "failed to publish user command")
 	}
@@ -1185,14 +1400,6 @@ func (c *Channel) handleRemoteUserCommand(event *Event) {
 }
 
 func (c *Channel) handleRemoteAssignsEvent(event *Event) {
-	if event.Event == string(assignsSyncRequest) {
-		go c.handleAssignsSyncRequest(event)
-		return
-	}
-	if event.Event == string(assignsSyncResponse) {
-		c.handleAssignsSyncResponse(event)
-		return
-	}
 	payload, ok := event.Payload.(map[string]interface{})
 	if !ok {
 		return
@@ -1212,466 +1419,51 @@ func (c *Channel) handleRemoteAssignsEvent(event *Event) {
 	if userID == "" {
 		return
 	}
-	assigns, err := c.store.Read(userID)
-	if err != nil {
+
+	remote, ok := payload["assigns"].(map[string]interface{})
+	if !ok {
+		remote, _ = payload["Assigns"].(map[string]interface{})
+	}
+
+	if existing, err := c.store.Read(userID); err == nil {
+		assignsCopy := make(map[string]interface{})
+		for k, v := range existing {
+			assignsCopy[k] = v
+		}
+		if remote != nil {
+			for k, v := range remote {
+				assignsCopy[k] = v
+			}
+		} else if key != "" {
+			assignsCopy[key] = value
+		}
+		_ = c.store.Update(userID, assignsCopy)
 		return
 	}
 
-	assignsCopy := make(map[string]interface{})
-	for k, v := range assigns {
+	c.distMutex.Lock()
+	current := c.remoteAssigns[userID]
+	if current == nil {
+		current = make(map[string]interface{})
+	}
+	assignsCopy := make(map[string]interface{}, len(current))
+	for k, v := range current {
 		assignsCopy[k] = v
 	}
-	if remoteAssigns, ok := payload["assigns"].(map[string]interface{}); ok {
-		for k, v := range remoteAssigns {
-			assignsCopy[k] = v
-		}
-	} else if remoteAssigns, ok := payload["Assigns"].(map[string]interface{}); ok {
-		for k, v := range remoteAssigns {
+	if remote != nil {
+		for k, v := range remote {
 			assignsCopy[k] = v
 		}
 	} else if key != "" {
 		assignsCopy[key] = value
 	}
-	_ = c.store.Update(userID, assignsCopy)
-}
-
-func newSyncCoordinator(requestID, requesterUserID string, timeout time.Duration) *syncCoordinator {
-	return &syncCoordinator{
-		requestID:       requestID,
-		requesterUserID: requesterUserID,
-		responses:       make(map[string]map[string]interface{}),
-		timeout:         timeout,
-		completeChan:    make(chan map[string]interface{}, 1),
-		completed:       false,
-	}
-}
-
-func (c *Channel) addSyncCoordinator(requestID, requesterUserID string) *syncCoordinator {
-	c.syncCoordinatorMutex.Lock()
-	defer c.syncCoordinatorMutex.Unlock()
-	coordinator := newSyncCoordinator(requestID, requesterUserID, 500*time.Millisecond)
-
-	c.syncCoordinators[requestID] = coordinator
-	go c.handleSyncTimeout(coordinator)
-
-	return coordinator
-}
-
-func (c *Channel) getSyncCoordinator(requestID string) *syncCoordinator {
-	c.syncCoordinatorMutex.RLock()
-	defer c.syncCoordinatorMutex.RUnlock()
-	return c.syncCoordinators[requestID]
-}
-
-func (c *Channel) removeSyncCoordinator(requestID string) {
-	c.syncCoordinatorMutex.Lock()
-	defer c.syncCoordinatorMutex.Unlock()
-	delete(c.syncCoordinators, requestID)
-}
-
-func (c *Channel) addAssignsSyncCoordinator(requestID, requesterUserID string) *syncCoordinator {
-	c.assignsSyncCoordinatorMutex.Lock()
-	defer c.assignsSyncCoordinatorMutex.Unlock()
-	coordinator := newSyncCoordinator(requestID, requesterUserID, 500*time.Millisecond)
-
-	c.assignsSyncCoordinators[requestID] = coordinator
-	go c.handleAssignsSyncTimeout(coordinator)
-
-	return coordinator
-}
-
-func (c *Channel) getAssignsSyncCoordinator(requestID string) *syncCoordinator {
-	c.assignsSyncCoordinatorMutex.RLock()
-	defer c.assignsSyncCoordinatorMutex.RUnlock()
-	return c.assignsSyncCoordinators[requestID]
-}
-
-func (c *Channel) removeAssignsSyncCoordinator(requestID string) {
-	c.assignsSyncCoordinatorMutex.Lock()
-	defer c.assignsSyncCoordinatorMutex.Unlock()
-	delete(c.assignsSyncCoordinators, requestID)
-}
-
-func (c *syncCoordinator) addResponse(nodeID string, presenceData map[string]interface{}) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	if c.completed {
-		return
-	}
-	c.responses[nodeID] = presenceData
-}
-
-func (c *syncCoordinator) aggregateResponses() map[string]interface{} {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-	merged := make(map[string]interface{})
-
-	for _, presenceData := range c.responses {
-		for userID, userData := range presenceData {
-			merged[userID] = userData
-		}
-	}
-	return merged
-}
-
-func (c *syncCoordinator) complete() map[string]interface{} {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	if c.completed {
-		return nil
-	}
-	c.completed = true
-
-	merged := make(map[string]interface{})
-	for _, presenceData := range c.responses {
-		for userID, userData := range presenceData {
-			merged[userID] = userData
-		}
-	}
-
-	select {
-	case c.completeChan <- merged:
-	default:
-	}
-	return merged
-}
-
-func (c *Channel) handleSyncTimeout(coordinator *syncCoordinator) {
-	select {
-	case <-time.After(coordinator.timeout):
-		aggregated := coordinator.complete()
-
-		if aggregated != nil {
-			c.sendSyncComplete(coordinator.requestID, coordinator.requesterUserID, aggregated)
-		}
-		c.removeSyncCoordinator(coordinator.requestID)
-
-	case <-c.ctx.Done():
-		c.removeSyncCoordinator(coordinator.requestID)
-	}
-}
-
-func (c *Channel) handleAssignsSyncTimeout(coordinator *syncCoordinator) {
-	select {
-	case <-time.After(coordinator.timeout):
-		aggregated := coordinator.complete()
-
-		if aggregated != nil {
-			c.sendAssignsSyncComplete(coordinator.requestID, coordinator.requesterUserID, aggregated)
-		}
-		c.removeAssignsSyncCoordinator(coordinator.requestID)
-
-	case <-c.ctx.Done():
-		c.removeAssignsSyncCoordinator(coordinator.requestID)
-	}
-}
-
-func (c *Channel) requestAssignsSync(requesterUserID string) string {
-	if c.pubsub == nil || c.endpointPath == "" {
-		return ""
-	}
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-	requestID := uuid.NewString()
-
-	c.addAssignsSyncCoordinator(requestID, requesterUserID)
-
-	payload := assignsPayload{
-		Event:     assignsSyncRequest,
-		RequestID: requestID,
-	}
-	evt := Event{
-		Action:      assigns,
-		ChannelName: c.name,
-		RequestId:   requestID,
-		Payload:     payload,
-		Event:       string(assignsSyncRequest),
-		NodeID:      c.nodeID,
-	}
-	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncRequest))
-
-	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
-	if err != nil {
-		c.removeAssignsSyncCoordinator(requestID)
-		return ""
-	}
-
-	go func() {
-		if err := c.pubsub.Publish(topic, data); err != nil {
-			c.reportError("pubsub_publish", err)
-		}
-	}()
-
-	return requestID
-}
-
-func (c *Channel) handlePresenceSyncRequest(requestEvent *Event) {
-	if c.pubsub == nil || c.endpointPath == "" {
-		return
-	}
-	payload, ok := requestEvent.Payload.(map[string]interface{})
-
-	if !ok {
-		return
-	}
-	requestID, _ := payload["requestId"].(string)
-
-	if requestID == "" {
-		return
-	}
-	presenceData := c.presence.GetAll()
-
-	presenceSlice := make([]interface{}, 0, len(presenceData))
-
-	for userID, userData := range presenceData {
-		presenceSlice = append(presenceSlice, map[string]interface{}{
-			"userId": userID,
-			"data":   userData,
-		})
-	}
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-	responsePayload := presencePayload{
-		Event:     syncResponse,
-		NodeID:    c.nodeID,
-		RequestID: requestID,
-		Presence:  presenceSlice,
-	}
-	evt := Event{
-		Action:      presence,
-		ChannelName: c.name,
-		RequestId:   uuid.NewString(),
-		Payload:     responsePayload,
-		Event:       string(syncResponse),
-		NodeID:      c.nodeID,
-	}
-	topic := formatTopic(cleanEndpoint, c.name, string(syncResponse))
-
-	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
-
-	if err != nil {
-		return
-	}
-	if err := c.pubsub.Publish(topic, data); err != nil {
-		c.reportError("pubsub_publish", err)
-	}
-}
-
-func (c *Channel) handleSyncResponse(event *Event) {
-	payload, ok := event.Payload.(map[string]interface{})
-
-	if !ok {
-		return
-	}
-	requestID, _ := payload["requestId"].(string)
-
-	nodeID, _ := payload["nodeId"].(string)
-
-	presenceData, _ := payload["presence"].([]interface{})
-
-	if requestID == "" || nodeID == "" {
-		return
-	}
-	coordinator := c.getSyncCoordinator(requestID)
-
-	if coordinator == nil {
-		return
-	}
-	nodePresence := make(map[string]interface{})
-
-	for _, item := range presenceData {
-		if itemMap, ok := item.(map[string]interface{}); ok {
-			if userID, exists := itemMap["userId"].(string); exists {
-				nodePresence[userID] = itemMap["data"]
-			}
-		}
-	}
-	coordinator.addResponse(nodeID, nodePresence)
-}
-
-func (c *Channel) sendSyncComplete(requestID, requesterUserID string, aggregatedPresence map[string]interface{}) {
-	if c.pubsub == nil || c.endpointPath == "" {
-		return
-	}
-	presenceSlice := make([]interface{}, 0, len(aggregatedPresence))
-
-	for userID, userData := range aggregatedPresence {
-		presenceSlice = append(presenceSlice, map[string]interface{}{
-			"userId": userID,
-			"data":   userData,
-		})
-	}
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-	completePayload := presencePayload{
-		Event:     syncComplete,
-		RequestID: requestID,
-		Presence:  presenceSlice,
-	}
-	evt := Event{
-		Action:      presence,
-		ChannelName: c.name,
-		RequestId:   uuid.NewString(),
-		Payload:     completePayload,
-		Event:       string(syncComplete),
-		NodeID:      c.nodeID,
-	}
-	recipientIDs := fromSlice([]string{requesterUserID})
-
-	internalEv := internalEvent{
-		Event:      evt,
-		Recipients: recipientIDs,
-	}
-	select {
-	case c.channel <- internalEv:
-	case <-c.ctx.Done():
-	default:
-	}
-}
-
-func (c *Channel) handleAssignsSyncRequest(requestEvent *Event) {
-	if c.pubsub == nil || c.endpointPath == "" {
-		return
-	}
-	payload, ok := requestEvent.Payload.(map[string]interface{})
-	if !ok {
-		return
-	}
-	requestID, _ := payload["requestId"].(string)
-	if requestID == "" {
-		return
-	}
-
-	assignsData := c.getLocalAssigns()
-	assignsSlice := make([]interface{}, 0, len(assignsData))
-
-	for userID, userAssigns := range assignsData {
-		assignsSlice = append(assignsSlice, map[string]interface{}{
-			"userId":  userID,
-			"assigns": userAssigns,
-		})
-	}
-
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-
-	responsePayload := assignsPayload{
-		Event:     assignsSyncResponse,
-		NodeID:    c.nodeID,
-		RequestID: requestID,
-		Assigns:   assignsSlice,
-	}
-
-	evt := Event{
-		Action:      assigns,
-		ChannelName: c.name,
-		RequestId:   uuid.NewString(),
-		Payload:     responsePayload,
-		Event:       string(assignsSyncResponse),
-		NodeID:      c.nodeID,
-	}
-
-	topic := formatTopic(cleanEndpoint, c.name, string(assignsSyncResponse))
-	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
-	if err != nil {
-		return
-	}
-	if err := c.pubsub.Publish(topic, data); err != nil {
-		c.reportError("pubsub_publish", err)
-	}
-}
-
-func (c *Channel) handleAssignsSyncResponse(event *Event) {
-	payload, ok := event.Payload.(map[string]interface{})
-	if !ok {
-		return
-	}
-	requestID, _ := payload["requestId"].(string)
-	nodeID, _ := payload["nodeId"].(string)
-	assignsData, _ := payload["assigns"].([]interface{})
-
-	if requestID == "" || nodeID == "" {
-		return
-	}
-
-	coordinator := c.getAssignsSyncCoordinator(requestID)
-	if coordinator == nil {
-		return
-	}
-
-	nodeAssigns := make(map[string]interface{})
-	for _, item := range assignsData {
-		if itemMap, ok := item.(map[string]interface{}); ok {
-			if userID, exists := itemMap["userId"].(string); exists {
-				nodeAssigns[userID] = itemMap["assigns"]
-			}
-		}
-	}
-	coordinator.addResponse(nodeID, nodeAssigns)
-}
-
-func (c *Channel) sendAssignsSyncComplete(requestID, requesterUserID string, aggregatedAssigns map[string]interface{}) {
-	if c.pubsub == nil || c.endpointPath == "" {
-		return
-	}
-
-	assignsSlice := make([]interface{}, 0, len(aggregatedAssigns))
-	for userID, userAssigns := range aggregatedAssigns {
-		assignsSlice = append(assignsSlice, map[string]interface{}{
-			"userId":  userID,
-			"assigns": userAssigns,
-		})
-	}
-
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-
-	completePayload := assignsPayload{
-		Event:     assignsSyncComplete,
-		RequestID: requestID,
-		Assigns:   assignsSlice,
-	}
-
-	evt := Event{
-		Action:      assigns,
-		ChannelName: c.name,
-		RequestId:   uuid.NewString(),
-		Payload:     completePayload,
-		Event:       string(assignsSyncComplete),
-		NodeID:      c.nodeID,
-	}
-
-	recipientIDs := fromSlice([]string{requesterUserID})
-	internalEv := internalEvent{
-		Event:      evt,
-		Recipients: recipientIDs,
-	}
-
-	select {
-	case c.channel <- internalEv:
-	case <-c.ctx.Done():
-	default:
-	}
+	c.remoteAssigns[userID] = assignsCopy
+	c.distMutex.Unlock()
 }
 
 func (c *Channel) requestRemoteUser(userID string) (*User, error) {
 	if c.pubsub == nil || c.endpointPath == "" {
 		return nil, notFound(c.name, "User not found in channel")
-	}
-
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
 	}
 
 	requestID := uuid.NewString()
@@ -1701,13 +1493,12 @@ func (c *Channel) requestRemoteUser(userID string) (*User, error) {
 		NodeID:      c.nodeID,
 	}
 
-	topic := formatTopic(cleanEndpoint, c.name, string(userGetRequest))
-	data, err := distributedBytesFromEvent(cleanEndpoint, event, "CHANNEL", "ALL_USERS")
+	data, err := distributedBytesFromEvent(c.cleanEndpoint(), event, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		return nil, wrapF(err, "failed to marshal user get request")
 	}
 
-	if err := c.pubsub.Publish(topic, data); err != nil {
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
 		return nil, wrapF(err, "failed to publish user get request")
 	}
 
@@ -1747,11 +1538,6 @@ func (c *Channel) handleUserGetRequest(event *Event, userID string) {
 		return
 	}
 
-	cleanEndpoint := c.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-
 	var presenceData interface{}
 	if user.Presence != nil {
 		presenceData = user.Presence
@@ -1768,19 +1554,18 @@ func (c *Channel) handleUserGetRequest(event *Event, userID string) {
 	responseEvent := Event{
 		Action:      userCommand,
 		ChannelName: c.name,
-		RequestId:   uuid.NewString(),
+		RequestId:   requestID,
 		Event:       string(userGetResponse),
 		Payload:     responsePayload,
 		NodeID:      c.nodeID,
 	}
 
-	topic := formatTopic(cleanEndpoint, c.name, string(userGetResponse))
-	data, err := distributedBytesFromEvent(cleanEndpoint, responseEvent, "CHANNEL", "ALL_USERS")
+	data, err := distributedBytesFromEvent(c.cleanEndpoint(), responseEvent, "CHANNEL", "ALL_USERS")
 	if err != nil {
 		return
 	}
 
-	if err := c.pubsub.Publish(topic, data); err != nil {
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
 		c.reportError("pubsub_publish", err)
 	}
 }

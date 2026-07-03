@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+from typing import TypedDict
 
 import pytest
-from pondsocket_client import Channel, ConnectionState, ResponseTimeoutError
+from pondsocket_client import Channel, ConnectionState, ResponseTimeoutError, typed_channel
 
 from pondsocket_common import (
     BehaviorSubject,
@@ -11,10 +13,14 @@ from pondsocket_common import (
     ClientActions,
     ClientMessage,
     Events,
+    PondEvent,
+    PondSchema,
     PresenceEventTypes,
     PresenceMessage,
     ServerActions,
     ServerMessage,
+    pond_event,
+    pond_schema,
     uuid,
 )
 
@@ -73,6 +79,157 @@ async def test_initial_state_is_idle() -> None:
     channel, _, _ = _make_channel()
     assert channel.channel_state == ChannelState.IDLE
     assert channel.presence == []
+
+
+class TypedChatPayload(TypedDict):
+    text: str
+
+
+class TypedPresence(TypedDict):
+    user: str
+
+
+class TypedAssigns(TypedDict):
+    role: str
+
+
+class TypedJoinParams(TypedDict):
+    token: str
+
+
+async def test_typed_channel_wraps_existing_channel_api() -> None:
+    channel, sent, _ = _make_channel()
+    schema: PondSchema[TypedPresence, TypedAssigns, TypedJoinParams] = pond_schema("chat")
+    chat: PondEvent[TypedChatPayload, TypedChatPayload] = pond_event("chat")
+    typed = typed_channel(channel, schema)
+    received: list[TypedChatPayload] = []
+
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+        )
+    )
+    typed.on(chat, received.append)
+    typed.send(chat, {"text": "hello"})
+    await asyncio.sleep(0)
+    assert sent[-1].event == "chat"
+    assert sent[-1].payload == {"text": "hello"}
+
+    channel.handle_event(_server_msg("/chat/1", "chat", payload={"text": "from server"}))
+    assert received == [{"text": "from server"}]
+
+    channel.handle_event(
+        _presence_msg(
+            "/chat/1",
+            PresenceEventTypes.JOIN,
+            presence=[{"user": "alice"}],
+            changed={"user": "alice"},
+        )
+    )
+    assert typed.presence == [{"user": "alice"}]
+
+
+@dataclass(frozen=True)
+class ChatDataclass:
+    text: str
+
+
+@dataclass(frozen=True)
+class PresenceDataclass:
+    user: str
+
+
+async def test_typed_channel_encodes_and_decodes_dataclass_payloads() -> None:
+    channel, sent, _ = _make_channel()
+    schema: PondSchema[PresenceDataclass, TypedAssigns, TypedJoinParams] = pond_schema(
+        "chat", PresenceDataclass
+    )
+    chat: PondEvent[ChatDataclass, ChatDataclass] = pond_event(
+        "chat", ChatDataclass, ChatDataclass
+    )
+    typed = typed_channel(channel, schema)
+    received: list[ChatDataclass] = []
+
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+        )
+    )
+    typed.on(chat, received.append)
+    typed.send(chat, ChatDataclass(text="hello"))
+    await asyncio.sleep(0)
+    assert sent[-1].event == "chat"
+    assert sent[-1].payload == {"text": "hello"}
+
+    channel.handle_event(_server_msg("/chat/1", "chat", payload={"text": "from server"}))
+    assert received == [ChatDataclass(text="from server")]
+    assert isinstance(received[0], ChatDataclass)
+
+    channel.handle_event(
+        _presence_msg(
+            "/chat/1",
+            PresenceEventTypes.JOIN,
+            presence=[{"user": "alice"}],
+            changed={"user": "alice"},
+        )
+    )
+    assert typed.presence == [PresenceDataclass(user="alice")]
+    assert isinstance(typed.presence[0], PresenceDataclass)
+
+
+async def test_typed_channel_exposes_state_and_all_message_surface() -> None:
+    channel, _, _ = _make_channel()
+    schema: PondSchema[TypedPresence, TypedAssigns, TypedJoinParams] = pond_schema("chat")
+    typed = typed_channel(channel, schema)
+
+    states: list[ChannelState] = []
+    typed.on_channel_state_change(states.append)
+    assert states == [ChannelState.IDLE]
+    assert typed.channel_state == ChannelState.IDLE
+
+    typed.join()
+    assert typed.channel_state == ChannelState.JOINING
+    assert states[-1] == ChannelState.JOINING
+
+    channel.handle_event(
+        _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
+    )
+    events: list[str] = []
+    typed.on_message(lambda m: events.append(m.event))
+    channel.handle_event(_server_msg("/chat/1", "chat"))
+    channel.handle_event(_server_msg("/chat/1", "ping"))
+    assert events == ["chat", "ping"]
+
+
+async def test_typed_channel_request_decodes_dataclass_response() -> None:
+    channel, sent, _ = _make_channel()
+    schema: PondSchema[PresenceDataclass, TypedAssigns, TypedJoinParams] = pond_schema(
+        "chat", PresenceDataclass
+    )
+    ping: PondEvent[ChatDataclass, ChatDataclass] = pond_event(
+        "ping", ChatDataclass, ChatDataclass
+    )
+    typed = typed_channel(channel, schema)
+    channel.handle_event(
+        _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
+    )
+
+    async def respond() -> None:
+        await asyncio.sleep(0.01)
+        rid = sent[-1].request_id
+        channel.handle_event(
+            _server_msg("/chat/1", "pong", request_id=rid, payload={"text": "pong"})
+        )
+
+    task = asyncio.create_task(respond())
+    response = await typed.request(ping, ChatDataclass(text="ping"), wait=1.0)
+    await task
+    assert response == ChatDataclass(text="pong")
+    assert isinstance(response, ChatDataclass)
 
 
 async def test_join_when_connected_transitions_to_joining_and_sends() -> None:

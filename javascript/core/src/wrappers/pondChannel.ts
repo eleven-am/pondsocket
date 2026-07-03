@@ -1,36 +1,41 @@
-import { PondMessage, PondPath } from '@eleven-am/pondsocket-common';
+import {
+    AnyPondSchema,
+    EventPayload,
+    EventsOf,
+    PondPath,
+} from '@eleven-am/pondsocket-common';
 
 import { Channel } from './channel';
 import { EventHandler, LeaveCallback, OutgoingEventHandler } from '../abstracts/types';
 import { LobbyEngine } from '../engines/lobbyEngine';
 
 
-export class PondChannel {
+export class PondChannel<Schema extends AnyPondSchema = AnyPondSchema> {
     readonly #lobby: LobbyEngine;
 
     constructor (lobby: LobbyEngine) {
         this.#lobby = lobby;
     }
 
-    public onEvent<Event extends string> (event: PondPath<Event>, handler: EventHandler<Event>): PondChannel {
-        this.#lobby.onEvent(event, handler);
+    public onEvent<Event extends Extract<keyof EventsOf<Schema>, string>> (event: PondPath<Event>, handler: EventHandler<Event, Schema, Event>): PondChannel<Schema> {
+        this.#lobby.onEvent<Schema, Event>(event, handler);
 
         return this;
     }
 
-    public onLeave (callback: LeaveCallback): PondChannel {
+    public onLeave (callback: LeaveCallback): PondChannel<Schema> {
         this.#lobby.onLeave(callback);
 
         return this;
     }
 
-    public handleOutgoingEvent<Event extends string> (event: PondPath<Event>, handler: OutgoingEventHandler<Event>) {
-        this.#lobby.handleOutgoingEvent(event, handler);
+    public handleOutgoingEvent<Event extends Extract<keyof EventsOf<Schema>, string>> (event: PondPath<Event>, handler: OutgoingEventHandler<Event, Schema, Event>) {
+        this.#lobby.handleOutgoingEvent<Schema, Event>(event, handler);
 
         return this;
     }
 
-    public getChannel (channelName: string): Channel | null {
+    public getChannel (channelName: string): Channel<Schema> | null {
         try {
             return this.#getChannel(channelName);
         } catch {
@@ -38,19 +43,19 @@ export class PondChannel {
         }
     }
 
-    public broadcast (channelName: string, event: string, payload: PondMessage): PondChannel {
+    public broadcast<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>): PondChannel<Schema> {
         this.#getChannel(channelName).broadcast(event, payload);
 
         return this;
     }
 
-    public broadcastFrom (channelName: string, userId: string, event: string, payload: PondMessage): PondChannel {
+    public broadcastFrom<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, userId: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>): PondChannel<Schema> {
         this.#getChannel(channelName).broadcastFrom(userId, event, payload);
 
         return this;
     }
 
-    public broadcastTo (channelName: string, userIds: string | string[], event: string, payload: PondMessage): PondChannel {
+    public broadcastTo<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, userIds: string | string[], event: Event, payload: EventPayload<EventsOf<Schema>, Event>): PondChannel<Schema> {
         this.#getChannel(channelName).broadcastTo(userIds, event, payload);
 
         return this;
@@ -59,6 +64,6 @@ export class PondChannel {
     #getChannel (channelName: string) {
         const channel = this.#lobby.getChannel(channelName);
 
-        return new Channel(channel);
+        return new Channel<Schema>(channel);
     }
 }

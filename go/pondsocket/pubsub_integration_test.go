@@ -75,8 +75,18 @@ func TestPubSubIntegration(t *testing.T) {
 			t.Error("Expected message to be published to PubSub")
 		} else {
 			expectedTopic := "pondsocket:v1:default:socket:test:channel"
-			if messagesCopy[0].Topic != expectedTopic {
-				t.Errorf("Expected topic %s, got %s", expectedTopic, messagesCopy[0].Topic)
+			foundBroadcast := false
+			for _, msg := range messagesCopy {
+				if msg.Topic != expectedTopic {
+					continue
+				}
+				if event, ok := eventFromDistributedBytes(msg.Data); ok && event.Event == "test:event" {
+					foundBroadcast = true
+					break
+				}
+			}
+			if !foundBroadcast {
+				t.Errorf("Expected broadcast published to topic %s", expectedTopic)
 			}
 		}
 

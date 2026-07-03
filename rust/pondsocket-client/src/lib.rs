@@ -15,6 +15,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+pub mod typed;
+pub use typed::TypedChannel;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Connecting,
@@ -499,6 +502,8 @@ fn presence_event_name(event: PresenceEventType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pondsocket_common::{PondEvent, PondSchema, PresencePayload};
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn resolves_http_url_to_ws_with_params() {
@@ -515,5 +520,107 @@ mod tests {
         channel.join().await;
         assert_eq!(channel.state(), ChannelState::Joining);
         assert_eq!(channel.inner.queue.lock().await.len(), 1);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct ChatPayload {
+        text: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct AckPayload {
+        ok: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Presence {
+        user_id: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Assigns {
+        role: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Join {
+        token: String,
+    }
+
+    struct Chat;
+    struct ChatSchema;
+
+    impl PondEvent for Chat {
+        type Payload = ChatPayload;
+        type Response = AckPayload;
+
+        const NAME: &'static str = "chat";
+    }
+
+    impl PondSchema for ChatSchema {
+        type Presence = Presence;
+        type Assigns = Assigns;
+        type JoinParams = Join;
+    }
+
+    #[tokio::test]
+    async fn typed_channel_sends_and_decodes_schema_values() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let params = Join {
+            token: "secret".to_owned(),
+        };
+        let channel = client
+            .create_typed_channel::<ChatSchema>("room", Some(&params))
+            .await
+            .unwrap();
+
+        channel.join().await;
+        channel
+            .send::<Chat>(&ChatPayload {
+                text: "hello".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let queued = channel.raw().inner.queue.lock().await;
+        assert_eq!(queued[0].payload["token"], "secret");
+        assert_eq!(queued[1].event, "chat");
+        assert_eq!(queued[1].payload["text"], "hello");
+        drop(queued);
+
+        let message = ServerMessage {
+            action: ServerAction::Broadcast,
+            event: "chat".to_owned(),
+            channel_name: "room".to_owned(),
+            request_id: "r1".to_owned(),
+            payload: serde_json::from_value(serde_json::json!({ "text": "from server" })).unwrap(),
+        };
+        assert_eq!(
+            channel.decode_message::<Chat>(&message).unwrap(),
+            Some(ChatPayload {
+                text: "from server".to_owned()
+            })
+        );
+
+        let presence = PresenceMessage {
+            action: pondsocket_common::PresenceAction::Presence,
+            event: PresenceEventType::Join,
+            channel_name: "room".to_owned(),
+            request_id: "p1".to_owned(),
+            payload: PresencePayload {
+                changed: serde_json::from_value(serde_json::json!({ "user_id": "u1" })).unwrap(),
+                presence: vec![
+                    serde_json::from_value(serde_json::json!({ "user_id": "u1" })).unwrap(),
+                ],
+            },
+        };
+        let (changed, users) = channel.decode_presence(&presence).unwrap();
+        assert_eq!(
+            changed,
+            Presence {
+                user_id: "u1".to_owned()
+            }
+        );
+        assert_eq!(users, vec![changed]);
     }
 }

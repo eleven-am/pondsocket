@@ -4,20 +4,22 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import TypeAlias, TypeVar
 
-from pondsocket_common import ClientActions, IncomingConnection, ServerActions, uuid
+from pondsocket_common import ClientActions, IncomingConnection, PondSchema, ServerActions, uuid
 
 from .channel import Channel
 from .contexts.connection_context import ConnectionContext, ConnectionDecision
 from .contexts.join_context import JoinContext
 from .errors import PondError, forbidden, not_found
+from .heartbeat import HeartbeatCoordinator
 from .lobby import Lobby
 from .middleware import execute_with_middleware
 from .parser import parse
 from .pubsub import PubSub
 from .store import Store
 from .transport import Transport
+from .typed import TypedJoinContext, TypedJoinHandler, TypedLobby, typed_lobby
 from .types import (
     Event,
     LeaveReason,
@@ -35,6 +37,9 @@ JoinHandler: TypeAlias = Callable[[JoinContext], Awaitable[None]]
 JoinMiddlewareFn: TypeAlias = Callable[
     [JoinContext, Callable[[], Awaitable[None]]], Awaitable[None]
 ]
+PresenceT = TypeVar("PresenceT")
+AssignsT = TypeVar("AssignsT")
+JoinParamsT = TypeVar("JoinParamsT")
 
 
 @dataclass(slots=True)
@@ -52,6 +57,7 @@ class Endpoint:
         "_connection_handler",
         "_connection_middlewares",
         "_connections",
+        "_heartbeat",
         "_options",
         "_path",
         "_pubsub",
@@ -65,6 +71,7 @@ class Endpoint:
         connection_handler: ConnectionHandler,
         options: Options | None = None,
         pubsub: PubSub | None = None,
+        heartbeat: HeartbeatCoordinator | None = None,
         connection_middlewares: list[ConnectionMiddlewareFn] | None = None,
     ) -> None:
         self._path = path
@@ -72,6 +79,7 @@ class Endpoint:
         self._connection_middlewares = list(connection_middlewares or [])
         self._options = options or Options()
         self._pubsub = pubsub
+        self._heartbeat = heartbeat
         self._connections: Store[Transport] = Store()
         self._channel_registrations: list[_ChannelRegistration] = []
         self._connect_times: dict[str, float] = {}
@@ -95,6 +103,7 @@ class Endpoint:
             endpoint_path=self._path,
             options=self._options,
             pubsub=self._pubsub,
+            heartbeat=self._heartbeat,
         )
         self._channel_registrations.append(
             _ChannelRegistration(
@@ -105,6 +114,18 @@ class Endpoint:
             )
         )
         return lobby
+
+    def create_typed_channel(
+        self,
+        schema: PondSchema[PresenceT, AssignsT, JoinParamsT],
+        pattern: str,
+        handler: TypedJoinHandler[PresenceT, AssignsT, JoinParamsT],
+    ) -> TypedLobby[PresenceT, AssignsT]:
+        async def wrapped(ctx: JoinContext) -> None:
+            await handler(TypedJoinContext(ctx))
+
+        lobby = self.create_channel(pattern, wrapped)
+        return typed_lobby(lobby, schema)
 
     async def request_connection(
         self,

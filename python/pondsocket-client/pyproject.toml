@@ -1,13 +1,13 @@
 [project]
 name = "pondsocket-client"
-version = "0.0.3"
+version = "0.0.5"
 description = "PondSocket Python client — connect to a PondSocket server from Python."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "eleven-am" }]
 dependencies = [
-    "pondsocket-common>=0.0.3,<0.1.0",
+    "pondsocket-common>=0.0.4,<0.1.0",
     "websockets>=13",
 ]
 

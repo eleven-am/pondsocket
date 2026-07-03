@@ -17,7 +17,9 @@ from pondsocket_common import (
 
 from .contexts.leave_context import LeaveContext
 from .contexts.outgoing_context import OutgoingContext
+from .distributed_wire import distributed_bytes, parse_envelope
 from .errors import internal, not_found
+from .heartbeat import HeartbeatCoordinator
 from .middleware import Middleware, execute_with_middleware
 from .presence import PresenceClient
 from .pubsub import PubSub, format_topic
@@ -26,6 +28,7 @@ from .transport import Transport
 from .types import (
     AllExceptSender,
     AllUsers,
+    DistributedMessageType,
     Event,
     InternalActions,
     LeaveReason,
@@ -35,6 +38,17 @@ from .types import (
     SystemEvents,
     ToUsers,
     User,
+)
+
+_LEGACY_DISTRIBUTED_TYPES = frozenset(
+    {
+        DistributedMessageType.USER_MESSAGE.value,
+        DistributedMessageType.PRESENCE_UPDATE.value,
+        DistributedMessageType.PRESENCE_REMOVED.value,
+        DistributedMessageType.ASSIGNS_UPDATE.value,
+        DistributedMessageType.EVICT_USER.value,
+        DistributedMessageType.USER_REMOVE.value,
+    }
 )
 
 LeaveHandler: TypeAlias = Callable[[LeaveContext], Awaitable[None]]
@@ -61,6 +75,7 @@ class ChannelOptions:
     on_destroy: OnDestroy | None = None
     endpoint_path: str = ""
     pubsub: PubSub | None = None
+    heartbeat: HeartbeatCoordinator | None = None
 
 
 class Channel:
@@ -72,15 +87,18 @@ class Channel:
         "_dispatch_semaphore",
         "_dispatch_task",
         "_endpoint_path",
+        "_heartbeat",
         "_leave_handler",
         "_leave_middlewares",
         "_lifecycle_lock",
         "_message_middleware",
+        "_node_users",
         "_on_destroy",
         "_options",
         "_outgoing_middleware",
         "_presence",
         "_pubsub",
+        "_user_get_waiters",
         "name",
         "node_id",
     )
@@ -91,6 +109,7 @@ class Channel:
         self._options = opts.options
         self._endpoint_path = opts.endpoint_path
         self._pubsub = opts.pubsub
+        self._heartbeat = opts.heartbeat
         self._message_middleware: Middleware[MessageEvent, Channel] = (
             opts.message_middleware or Middleware()
         )
@@ -112,6 +131,8 @@ class Channel:
         )
         self._dispatch_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._node_users: dict[str, set[str]] = {}
+        self._user_get_waiters: dict[str, asyncio.Future[User | None]] = {}
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -120,6 +141,8 @@ class Channel:
             self._active = True
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
         await self._subscribe_to_pubsub()
+        await self._start_liveness()
+        await self._request_channel_state()
         self._fire_metric_channel_created()
 
     async def close(self) -> None:
@@ -133,8 +156,28 @@ class Channel:
                     await self._dispatch_task
             self._dispatch_task = None
         await self._unsubscribe_from_pubsub()
+        self._stop_liveness()
+        self._node_users.clear()
+        self._resolve_pending_user_gets()
         self._fire_metric_channel_destroyed()
         await self._fire_on_destroy()
+
+    async def _start_liveness(self) -> None:
+        if self._heartbeat is None or self._pubsub is None or not self._endpoint_path:
+            return
+        self._heartbeat.register(self)
+        await self._heartbeat.start()
+
+    def _stop_liveness(self) -> None:
+        if self._heartbeat is not None:
+            self._heartbeat.unregister(self)
+
+    def _resolve_pending_user_gets(self) -> None:
+        waiters = list(self._user_get_waiters.values())
+        self._user_get_waiters.clear()
+        for fut in waiters:
+            if not fut.done():
+                fut.set_result(None)
 
     async def _fire_on_destroy(self) -> None:
         handler = self._on_destroy
@@ -160,12 +203,21 @@ class Channel:
         if not self._active:
             raise internal(self.name, "Channel is not active")
         user_id = transport.get_id()
+        assigns = dict(transport.clone_assigns())
         await self._connections.create(user_id, transport)
-        await self._assigns.upsert(user_id, dict(transport.clone_assigns()))
+        await self._assigns.upsert(user_id, assigns)
         self._fire_metric_channel_joined(user_id)
+        await self._publish_distributed(
+            DistributedMessageType.USER_JOINED.value,
+            {"userId": user_id, "presence": {}, "assigns": assigns},
+        )
 
     async def remove_user(
-        self, user_id: str, reason: str = LeaveReason.EXPLICIT_LEAVE.value
+        self,
+        user_id: str,
+        reason: str = LeaveReason.EXPLICIT_LEAVE.value,
+        *,
+        skip_distributed: bool = False,
     ) -> None:
         if not await self._connections.discard(user_id):
             await self._publish_user_command("user:remove", user_id, reason)
@@ -179,6 +231,12 @@ class Channel:
         await self._assigns.discard(user_id)
         await self._presence.untrack(user_id)
         self._fire_metric_channel_left(user_id)
+
+        if not skip_distributed:
+            await self._publish_distributed(
+                DistributedMessageType.USER_LEFT.value,
+                {"userId": user_id},
+            )
 
         await self._fire_leave_handler(user, reason)
 
@@ -197,6 +255,9 @@ class Channel:
 
     async def get_user(self, user_id: str) -> User:
         if not await self._connections.has(user_id):
+            remote = await self._request_remote_user(user_id)
+            if remote is not None:
+                return remote
             raise not_found(self.name, f"User {user_id} not in channel")
         assigns = await self._assigns.get(user_id, {}) or {}
         presence: PondPresence | None = None
@@ -220,7 +281,7 @@ class Channel:
             channel_name=self.name,
             request_id=uuid(),
             event="assigns:update",
-            payload={"userId": user_id, "key": key, "value": value, "assigns": dict(current)},
+            payload={"userId": user_id, "assigns": dict(current)},
             node_id=self.node_id,
         )
         await self._publish_event_to_pubsub(ev, "assigns:update")
@@ -254,7 +315,9 @@ class Channel:
             node_id=self.node_id,
         )
         await self._send_direct([user_id], ev)
-        await self.remove_user(user_id, reason=LeaveReason.EVICTED.value)
+        await self.remove_user(
+            user_id, reason=LeaveReason.EVICTED.value, skip_distributed=True
+        )
 
     async def broadcast(self, event_name: str, payload: PondMessage) -> None:
         await self._send_event(
@@ -500,8 +563,17 @@ class Channel:
         ep = self._endpoint_path
         return ep[1:] if ep.startswith("/") else ep
 
+    def _channel_topic(self) -> str:
+        return format_topic(
+            self._clean_endpoint(),
+            self.name,
+            "",
+            namespace=self._options.namespace,
+            prefix=self._options.key_prefix,
+        )
+
     def _pubsub_pattern(self) -> str:
-        return format_topic(self._clean_endpoint(), self.name, ".*")
+        return self._channel_topic()
 
     async def _subscribe_to_pubsub(self) -> None:
         if self._pubsub is None or not self._endpoint_path:
@@ -522,7 +594,7 @@ class Channel:
     async def _publish_event_to_pubsub(self, event: Event, event_subtype: str) -> None:
         if self._pubsub is None or not self._endpoint_path:
             return
-        topic = format_topic(self._clean_endpoint(), self.name, event_subtype)
+        topic = self._channel_topic()
         try:
             await self._pubsub.publish(
                 topic,
@@ -531,16 +603,49 @@ class Channel:
         except Exception:
             return
 
+    async def _publish_distributed(self, msg_type: str, extra: dict[str, Any]) -> None:
+        if self._pubsub is None or not self._endpoint_path:
+            return
+        topic = self._channel_topic()
+        data = distributed_bytes(
+            msg_type, self.node_id, self._clean_endpoint(), self.name, extra
+        )
+        try:
+            await self._pubsub.publish(topic, data)
+        except Exception:
+            return
+
     async def _handle_pubsub_message(self, _topic: str, data: bytes) -> None:
-        event = _distributed_bytes_to_event(data)
-        if event is None:
+        raw = parse_envelope(data)
+        if raw is None:
             return
-        if event.node_id and event.node_id == self.node_id:
+        node_id = raw.get("sourceNodeId")
+        if not isinstance(node_id, str) or node_id == self.node_id:
             return
-        if event.channel_name != self.name:
+        if raw.get("channelName") != self.name:
             return
         if not self._active:
             return
+        msg_type = raw.get("type")
+        if msg_type in _LEGACY_DISTRIBUTED_TYPES:
+            event = _event_from_envelope(raw)
+            if event is not None:
+                await self._dispatch_event(event)
+            return
+        if msg_type == DistributedMessageType.STATE_REQUEST.value:
+            await self._handle_state_request(raw)
+        elif msg_type == DistributedMessageType.STATE_RESPONSE.value:
+            await self._handle_state_response(raw)
+        elif msg_type == DistributedMessageType.USER_JOINED.value:
+            await self._handle_remote_user_joined(raw)
+        elif msg_type == DistributedMessageType.USER_LEFT.value:
+            await self._handle_remote_user_left(raw)
+        elif msg_type == DistributedMessageType.USER_GET_REQUEST.value:
+            await self._handle_user_get_request(raw)
+        elif msg_type == DistributedMessageType.USER_GET_RESPONSE.value:
+            await self._handle_user_get_response(raw)
+
+    async def _dispatch_event(self, event: Event) -> None:
         if event.action == ServerActions.BROADCAST.value:
             recipients = await self._resolve_distributed_recipients(event)
             if recipients:
@@ -581,12 +686,22 @@ class Channel:
             return
         if event.event == PresenceEventTypes.LEAVE.value:
             await self._presence.discard(user_id)
+            if isinstance(event.payload, dict):
+                event.payload["presence"] = await self._presence.values()
             return
         if isinstance(changed, dict):
             presence = {k: v for k, v in changed.items() if k not in {"userId", "id"}}
             if not presence:
                 presence = dict(changed)
+            existed = await self._presence.has(user_id)
             await self._presence.set_remote(user_id, presence)
+            event.event = (
+                PresenceEventTypes.UPDATE.value
+                if existed
+                else PresenceEventTypes.JOIN.value
+            )
+            if isinstance(event.payload, dict):
+                event.payload["presence"] = await self._presence.values()
 
     async def _handle_remote_assigns(self, event: Event) -> None:
         if not isinstance(event.payload, dict):
@@ -634,6 +749,159 @@ class Channel:
             node_id=self.node_id,
         )
         await self._publish_event_to_pubsub(ev, command)
+
+    async def _request_channel_state(self) -> None:
+        if self._pubsub is None or not self._endpoint_path:
+            return
+        await self._publish_distributed(
+            DistributedMessageType.STATE_REQUEST.value,
+            {"fromNode": self.node_id},
+        )
+
+    async def _handle_state_request(self, _raw: dict[str, Any]) -> None:
+        local_ids = await self._connections.keys()
+        if not local_ids:
+            return
+        users: list[dict[str, Any]] = []
+        for uid in local_ids:
+            assigns = await self._assigns.get(uid, {}) or {}
+            presence: PondPresence = {}
+            if await self._presence.has(uid):
+                presence = await self._presence.get(uid)
+            users.append({"id": uid, "assigns": dict(assigns), "presence": presence})
+        await self._publish_distributed(
+            DistributedMessageType.STATE_RESPONSE.value,
+            {"users": users},
+        )
+
+    async def _handle_state_response(self, raw: dict[str, Any]) -> None:
+        users = raw.get("users")
+        if not isinstance(users, list):
+            return
+        node_id = str(raw.get("sourceNodeId") or "")
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            user_id = str(user.get("id") or "")
+            if not user_id or await self._connections.has(user_id):
+                continue
+            assigns = user.get("assigns")
+            await self._assigns.upsert(
+                user_id, dict(assigns) if isinstance(assigns, dict) else {}
+            )
+            self._track_node_user(node_id, user_id)
+            presence = user.get("presence")
+            if isinstance(presence, dict) and presence:
+                await self._presence.set_remote(user_id, dict(presence))
+
+    async def _handle_remote_user_joined(self, raw: dict[str, Any]) -> None:
+        user_id = str(raw.get("userId") or "")
+        if not user_id or await self._connections.has(user_id):
+            return
+        node_id = str(raw.get("sourceNodeId") or "")
+        assigns = raw.get("assigns")
+        await self._assigns.upsert(
+            user_id, dict(assigns) if isinstance(assigns, dict) else {}
+        )
+        self._track_node_user(node_id, user_id)
+        presence = raw.get("presence")
+        if isinstance(presence, dict) and presence:
+            await self._presence.set_remote(user_id, dict(presence))
+
+    async def _handle_remote_user_left(self, raw: dict[str, Any]) -> None:
+        user_id = str(raw.get("userId") or "")
+        if not user_id or await self._connections.has(user_id):
+            return
+        node_id = str(raw.get("sourceNodeId") or "")
+        await self._assigns.discard(user_id)
+        await self._presence.discard(user_id)
+        self._untrack_node_user(node_id, user_id)
+
+    async def _handle_user_get_request(self, raw: dict[str, Any]) -> None:
+        user_id = str(raw.get("userId") or "")
+        request_id = str(raw.get("requestId") or "")
+        if not user_id or not request_id:
+            return
+        if not await self._connections.has(user_id):
+            return
+        assigns = await self._assigns.get(user_id, {}) or {}
+        presence: PondPresence = {}
+        if await self._presence.has(user_id):
+            presence = await self._presence.get(user_id)
+        await self._publish_distributed(
+            DistributedMessageType.USER_GET_RESPONSE.value,
+            {
+                "userId": user_id,
+                "requestId": request_id,
+                "assigns": dict(assigns),
+                "presence": presence,
+            },
+        )
+
+    async def _handle_user_get_response(self, raw: dict[str, Any]) -> None:
+        request_id = str(raw.get("requestId") or "")
+        fut = self._user_get_waiters.get(request_id)
+        if fut is None or fut.done():
+            return
+        assigns = raw.get("assigns")
+        presence = raw.get("presence")
+        user = User(
+            id=str(raw.get("userId") or ""),
+            assigns=dict(assigns) if isinstance(assigns, dict) else {},
+            presence=dict(presence) if isinstance(presence, dict) else None,
+        )
+        fut.set_result(user)
+
+    async def _request_remote_user(self, user_id: str) -> User | None:
+        if self._pubsub is None or not self._endpoint_path:
+            return None
+        request_id = uuid()
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[User | None] = loop.create_future()
+        self._user_get_waiters[request_id] = fut
+        try:
+            await self._publish_distributed(
+                DistributedMessageType.USER_GET_REQUEST.value,
+                {
+                    "userId": user_id,
+                    "requestId": request_id,
+                    "fromNode": self.node_id,
+                },
+            )
+            return await asyncio.wait_for(
+                fut, timeout=self._options.user_get_timeout
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            return None
+        finally:
+            self._user_get_waiters.pop(request_id, None)
+
+    def _track_node_user(self, node_id: str, user_id: str) -> None:
+        if not node_id:
+            return
+        self._node_users.setdefault(node_id, set()).add(user_id)
+        if self._heartbeat is not None:
+            self._heartbeat.note_node(node_id)
+
+    def _untrack_node_user(self, node_id: str, user_id: str) -> None:
+        if not node_id:
+            return
+        users = self._node_users.get(node_id)
+        if users is None:
+            return
+        users.discard(user_id)
+        if not users:
+            self._node_users.pop(node_id, None)
+
+    async def evict_node_users(self, node_id: str) -> None:
+        users = self._node_users.pop(node_id, None)
+        if not users:
+            return
+        for user_id in users:
+            if await self._connections.has(user_id):
+                continue
+            await self._assigns.discard(user_id)
+            await self._presence.discard(user_id)
 
     def _fire_metric_channel_created(self) -> None:
         hooks = self._options.hooks
@@ -741,7 +1009,6 @@ def _event_to_distributed_bytes(event: Event, subtype: str, endpoint: str) -> by
         )
     elif message_type == "PRESENCE_UPDATE":
         payload = event.payload if isinstance(event.payload, dict) else {}
-        envelope["event"] = event.event
         changed = payload.get("changed", {})
         if event.user_id:
             envelope["userId"] = event.user_id
@@ -749,8 +1016,7 @@ def _event_to_distributed_bytes(event: Event, subtype: str, endpoint: str) -> by
             envelope["userId"] = str(changed.get("userId") or changed.get("id") or "")
         else:
             envelope["userId"] = ""
-        envelope["presence"] = payload.get("changed", {})
-        envelope["payload"] = payload
+        envelope["presence"] = changed if isinstance(changed, dict) else {}
     elif message_type == "PRESENCE_REMOVED":
         payload = event.payload if isinstance(event.payload, dict) else {}
         changed = payload.get("changed", {})
@@ -760,36 +1026,28 @@ def _event_to_distributed_bytes(event: Event, subtype: str, endpoint: str) -> by
             envelope["userId"] = str(changed.get("userId") or changed.get("id") or "")
         else:
             envelope["userId"] = ""
-        envelope["payload"] = payload
     elif message_type == "ASSIGNS_UPDATE":
         payload = event.payload if isinstance(event.payload, dict) else {}
         envelope["userId"] = payload.get("userId", "")
-        if "key" in payload:
-            envelope["key"] = payload.get("key")
-        if "value" in payload:
-            envelope["value"] = payload.get("value")
         envelope["assigns"] = payload.get("assigns", {})
-        envelope["payload"] = payload
-    elif message_type in {"EVICT_USER", "USER_REMOVE"}:
+    elif message_type == "EVICT_USER":
         payload = event.payload if isinstance(event.payload, dict) else {}
         envelope["userId"] = payload.get("userId", "")
         envelope["reason"] = payload.get("reason", "")
+    elif message_type == "USER_REMOVE":
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        envelope["userId"] = payload.get("userId", "")
     return json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _distributed_bytes_to_event(data: bytes) -> Event | None:
-    import json
+    raw = parse_envelope(data)
+    if raw is None:
+        return None
+    return _event_from_envelope(raw)
 
-    try:
-        raw = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    if raw.get("protocol") != "pondsocket.distributed":
-        return None
-    if raw.get("version") != 1:
-        return None
+
+def _event_from_envelope(raw: dict[str, Any]) -> Event | None:
     message_type = raw.get("type")
     channel_name = raw.get("channelName")
     node_id = raw.get("sourceNodeId")

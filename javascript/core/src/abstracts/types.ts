@@ -4,10 +4,15 @@ import internal from 'node:stream';
 
 import {
     ChannelEvent,
+    AnyPondSchema,
+    AssignsOf,
     EventParams,
-    JoinParams,
+    EventsOf,
+    JoinParamsOf,
     PondAssigns,
+    PondEventMap,
     PondMessage,
+    PondPresence,
     ServerActions,
     SystemSender,
     Unsubscribe,
@@ -33,13 +38,21 @@ export interface SocketRequest {
     address: string;
 }
 
-export type ConnectionHandler<Path extends string> = (ctx: ConnectionContext<Path>, next: NextFunction) => void | Promise<void>;
+export type EventPayload<EventMap extends PondEventMap, Event extends keyof EventMap> =
+    EventMap[Event] extends [PondMessage, PondMessage] ? EventMap[Event][0] : EventMap[Event];
 
-export type AuthorizationHandler<Path extends string> = (ctx: JoinContext<Path>, next: NextFunction) => void | Promise<void>;
+export type EventResponse<EventMap extends PondEventMap, Event extends keyof EventMap> =
+    EventMap[Event] extends [PondMessage, PondMessage] ? EventMap[Event][1] : PondMessage;
 
-export type EventHandler<Path extends string> = (ctx: EventContext<Path>, next: NextFunction) => void | Promise<void>;
+export type EventKey<Schema extends AnyPondSchema> = Extract<keyof EventsOf<Schema>, string>;
 
-export type OutgoingEventHandler<Event extends string> = (event: OutgoingContext<Event>, next: NextFunction) => PondMessage | Promise<PondMessage> | void | Promise<void>;
+export type ConnectionHandler<Path extends string> = (ctx: ConnectionContext<Path>, next: NextFunction) => unknown | Promise<unknown>;
+
+export type AuthorizationHandler<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> = (ctx: JoinContext<Path, Schema>, next: NextFunction) => unknown | Promise<unknown>;
+
+export type EventHandler<Path extends string, Schema extends AnyPondSchema = AnyPondSchema, Event extends EventKey<Schema> = EventKey<Schema>> = (ctx: EventContext<Path, Schema, Event>, next: NextFunction) => unknown | Promise<unknown>;
+
+export type OutgoingEventHandler<Path extends string, Schema extends AnyPondSchema = AnyPondSchema, Event extends EventKey<Schema> = EventKey<Schema>> = (event: OutgoingContext<Path, Schema, Event>, next: NextFunction) => EventPayload<EventsOf<Schema>, Event> | Promise<EventPayload<EventsOf<Schema>, Event>> | void | Promise<void>;
 
 export interface ConnectionParams {
     head: Buffer;
@@ -62,10 +75,10 @@ export interface ConnectionResponseOptions {
     webSocketServer: WebSocketServer;
 }
 
-export interface JoinRequestOptions<Path extends string> {
+export interface JoinRequestOptions<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> {
     clientId: string;
-    assigns: PondAssigns;
-    joinParams: JoinParams;
+    assigns: AssignsOf<Schema>;
+    joinParams: JoinParamsOf<Schema>;
     params: EventParams<Path>;
 }
 
@@ -87,7 +100,7 @@ export type BroadcastEvent = Omit<InternalChannelEvent, 'action' | 'payload' | '
 }
 
 export interface LeaveEvent {
-    user: UserData;
+    user: UserData<PondPresence, PondAssigns>;
     channel: Channel;
 }
 

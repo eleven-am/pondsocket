@@ -1,12 +1,15 @@
 import {
     ChannelEvent,
     ChannelReceivers,
+    AnyPondSchema,
+    AssignsOf,
     ErrorTypes,
-    JoinParams,
+    EventsOf,
+    JoinParamsOf,
     PondAssigns,
     PondMessage,
     PondObject,
-    PondPresence,
+    PresenceOf,
     ServerActions,
     UserData,
 } from '@eleven-am/pondsocket-common';
@@ -16,35 +19,35 @@ import { JoinRequestOptions, RequestCache } from '../abstracts/types';
 import { ChannelEngine } from '../engines/channelEngine';
 import { HttpError } from '../errors/httpError';
 
-export class JoinContext<Path extends string> extends BaseContext<Path> {
-    readonly #options: JoinRequestOptions<Path>;
+export class JoinContext<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> extends BaseContext<Path, Schema, Extract<keyof EventsOf<Schema>, string>, JoinParamsOf<Schema>> {
+    readonly #options: JoinRequestOptions<Path, Schema>;
 
     readonly #user: RequestCache;
 
-    #newAssigns: PondAssigns;
+    #newAssigns: AssignsOf<Schema>;
 
     #executed: boolean;
 
     #accepted: boolean;
 
-    constructor (options: JoinRequestOptions<Path>, engine: ChannelEngine, user: RequestCache) {
+    constructor (options: JoinRequestOptions<Path, Schema>, engine: ChannelEngine, user: RequestCache) {
         super(engine, options.params, engine.name, options.joinParams, user.clientId);
         this.#options = options;
         this.#user = user;
         this.#executed = false;
         this.#accepted = false;
-        this.#newAssigns = { ...user.assigns };
+        this.#newAssigns = { ...user.assigns } as AssignsOf<Schema>;
     }
 
-    get user (): UserData {
+    get user (): UserData<PresenceOf<Schema>, AssignsOf<Schema>> {
         return {
             id: this.#options.clientId,
             assigns: this.#options.assigns,
-            presence: {},
+            presence: {} as PresenceOf<Schema>,
         };
     }
 
-    get joinParams (): JoinParams {
+    get joinParams (): JoinParamsOf<Schema> {
         return this.#options.joinParams;
     }
 
@@ -52,7 +55,10 @@ export class JoinContext<Path extends string> extends BaseContext<Path> {
         return this.#executed;
     }
 
-    accept (): JoinContext<Path> {
+    accept (assigns?: Partial<AssignsOf<Schema>>): JoinContext<Path, Schema> {
+        if (assigns) {
+            this.assign(assigns);
+        }
         this.#performChecks();
         const onMessage = this.engine.parent.parent.sendMessage.bind(this.engine.parent.parent, this.#user.socket);
 
@@ -70,7 +76,7 @@ export class JoinContext<Path extends string> extends BaseContext<Path> {
         return this;
     }
 
-    decline (message?: string, errorCode?: number): JoinContext<Path> {
+    decline (message?: string, errorCode?: number): JoinContext<Path, Schema> {
         this.#performChecks();
 
         const errorMessage: ChannelEvent = {
@@ -89,7 +95,7 @@ export class JoinContext<Path extends string> extends BaseContext<Path> {
         return this;
     }
 
-    assign (assigns: PondAssigns): JoinContext<Path> {
+    assign (assigns: Partial<AssignsOf<Schema>>): JoinContext<Path, Schema> {
         if (this.#accepted) {
             this.engine.updateAssigns(this.#user.clientId, assigns);
         } else {
@@ -102,7 +108,7 @@ export class JoinContext<Path extends string> extends BaseContext<Path> {
         return this;
     }
 
-    reply (event: string, payload: PondMessage): JoinContext<Path> {
+    reply (event: string, payload: PondMessage): JoinContext<Path, Schema> {
         const message: ChannelEvent = {
             action: ServerActions.SYSTEM,
             channelName: this.engine.name,
@@ -116,7 +122,7 @@ export class JoinContext<Path extends string> extends BaseContext<Path> {
         return this;
     }
 
-    trackPresence (presence: PondPresence): JoinContext<Path> {
+    trackPresence (presence: PresenceOf<Schema>): JoinContext<Path, Schema> {
         this.engine.trackPresence(this.#user.clientId, presence);
 
         return this;

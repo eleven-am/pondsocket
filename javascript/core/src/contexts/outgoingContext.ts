@@ -1,7 +1,10 @@
 import {
     ChannelReceivers,
+    AnyPondSchema,
     Event,
     EventParams,
+    EventPayload,
+    EventsOf,
     PondMessage,
     PondObject,
 } from '@eleven-am/pondsocket-common';
@@ -10,18 +13,22 @@ import { BaseContext } from './baseContext';
 import { ChannelEngine } from '../engines/channelEngine';
 
 
-export class OutgoingContext<Path extends string> extends BaseContext<Path> {
-    #payload: PondMessage;
+export class OutgoingContext<
+    Path extends string,
+    Schema extends AnyPondSchema = AnyPondSchema,
+    EventName extends Extract<keyof EventsOf<Schema>, string> = Extract<keyof EventsOf<Schema>, string>,
+> extends BaseContext<Path, Schema, EventName, EventPayload<EventsOf<Schema>, EventName>> {
+    #payload: EventPayload<EventsOf<Schema>, EventName>;
 
     #isBlocked: boolean;
 
     constructor (event: Event, params: EventParams<Path>, engine: ChannelEngine, userid: string) {
-        super(engine, params, event.event, event.payload, userid);
-        this.#payload = event.payload;
+        super(engine, params, event.event as EventName, event.payload as EventPayload<EventsOf<Schema>, EventName>, userid);
+        this.#payload = event.payload as EventPayload<EventsOf<Schema>, EventName>;
         this.#isBlocked = false;
     }
 
-    get payload (): PondMessage {
+    get payload (): EventPayload<EventsOf<Schema>, EventName> {
         return this.#payload;
     }
 
@@ -46,7 +53,7 @@ export class OutgoingContext<Path extends string> extends BaseContext<Path> {
      * Transforms the outgoing context with a new payload.
      * @param payload - The new payload to set for the context.
      */
-    transform (payload: PondMessage): this {
+    transform (payload: EventPayload<EventsOf<Schema>, EventName>): this {
         this.#payload = payload;
 
         return this;

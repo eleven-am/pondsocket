@@ -1,9 +1,10 @@
 import {
     BehaviorSubject,
+    AnyPondSchema,
     ChannelEvent,
     channelEventSchema,
     Events,
-    JoinParams,
+    JoinParamsOf,
     ServerActions,
     Subject,
     ChannelState,
@@ -99,7 +100,7 @@ export abstract class BaseClient {
 
     public abstract disconnect (): void;
 
-    public createChannel (name: string, params?: JoinParams) {
+    public createChannel<Schema extends AnyPondSchema = AnyPondSchema> (name: string, params?: JoinParamsOf<Schema>) {
         const channel = this.#channels.get(name);
 
         if (channel && channel.channelState !== ChannelState.CLOSED) {
@@ -107,7 +108,7 @@ export abstract class BaseClient {
         }
 
         const publisher = this._createPublisher();
-        const newChannel = new Channel(publisher, this._connectionState, name, params || {});
+        const newChannel = new Channel<Schema>(publisher, this._connectionState, name, params || {} as JoinParamsOf<Schema>);
 
         this.#channels.set(name, newChannel);
 

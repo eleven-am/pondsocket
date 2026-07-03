@@ -73,6 +73,7 @@ type options struct {
 	InternalQueueTimeout time.Duration
 	PubSub               PubSub
 	Hooks                *Hooks
+	Namespace            string
 }
 
 type recipient string
@@ -86,12 +87,6 @@ const (
 	join                 presenceEventType = "presence:join"
 	leave                presenceEventType = "presence:leave"
 	update               presenceEventType = "presence:update"
-	syncRequest          presenceEventType = "presence:sync_request"
-	syncResponse         presenceEventType = "presence:sync_response"
-	syncComplete         presenceEventType = "presence:sync_complete"
-	assignsSyncRequest   assignsEventType  = "assigns:sync_request"
-	assignsSyncResponse  assignsEventType  = "assigns:sync_response"
-	assignsSyncComplete  assignsEventType  = "assigns:sync_complete"
 	userEvictCommand     userCommandType   = "user:evict"
 	userRemoveCommand    userCommandType   = "user:remove"
 	userGetRequest       userCommandType   = "user:get_request"
@@ -202,6 +197,7 @@ type Options struct {
 	MaxConcurrentHandlers int
 	Hooks                 *Hooks
 	PubSub                PubSub
+	Namespace             string
 }
 
 // ServerOptions configures the HTTP server that hosts the WebSocket endpoints.

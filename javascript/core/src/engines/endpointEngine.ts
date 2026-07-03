@@ -1,5 +1,6 @@
 import {
     ChannelEvent,
+    AnyPondSchema,
     ClientActions,
     ClientMessage,
     clientMessageSchema,
@@ -45,14 +46,14 @@ export class EndpointEngine {
     /**
      * Creates a new channel on a specified path
      */
-    createChannel<Path extends string> (path: PondPath<Path>, handler: AuthorizationHandler<Path>) {
+    createChannel<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> (path: PondPath<Path>, handler: AuthorizationHandler<Path, Schema>) {
         const lobbyEngine = new LobbyEngine(this, this.#backend);
 
         this.#middleware.use((user, joinParams, next) => {
             const event = parseAddress(path, user.channelName);
 
             if (event) {
-                const options: JoinRequestOptions<Path> = {
+                const options: JoinRequestOptions<Path, Schema> = {
                     clientId: user.clientId,
                     assigns: user.assigns,
                     params: event,
@@ -60,9 +61,9 @@ export class EndpointEngine {
                 };
 
                 const channel = lobbyEngine.getOrCreateChannel(user.channelName);
-                const context = new JoinContext(options, channel, user);
+                const context = new JoinContext<Path, Schema>(options, channel, user);
 
-                return handler(context, next);
+                return Promise.resolve(handler(context, next)).then(() => undefined);
             }
 
             next();
@@ -70,7 +71,7 @@ export class EndpointEngine {
 
         this.#lobbyEngines.set(path, lobbyEngine);
 
-        return new PondChannel(lobbyEngine);
+        return new PondChannel<Schema>(lobbyEngine);
     }
 
     /**

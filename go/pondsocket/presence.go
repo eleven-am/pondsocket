@@ -25,16 +25,6 @@ type presencePayload struct {
 	RequestID string            `json:"requestId,omitempty"`
 }
 
-type assignsPayload struct {
-	Event     assignsEventType `json:"event"`
-	UserID    string           `json:"userId"`
-	Key       string           `json:"key"`
-	Value     interface{}      `json:"value"`
-	Assigns   []interface{}    `json:"assigns,omitempty"`
-	NodeID    string           `json:"nodeId,omitempty"`
-	RequestID string           `json:"requestId,omitempty"`
-}
-
 func newPresence(channel *Channel) *presenceClient {
 	return &presenceClient{
 		store:   newStore[interface{}](),
@@ -64,7 +54,6 @@ func (p *presenceClient) Track(userID string, presenceData interface{}) error {
 		return trackErr
 	}
 
-	p.requestPresenceSync(userID)
 	return p.publishPresenceEvent(join, userID, presenceData, currentPresenceList)
 }
 
@@ -179,7 +168,7 @@ func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userI
 		if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
 			cleanEndpoint = cleanEndpoint[1:]
 		}
-		topic := formatTopic(cleanEndpoint, p.channel.name, string(eventType))
+		topic := formatTopicNS(p.channel.namespace, cleanEndpoint, p.channel.name)
 
 		data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
 
@@ -215,42 +204,4 @@ func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userI
 		}
 	}
 	return nil
-}
-
-func (p *presenceClient) requestPresenceSync(requesterUserID string) {
-	if p.channel.pubsub == nil || p.channel.endpointPath == "" {
-		return
-	}
-	cleanEndpoint := p.channel.endpointPath
-	if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
-		cleanEndpoint = cleanEndpoint[1:]
-	}
-	requestID := uuid.NewString()
-
-	p.channel.addSyncCoordinator(requestID, requesterUserID)
-
-	payload := presencePayload{
-		Event:     syncRequest,
-		RequestID: requestID,
-	}
-	evt := Event{
-		Action:      presence,
-		ChannelName: p.channel.name,
-		RequestId:   requestID,
-		Payload:     payload,
-		Event:       string(syncRequest),
-		NodeID:      p.channel.nodeID,
-	}
-	topic := formatTopic(cleanEndpoint, p.channel.name, string(syncRequest))
-
-	data, err := distributedBytesFromEvent(cleanEndpoint, evt, "CHANNEL", "ALL_USERS")
-
-	if err != nil {
-		return
-	}
-	go func() {
-		if err := p.channel.pubsub.Publish(topic, data); err != nil {
-			p.channel.reportError("pubsub_publish", err)
-		}
-	}()
 }

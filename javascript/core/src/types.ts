@@ -121,22 +121,21 @@ export interface EvictUser extends DistributedMessage {
 export interface UserRemove extends DistributedMessage {
     type: DistributedMessageType.USER_REMOVE;
     userId: string;
-    reason: string;
 }
 
 export interface UserGetRequest extends DistributedMessage {
     type: DistributedMessageType.USER_GET_REQUEST;
     userId: string;
-    lookupRequestId: string;
+    requestId: string;
+    fromNode: string;
 }
 
 export interface UserGetResponse extends DistributedMessage {
     type: DistributedMessageType.USER_GET_RESPONSE;
-    lookupRequestId: string;
     userId: string;
-    found: boolean;
-    assigns?: PondAssigns;
-    presence?: PondPresence;
+    requestId: string;
+    assigns: PondAssigns;
+    presence: PondPresence;
 }
 
 export interface NodeHeartbeat extends DistributedMessage {

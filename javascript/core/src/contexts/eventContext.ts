@@ -1,10 +1,13 @@
 import {
     ChannelReceivers,
+    AnyPondSchema,
+    AssignsOf,
     EventParams,
-    PondAssigns,
+    EventPayload,
+    EventsOf,
     PondMessage,
     PondObject,
-    PondPresence,
+    PresenceOf,
     ServerActions,
     SystemSender,
 } from '@eleven-am/pondsocket-common';
@@ -13,24 +16,32 @@ import { BaseContext } from './baseContext';
 import { BroadcastEvent } from '../abstracts/types';
 import { ChannelEngine } from '../engines/channelEngine';
 
-export class EventContext<Path extends string> extends BaseContext<Path> {
+export class EventContext<
+    Path extends string,
+    Schema extends AnyPondSchema = AnyPondSchema,
+    EventName extends Extract<keyof EventsOf<Schema>, string> = Extract<keyof EventsOf<Schema>, string>,
+> extends BaseContext<Path, Schema, EventName, EventPayload<EventsOf<Schema>, EventName>> {
     readonly #event: BroadcastEvent;
 
     readonly #requestId: string;
 
     constructor (event: BroadcastEvent, params: EventParams<Path>, engine: ChannelEngine) {
-        super(engine, params, event.event, event.payload, event.sender);
+        super(engine, params, event.event as EventName, event.payload as EventPayload<EventsOf<Schema>, EventName>, event.sender);
         this.#event = event;
         this.#requestId = event.requestId;
     }
 
-    assign (assigns: PondAssigns): EventContext<Path> {
+    get payload (): EventPayload<EventsOf<Schema>, EventName> {
+        return this.#event.payload as EventPayload<EventsOf<Schema>, EventName>;
+    }
+
+    assign (assigns: Partial<AssignsOf<Schema>>): EventContext<Path, Schema, EventName> {
         this.channel.updateAssigns(this.#event.sender, assigns);
 
         return this;
     }
 
-    reply (event: string, payload: PondMessage) {
+    reply<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
         this.engine.sendMessage(
             SystemSender.CHANNEL,
             [this.#event.sender],
@@ -43,25 +54,25 @@ export class EventContext<Path extends string> extends BaseContext<Path> {
         return this;
     }
 
-    trackPresence (presence: PondPresence, userId = this.#event.sender): EventContext<Path> {
+    trackPresence (presence: PresenceOf<Schema>, userId = this.#event.sender): EventContext<Path, Schema, EventName> {
         this.channel.trackPresence(userId, presence);
 
         return this;
     }
 
-    updatePresence (presence: PondPresence, userId = this.#event.sender): EventContext<Path> {
+    updatePresence (presence: Partial<PresenceOf<Schema>>, userId = this.#event.sender): EventContext<Path, Schema, EventName> {
         this.channel.updatePresence(userId, presence);
 
         return this;
     }
 
-    evictUser (reason: string, userId = this.#event.sender): EventContext<Path> {
+    evictUser (reason: string, userId = this.#event.sender): EventContext<Path, Schema, EventName> {
         this.channel.evictUser(userId, reason);
 
         return this;
     }
 
-    removePresence (userId = this.#event.sender): EventContext<Path> {
+    removePresence (userId = this.#event.sender): EventContext<Path, Schema, EventName> {
         this.channel.removePresence(userId);
 
         return this;

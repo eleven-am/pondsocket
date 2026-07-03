@@ -3,24 +3,30 @@ from __future__ import annotations
 import abc
 import asyncio
 from collections.abc import Callable
-from typing import TypeAlias
+from typing import TypeAlias, TypeVar
 
 from pondsocket_common import (
     BehaviorSubject,
     ChannelEvent,
     ClientMessage,
     JoinParams,
+    PondSchema,
     Subject,
     Unsubscribe,
     ValidationError,
     parse_channel_event,
+    to_pond_object,
 )
 
 from ._channel import Channel
+from .typed import TypedChannel, typed_channel
 from .types import ClientOptions, ConnectionState
 
 ConnectionStateHandler: TypeAlias = Callable[[ConnectionState], None]
 ErrorHandler: TypeAlias = Callable[[BaseException], None]
+PresenceT = TypeVar("PresenceT")
+AssignsT = TypeVar("AssignsT")
+JoinParamsT = TypeVar("JoinParamsT")
 
 
 class BaseClient(abc.ABC):
@@ -73,6 +79,15 @@ class BaseClient(abc.ABC):
         )
         self._channels[name] = channel
         return channel
+
+    def create_typed_channel(
+        self,
+        schema: PondSchema[PresenceT, AssignsT, JoinParamsT],
+        name: str,
+        params: JoinParamsT | None = None,
+    ) -> TypedChannel[PresenceT]:
+        channel = self.create_channel(name, to_pond_object(params))
+        return typed_channel(channel, schema)
 
     def on_connection_change(self, callback: ConnectionStateHandler) -> Unsubscribe:
         return self._connection_state.subscribe(callback)

@@ -48,6 +48,7 @@ files = [
     "pondsocket/src",
     "pondsocket-asgi/src",
     "pondsocket-client/src",
+    "type-tests",
 ]
 
 [[tool.mypy.overrides]]

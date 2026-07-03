@@ -1,4 +1,4 @@
-import { PondPath } from '@eleven-am/pondsocket-common';
+import { AnyPondSchema, PondPath } from '@eleven-am/pondsocket-common';
 
 import { AuthorizationHandler } from '../abstracts/types';
 import { EndpointEngine } from '../engines/endpointEngine';
@@ -10,8 +10,8 @@ export class Endpoint {
         this.#engine = engine;
     }
 
-    createChannel<Path extends string> (path: PondPath<Path>, handler: AuthorizationHandler<Path>) {
-        return this.#engine.createChannel(path, handler);
+    createChannel<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> (path: PondPath<Path>, handler: AuthorizationHandler<Path, Schema>) {
+        return this.#engine.createChannel<Path, Schema>(path, handler);
     }
 
     closeConnection (clientIds: string | string[]) {

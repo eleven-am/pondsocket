@@ -102,10 +102,10 @@ pub fn match_topic(pattern: &str, topic: &str) -> bool {
     false
 }
 
-pub fn format_topic(endpoint: &str, channel: &str, _event: &str) -> String {
-    format!("pondsocket:v1:default:{endpoint}:{channel}")
+pub fn format_topic(namespace: &str, endpoint: &str, channel: &str) -> String {
+    format!("pondsocket:v1:{namespace}:{endpoint}:{channel}")
 }
 
-pub fn format_heartbeat_topic() -> String {
-    "pondsocket:v1:default:__heartbeat__".to_owned()
+pub fn format_heartbeat_topic(namespace: &str) -> String {
+    format!("pondsocket:v1:{namespace}:__heartbeat__")
 }

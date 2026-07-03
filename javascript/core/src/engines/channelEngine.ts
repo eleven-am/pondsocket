@@ -32,9 +32,12 @@ import {
     type PresenceUpdate,
     type StateRequest,
     type StateResponse,
+    type UserGetRequest,
+    type UserGetResponse,
     type UserJoined,
     type UserLeft,
     type UserMessage,
+    type UserRemove,
 } from '../types';
 
 function mapToObject<T> (map: Map<string, T>): Record<string, T> {
@@ -69,6 +72,8 @@ export class ChannelEngine {
     #nodeLastSeen: Map<string, number> = new Map();
 
     #nodeUsers: Map<string, Set<string>> = new Map();
+
+    #pendingUserGets: Map<string, { resolve: (data: UserData | null) => void; timer: ReturnType<typeof setTimeout> }> = new Map();
 
     #staleNodeTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -303,6 +308,44 @@ export class ChannelEngine {
         this.removeUser(userId, true);
     }
 
+    requestUserRemoval (userId: string): void {
+        this.#broadcastToNodes({
+            type: DistributedMessageType.USER_REMOVE,
+            endpointName: this.#endpointId,
+            channelName: this.#name,
+            userId,
+        });
+    }
+
+    getUserAcrossNodes (userId: string, timeoutMs = 5_000): Promise<UserData | null> {
+        if (!this.#backend) {
+            return Promise.resolve(null);
+        }
+
+        const requestId = uuid();
+
+        return new Promise<UserData | null>((resolve) => {
+            const timer = setTimeout(() => {
+                this.#pendingUserGets.delete(requestId);
+                resolve(null);
+            }, timeoutMs);
+
+            this.#pendingUserGets.set(requestId, {
+                resolve,
+                timer,
+            });
+
+            this.#broadcastToNodes({
+                type: DistributedMessageType.USER_GET_REQUEST,
+                endpointName: this.#endpointId,
+                channelName: this.#name,
+                userId,
+                requestId,
+                fromNode: this.#nodeId,
+            });
+        });
+    }
+
     getAssigns (): UserAssigns {
         return mapToObject(this.#assignsCache);
     }
@@ -403,6 +446,9 @@ export class ChannelEngine {
             clearInterval(this.#staleNodeTimer);
             this.#staleNodeTimer = null;
         }
+
+        this.#pendingUserGets.forEach((pending) => clearTimeout(pending.timer));
+        this.#pendingUserGets.clear();
 
         this.#nodeLastSeen.clear();
         this.#nodeUsers.clear();
@@ -548,6 +594,15 @@ export class ChannelEngine {
                 break;
             case DistributedMessageType.EVICT_USER:
                 this.#handleRemoteEvictUser(message);
+                break;
+            case DistributedMessageType.USER_REMOVE:
+                this.#handleRemoteUserRemove(message);
+                break;
+            case DistributedMessageType.USER_GET_REQUEST:
+                this.#handleRemoteUserGetRequest(message);
+                break;
+            case DistributedMessageType.USER_GET_RESPONSE:
+                this.#handleRemoteUserGetResponse(message);
                 break;
             case DistributedMessageType.NODE_HEARTBEAT:
                 break;
@@ -711,6 +766,51 @@ export class ChannelEngine {
             unsubscribe();
             this.#userSubscriptions.delete(message.userId);
         }
+    }
+
+    #handleRemoteUserRemove (message: UserRemove): void {
+        if (this.#userSubscriptions.has(message.userId)) {
+            this.removeUser(message.userId);
+
+            return;
+        }
+
+        this.#assignsCache.delete(message.userId);
+        this.#safeRemovePresence(message.userId);
+        this.#untrackNodeUser(message.sourceNodeId, message.userId);
+    }
+
+    #handleRemoteUserGetRequest (message: UserGetRequest): void {
+        if (!this.#userSubscriptions.has(message.userId)) {
+            return;
+        }
+
+        this.#broadcastToNodes({
+            type: DistributedMessageType.USER_GET_RESPONSE,
+            endpointName: this.#endpointId,
+            channelName: this.#name,
+            userId: message.userId,
+            requestId: message.requestId,
+            assigns: this.#assignsCache.get(message.userId) || {},
+            presence: this.#presenceEngine?.getPresence(message.userId) || {},
+        });
+    }
+
+    #handleRemoteUserGetResponse (message: UserGetResponse): void {
+        const pending = this.#pendingUserGets.get(message.requestId);
+
+        if (!pending) {
+            return;
+        }
+
+        clearTimeout(pending.timer);
+        this.#pendingUserGets.delete(message.requestId);
+
+        pending.resolve({
+            id: message.userId,
+            assigns: message.assigns || {},
+            presence: message.presence || {},
+        });
     }
 
     #setupHeartbeatTracking (): void {

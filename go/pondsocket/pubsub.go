@@ -62,9 +62,22 @@ func matchTopic(pattern, topic string) bool {
 	return false
 }
 
+const defaultNamespace = "default"
+
+func formatTopicNS(namespace, endpoint, channel string) string {
+	return fmt.Sprintf("pondsocket:v1:%s:%s:%s", namespace, endpoint, channel)
+}
+
 func formatTopic(endpoint, channel, event string) string {
 	_ = event
-	return fmt.Sprintf("pondsocket:v1:default:%s:%s", endpoint, channel)
+	return formatTopicNS(defaultNamespace, endpoint, channel)
+}
+
+func formatHeartbeatTopic(namespace string) string {
+	if namespace == "" {
+		namespace = defaultNamespace
+	}
+	return fmt.Sprintf("pondsocket:v1:%s:__heartbeat__", namespace)
 }
 
 func formatPresenceTopic(endpoint, channel string) string {
@@ -76,5 +89,5 @@ func formatMessageTopic(endpoint, channel string) string {
 }
 
 func formatSystemTopic(event string) string {
-	return fmt.Sprintf("pondsocket:v1:default:system:%s", event)
+	return fmt.Sprintf("pondsocket:v1:%s:system:%s", defaultNamespace, event)
 }

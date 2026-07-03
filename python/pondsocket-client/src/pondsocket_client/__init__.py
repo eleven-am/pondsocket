@@ -12,6 +12,7 @@ from ._channel import (
 )
 from ._websocket import WebSocketClient
 from .client import PondClient
+from .typed import TypedChannel, typed_channel
 from .types import (
     DEFAULT_BASE_RECONNECT_DELAY,
     DEFAULT_CONNECTION_TIMEOUT,
@@ -24,7 +25,7 @@ from .types import (
     Publisher,
 )
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 __all__ = [
     "DEFAULT_BASE_RECONNECT_DELAY",
@@ -46,7 +47,9 @@ __all__ = [
     "PresenceUpdateHandler",
     "Publisher",
     "ResponseTimeoutError",
+    "TypedChannel",
     "UsersChangeHandler",
     "WebSocketClient",
     "__version__",
+    "typed_channel",
 ]

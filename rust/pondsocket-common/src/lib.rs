@@ -1,3 +1,4 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -6,6 +7,55 @@ pub type PondMessage = Map<String, Value>;
 pub type PondPresence = Map<String, Value>;
 pub type PondAssigns = Map<String, Value>;
 pub type JoinParams = Map<String, Value>;
+
+pub trait PondEvent {
+    type Payload: Serialize + DeserializeOwned + Send + Sync + 'static;
+    type Response: Serialize + DeserializeOwned + Send + Sync + 'static;
+
+    const NAME: &'static str;
+}
+
+pub trait PondSchema {
+    type Presence: Serialize + DeserializeOwned + Send + Sync + 'static;
+    type Assigns: Serialize + DeserializeOwned + Send + Sync + 'static;
+    type JoinParams: Serialize + DeserializeOwned + Send + Sync + 'static;
+}
+
+pub fn to_pond_value<T>(value: &T) -> serde_json::Result<Value>
+where
+    T: Serialize + ?Sized,
+{
+    serde_json::to_value(value)
+}
+
+pub fn to_pond_map<T>(value: &T) -> serde_json::Result<Map<String, Value>>
+where
+    T: Serialize + ?Sized,
+{
+    match serde_json::to_value(value)? {
+        Value::Object(map) => Ok(map),
+        Value::Null => Ok(Map::new()),
+        value => {
+            let mut map = Map::new();
+            map.insert("value".to_owned(), value);
+            Ok(map)
+        }
+    }
+}
+
+pub fn from_pond_value<T>(value: Value) -> serde_json::Result<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(value)
+}
+
+pub fn from_pond_map<T>(value: Map<String, Value>) -> serde_json::Result<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(Value::Object(value))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -206,5 +256,44 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ev, ChannelEvent::Presence(_)));
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Sample {
+        id: String,
+        count: u32,
+    }
+
+    #[test]
+    fn pond_value_round_trips_through_from_pond_value() {
+        let sample = Sample {
+            id: "a".to_owned(),
+            count: 3,
+        };
+        let value = to_pond_value(&sample).unwrap();
+        assert_eq!(from_pond_value::<Sample>(value).unwrap(), sample);
+    }
+
+    #[test]
+    fn pond_map_round_trips_through_from_pond_map() {
+        let sample = Sample {
+            id: "b".to_owned(),
+            count: 7,
+        };
+        let map = to_pond_map(&sample).unwrap();
+        assert_eq!(map["id"], Value::from("b"));
+        assert_eq!(from_pond_map::<Sample>(map).unwrap(), sample);
+    }
+
+    #[test]
+    fn to_pond_map_wraps_scalar_under_value_key() {
+        let map = to_pond_map(&42u32).unwrap();
+        assert_eq!(map["value"], Value::from(42));
+    }
+
+    #[test]
+    fn to_pond_map_maps_null_to_empty_map() {
+        let map = to_pond_map(&Option::<Sample>::None).unwrap();
+        assert!(map.is_empty());
     }
 }

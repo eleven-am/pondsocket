@@ -1,14 +1,14 @@
 [project]
 name = "pondsocket-asgi"
-version = "0.0.3"
+version = "0.0.5"
 description = "Canonical ASGI adapter for PondSocket."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "eleven-am" }]
 dependencies = [
-    "pondsocket>=0.0.3,<0.1.0",
-    "pondsocket-common>=0.0.3,<0.1.0",
+    "pondsocket>=0.0.4,<0.1.0",
+    "pondsocket-common>=0.0.4,<0.1.0",
 ]
 
 [build-system]

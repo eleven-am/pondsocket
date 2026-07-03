@@ -67,6 +67,7 @@ from .presence import PresenceClient
 from .pubsub import (
     PubSub,
     PubSubClosedError,
+    format_heartbeat_topic,
     format_message_topic,
     format_presence_topic,
     format_system_topic,
@@ -78,9 +79,19 @@ from .server import EndpointMatch, PondSocket
 from .sse_transport import SSEServerTransport
 from .store import Store
 from .transport import OnCloseCallback, OnMessageHandler, PushableTransport, Transport
+from .typed import (
+    TypedChannel,
+    TypedEventContext,
+    TypedEventHandler,
+    TypedJoinContext,
+    TypedJoinHandler,
+    TypedLobby,
+    typed_lobby,
+)
 from .types import (
     AllExceptSender,
     AllUsers,
+    DistributedMessageType,
     Event,
     InternalActions,
     LeaveReason,
@@ -122,6 +133,7 @@ __all__ = [
     "ConnectionDecision",
     "ConnectionHandler",
     "ConnectionMiddlewareFn",
+    "DistributedMessageType",
     "Endpoint",
     "EndpointMatch",
     "Event",
@@ -176,6 +188,12 @@ __all__ = [
     "TokenBucketRateLimiter",
     "Transport",
     "TransportType",
+    "TypedChannel",
+    "TypedEventContext",
+    "TypedEventHandler",
+    "TypedJoinContext",
+    "TypedJoinHandler",
+    "TypedLobby",
     "User",
     "UserData",
     "__version__",
@@ -186,6 +204,7 @@ __all__ = [
     "event_to_pubsub_bytes",
     "event_to_wire",
     "forbidden",
+    "format_heartbeat_topic",
     "format_message_topic",
     "format_presence_topic",
     "format_system_topic",
@@ -197,6 +216,7 @@ __all__ = [
     "parse_inbound_text",
     "pubsub_bytes_to_event",
     "too_many_requests",
+    "typed_lobby",
     "unauthorized",
     "uuid",
     "wire_to_event",

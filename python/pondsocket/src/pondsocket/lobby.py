@@ -9,6 +9,7 @@ from .contexts.event_context import EventContext
 from .contexts.leave_context import LeaveContext
 from .contexts.outgoing_context import OutgoingContext
 from .errors import PondError
+from .heartbeat import HeartbeatCoordinator
 from .middleware import Middleware, execute_with_middleware
 from .parser import parse
 from .pubsub import PubSub
@@ -30,6 +31,7 @@ class Lobby:
     __slots__ = (
         "_channels",
         "_endpoint_path",
+        "_heartbeat",
         "_leave_handler",
         "_leave_middlewares",
         "_lock",
@@ -47,11 +49,13 @@ class Lobby:
         endpoint_path: str = "",
         options: Options | None = None,
         pubsub: PubSub | None = None,
+        heartbeat: HeartbeatCoordinator | None = None,
     ) -> None:
         self._path = path
         self._endpoint_path = endpoint_path
         self._options = options or Options()
         self._pubsub = pubsub
+        self._heartbeat = heartbeat
         self._channels: dict[str, Channel] = {}
         self._message_middleware: Middleware[MessageEvent, Channel] = Middleware()
         self._outgoing_middleware: Middleware[OutgoingContext, None] = Middleware()
@@ -168,6 +172,7 @@ class Lobby:
             on_destroy=on_destroy,
             endpoint_path=self._endpoint_path,
             pubsub=self._pubsub,
+            heartbeat=self._heartbeat,
         )
         return Channel(opts)
 

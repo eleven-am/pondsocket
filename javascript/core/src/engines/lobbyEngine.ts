@@ -1,4 +1,4 @@
-import { Event, PondPath } from '@eleven-am/pondsocket-common';
+import { AnyPondSchema, Event, EventsOf, PondPath } from '@eleven-am/pondsocket-common';
 
 import { ChannelEngine } from './channelEngine';
 import { EndpointEngine } from './endpointEngine';
@@ -40,7 +40,7 @@ export class LobbyEngine {
     /**
      * Attaches a handler for a specific event pattern
      */
-    onEvent<Event extends string> (event: PondPath<Event>, handler: EventHandler<Event>) {
+    onEvent<Schema extends AnyPondSchema, Path extends Extract<keyof EventsOf<Schema>, string>> (event: PondPath<Path>, handler: EventHandler<Path, Schema, Path>) {
         this.middleware.use((requestEvent, channel, next) => {
             const params = parseAddress(event, requestEvent.event);
 
@@ -48,16 +48,16 @@ export class LobbyEngine {
                 return next();
             }
 
-            const context = new EventContext(requestEvent, params, channel);
+            const context = new EventContext<Path, Schema, Path>(requestEvent, params, channel);
 
-            return handler(context, next);
+            return Promise.resolve(handler(context, next)).then(() => undefined);
         });
     }
 
     /**
      * Attaches a handler for outgoing events
      */
-    handleOutgoingEvent<Event extends string> (event: PondPath<Event>, handler: OutgoingEventHandler<Event>) {
+    handleOutgoingEvent<Schema extends AnyPondSchema, Path extends Extract<keyof EventsOf<Schema>, string>> (event: PondPath<Path>, handler: OutgoingEventHandler<Path, Schema, Path>) {
         this.outgoing.use(async (context, chEvent, next) => {
             const params = parseAddress(event, chEvent.event);
 
@@ -65,14 +65,16 @@ export class LobbyEngine {
                 return next();
             }
 
-            context.updateParams(params);
-            const payload = await handler(context, next);
+            const typedContext = context as OutgoingContext<Path, Schema, Path>;
+
+            typedContext.updateParams(params);
+            const payload = await handler(typedContext, next);
 
             if (payload === undefined || payload === null) {
                 return;
             }
 
-            context.transform(payload);
+            typedContext.transform(payload);
 
             return next();
         });

@@ -120,9 +120,9 @@ export class PondSocket {
                 webSocketServer: this.#socketServer,
             };
 
-            const context = new ConnectionContext(request, newParams);
+            const context = new ConnectionContext<Path>(request, newParams);
 
-            return handler(context, next);
+            return Promise.resolve(handler(context, next)).then(() => undefined);
         });
 
         return new Endpoint(endpoint);

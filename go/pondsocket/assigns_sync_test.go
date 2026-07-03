@@ -170,7 +170,7 @@ func TestAssignsSync(t *testing.T) {
 				if ok && event.Action == assigns && event.Event == "assigns:update" {
 					payload, ok := event.Payload.(map[string]interface{})
 					assigns, _ := payload["assigns"].(map[string]interface{})
-					if ok && payload["userId"] == "user1" && payload["key"] == "status" && payload["value"] == "online" && assigns["status"] == "online" {
+					if ok && payload["userId"] == "user1" && assigns["status"] == "online" {
 						found = true
 						break
 					}
@@ -231,9 +231,8 @@ func TestAssignsSync(t *testing.T) {
 			RequestId:   "remote-123",
 			Event:       "assigns:update",
 			Payload: map[string]interface{}{
-				"UserID": "user1",
-				"Key":    "status",
-				"Value":  "online",
+				"UserID":  "user1",
+				"assigns": map[string]interface{}{"status": "online"},
 			},
 		}
 

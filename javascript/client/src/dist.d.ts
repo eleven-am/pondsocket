@@ -1,10 +1,12 @@
 import {
     ChannelState,
+    AnyPondSchema,
+    EventPayload,
     EventWithResponse,
-    JoinParams,
+    EventsOf,
+    JoinParamsOf,
     PayloadForResponse,
-    PondEventMap,
-    PondPresence,
+    PresenceOf,
     PresencePayload,
     ResponseForEvent,
     Unsubscribe,
@@ -26,7 +28,7 @@ interface SSEClientOptions extends ClientOptions {
     withCredentials?: boolean;
 }
 
-declare class Channel<EventMap extends PondEventMap = PondEventMap, Presence extends PondPresence = PondPresence> {
+declare class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     /**
      * @desc The current connection state of the channel.
      */
@@ -35,7 +37,7 @@ declare class Channel<EventMap extends PondEventMap = PondEventMap, Presence ext
     /**
      * @desc Gets the current presence of the channel.
      */
-    presence (): Presence[];
+    readonly presence: PresenceOf<Schema>[];
 
     /**
      * @desc Connects to the channel.
@@ -57,52 +59,52 @@ declare class Channel<EventMap extends PondEventMap = PondEventMap, Presence ext
      * @desc Detects when clients join the channel.
      * @param callback - The callback to call when a client joins the channel.
      */
-    onJoin (callback: (presence: Presence) => void): Unsubscribe;
+    onJoin (callback: (presence: PresenceOf<Schema>) => void): Unsubscribe;
 
     /**
      * @desc Detects when clients leave the channel.
      * @param callback - The callback to call when a client leaves the channel.
      */
-    onLeave (callback: (presence: Presence) => void): Unsubscribe;
+    onLeave (callback: (presence: PresenceOf<Schema>) => void): Unsubscribe;
 
     /**
      * @desc Monitors the channel for messages.
      * @param callback - The callback to call when a message is received.
      */
-    onMessage<Event extends keyof EventMap> (callback: (event: Event, message: EventMap[Event]) => void): Unsubscribe;
+    onMessage<Event extends Extract<keyof EventsOf<Schema>, string>> (callback: (event: Event, message: EventPayload<EventsOf<Schema>, Event>) => void): Unsubscribe;
 
     /**
      * @desc Monitors the channel for messages.
      * @param event - The event to monitor.
      * @param callback - The callback to call when a message is received.
      */
-    onMessageEvent<Event extends keyof EventMap> (event: Event, callback: (message: EventMap[Event]) => void): Unsubscribe;
+    onMessageEvent<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, callback: (message: EventPayload<EventsOf<Schema>, Event>) => void): Unsubscribe;
 
     /**
      * @desc Detects when clients change their presence in the channel.
      * @param callback - The callback to call when a client changes their presence in the channel.
      */
-    onPresenceChange (callback: (presence: PresencePayload<Presence>) => void): Unsubscribe;
+    onPresenceChange (callback: (presence: PresencePayload<PresenceOf<Schema>>) => void): Unsubscribe;
 
     /**
      * @desc Monitors the presence of the channel.
      * @param callback - The callback to call when the presence changes.
      */
-    onUsersChange (callback: (users: Presence[]) => void): Unsubscribe;
+    onUsersChange (callback: (users: PresenceOf<Schema>[]) => void): Unsubscribe;
 
     /**
      * @desc Sends a message to specific clients in the channel.
      * @param event - The event to send.
      * @param payload - The message to send.
      */
-    sendMessage<Event extends keyof EventMap> (event: Event, payload: EventMap[Event]): void;
+    sendMessage<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventPayload<EventsOf<Schema>, Event>): void;
 
     /**
      * @desc Sends a message to the server and waits for a response.
      * @param sentEvent - The event to send.
      * @param payload - The message to send.
      */
-    sendForResponse<Event extends EventWithResponse<EventMap>> (sentEvent: Event, payload: PayloadForResponse<EventMap, Event>, timeoutMs?: number): Promise<ResponseForEvent<EventMap, Event>>;
+    sendForResponse<Event extends EventWithResponse<EventsOf<Schema>>> (sentEvent: Event, payload: PayloadForResponse<EventsOf<Schema>, Event>, timeoutMs?: number): Promise<ResponseForEvent<EventsOf<Schema>, Event>>;
 }
 
 declare class PondClient {
@@ -128,7 +130,7 @@ declare class PondClient {
      * @param name - The name of the channel.
      * @param params - The params to send to the server.
      */
-    createChannel<EventType extends PondEventMap = PondEventMap, Presence extends PondPresence = PondPresence> (name: string, params?: JoinParams): Channel<EventType, Presence>;
+    createChannel<Schema extends AnyPondSchema = AnyPondSchema> (name: string, params?: JoinParamsOf<Schema>): Channel<Schema>;
 
     /**
      * @desc Subscribes to the connection state.
@@ -171,7 +173,7 @@ declare class SSEClient {
      * @param name - The name of the channel.
      * @param params - The params to send to the server.
      */
-    createChannel<EventType extends PondEventMap = PondEventMap, Presence extends PondPresence = PondPresence> (name: string, params?: JoinParams): Channel<EventType, Presence>;
+    createChannel<Schema extends AnyPondSchema = AnyPondSchema> (name: string, params?: JoinParamsOf<Schema>): Channel<Schema>;
 
     /**
      * @desc Subscribes to the connection state.

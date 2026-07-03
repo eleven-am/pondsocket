@@ -28,22 +28,54 @@ def match_topic(pattern: str, topic: str) -> bool:
     return False
 
 
-def format_topic(endpoint: str, channel: str, event: str) -> str:
+DEFAULT_NAMESPACE = "default"
+DEFAULT_KEY_PREFIX = "pondsocket"
+
+
+def format_topic(
+    endpoint: str,
+    channel: str,
+    event: str,
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+    prefix: str = DEFAULT_KEY_PREFIX,
+) -> str:
     del event
-    return f"pondsocket:v1:default:{endpoint}:{channel}"
+    return f"{prefix}:v1:{namespace}:{endpoint}:{channel}"
 
 
-def format_heartbeat_topic() -> str:
-    return "pondsocket:v1:default:__heartbeat__"
+def format_heartbeat_topic(
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+    prefix: str = DEFAULT_KEY_PREFIX,
+) -> str:
+    return f"{prefix}:v1:{namespace}:__heartbeat__"
 
 
-def format_presence_topic(endpoint: str, channel: str) -> str:
-    return format_topic(endpoint, channel, "presence")
+def format_presence_topic(
+    endpoint: str,
+    channel: str,
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+    prefix: str = DEFAULT_KEY_PREFIX,
+) -> str:
+    return format_topic(endpoint, channel, "presence", namespace=namespace, prefix=prefix)
 
 
-def format_message_topic(endpoint: str, channel: str) -> str:
-    return format_topic(endpoint, channel, "message")
+def format_message_topic(
+    endpoint: str,
+    channel: str,
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+    prefix: str = DEFAULT_KEY_PREFIX,
+) -> str:
+    return format_topic(endpoint, channel, "message", namespace=namespace, prefix=prefix)
 
 
-def format_system_topic(event: str) -> str:
-    return f"pondsocket:v1:default:system:{event}"
+def format_system_topic(
+    event: str,
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+    prefix: str = DEFAULT_KEY_PREFIX,
+) -> str:
+    return f"{prefix}:v1:{namespace}:system:{event}"

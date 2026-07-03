@@ -3,12 +3,15 @@ import {
     ChannelEvent,
     ChannelState,
     ClientActions,
+    AnyPondSchema,
     EventWithResponse,
+    EventPayload,
+    EventsOf,
     JoinParams,
+    JoinParamsOf,
     PayloadForResponse,
-    PondEventMap,
     PondMessage,
-    PondPresence,
+    PresenceOf,
     PresenceEventTypes,
     PresencePayload,
     ResponseForEvent,
@@ -20,18 +23,18 @@ import {
 
 import { ClientMessage, ConnectionState, Publisher } from '../types';
 
-export class Channel<EventMap extends PondEventMap = PondEventMap> {
+export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     readonly #name: string;
 
     #queue: ClientMessage[];
 
-    #presence: PondPresence[];
+    #presence: PresenceOf<Schema>[];
 
     #presenceSub: Unsubscribe;
 
     readonly #publisher: Publisher;
 
-    readonly #joinParams: JoinParams;
+    readonly #joinParams: JoinParamsOf<Schema>;
 
     readonly #receiver: Subject<ChannelEvent>;
 
@@ -41,7 +44,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
 
     readonly #maxQueueSize: number;
 
-    constructor (publisher: Publisher, clientState: BehaviorSubject<ConnectionState>, name: string, params: JoinParams, maxQueueSize: number = 100) {
+    constructor (publisher: Publisher, clientState: BehaviorSubject<ConnectionState>, name: string, params: JoinParamsOf<Schema>, maxQueueSize: number = 100) {
         this.#name = name;
         this.#queue = [];
         this.#presence = [];
@@ -66,7 +69,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
     /**
      * @desc Gets the current presence of the channel.
      */
-    public get presence (): PondPresence[] {
+    public get presence (): PresenceOf<Schema>[] {
         return this.#presence;
     }
 
@@ -156,7 +159,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @desc Detects when clients join the channel.
      * @param callback - The callback to call when a client joins the channel.
      */
-    public onJoin (callback: (presence: PondPresence) => void) {
+    public onJoin (callback: (presence: PresenceOf<Schema>) => void) {
         return this.#subscribeToPresence((event, payload) => {
             if (event === PresenceEventTypes.JOIN) {
                 return callback(payload.changed);
@@ -168,7 +171,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @desc Detects when clients leave the channel.
      * @param callback - The callback to call when a client leaves the channel.
      */
-    public onLeave (callback: (presence: PondPresence) => void) {
+    public onLeave (callback: (presence: PresenceOf<Schema>) => void) {
         return this.#subscribeToPresence((event, payload) => {
             if (event === PresenceEventTypes.LEAVE) {
                 return callback(payload.changed);
@@ -180,9 +183,9 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @desc Monitors the channel for messages.
      * @param callback - The callback to call when a message is received.
      */
-    public onMessage<Event extends keyof EventMap> (callback: (event: Event, message: EventMap[Event]) => void) {
+    public onMessage<Event extends Extract<keyof EventsOf<Schema>, string>> (callback: (event: Event, message: EventPayload<EventsOf<Schema>, Event>) => void) {
         return this.#onMessage((event, message) => {
-            callback(event as Event, message as EventMap[Event]);
+            callback(event as Event, message as EventPayload<EventsOf<Schema>, Event>);
         });
     }
 
@@ -191,10 +194,10 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @param event - The event to monitor.
      * @param callback - The callback to call when a message is received.
      */
-    public onMessageEvent<Event extends keyof EventMap> (event: Event, callback: (message: EventMap[Event]) => void) {
+    public onMessageEvent<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, callback: (message: EventPayload<EventsOf<Schema>, Event>) => void) {
         return this.onMessage((eventReceived, message) => {
             if (eventReceived === event) {
-                return callback(message as EventMap[Event]);
+                return callback(message as EventPayload<EventsOf<Schema>, Event>);
             }
         });
     }
@@ -203,7 +206,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @desc Detects when clients change their presence in the channel.
      * @param callback - The callback to call when a client changes their presence in the channel.
      */
-    public onPresenceChange (callback: (presence: PresencePayload) => void) {
+    public onPresenceChange (callback: (presence: PresencePayload<PresenceOf<Schema>>) => void) {
         return this.#subscribeToPresence((event, payload) => {
             if (event === PresenceEventTypes.UPDATE) {
                 return callback(payload);
@@ -215,7 +218,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @desc Monitors the presence of the channel.
      * @param callback - The callback to call when the presence changes.
      */
-    public onUsersChange (callback: (users: PondPresence[]) => void) {
+    public onUsersChange (callback: (users: PresenceOf<Schema>[]) => void) {
         return this.#subscribeToPresence((_event, payload) => callback(payload.presence));
     }
 
@@ -224,7 +227,7 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
      * @param event - The event to send.
      * @param payload - The message to send.
      */
-    public sendMessage (event: string, payload: PondMessage) {
+    public sendMessage<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
         const requestId = uuid();
 
         const message: ClientMessage = {
@@ -238,17 +241,17 @@ export class Channel<EventMap extends PondEventMap = PondEventMap> {
         this.#publish(message);
     }
 
-    public sendForResponse<Event extends EventWithResponse<EventMap>> (sentEvent: Event, payload: PayloadForResponse<EventMap, Event>, timeoutMs = 30000) {
+    public sendForResponse<Event extends EventWithResponse<EventsOf<Schema>>> (sentEvent: Event, payload: PayloadForResponse<EventsOf<Schema>, Event>, timeoutMs = 30000) {
         const requestId = uuid();
 
-        return new Promise<ResponseForEvent<EventMap, Event>>((resolve, reject) => {
+        return new Promise<ResponseForEvent<EventsOf<Schema>, Event>>((resolve, reject) => {
             const cleanup = { timer: undefined as ReturnType<typeof setTimeout> | undefined,
                 unsub: () => {} };
 
             cleanup.unsub = this.#onMessage((_, message, responseId) => {
                 if (requestId === responseId) {
                     clearTimeout(cleanup.timer);
-                    resolve(message as ResponseForEvent<EventMap, Event>);
+                    resolve(message as ResponseForEvent<EventsOf<Schema>, Event>);
                     cleanup.unsub();
                 }
             });

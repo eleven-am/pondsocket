@@ -717,6 +717,8 @@ export declare class RedisDistributedBackend implements IDistributedBackend {
 
     readonly heartbeatTimeoutMs: number;
 
+    subscribeToChannel(endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Promise<Unsubscribe>;
+
     initialize (): Promise<void>;
 
     broadcast (endpointName: string, channelName: string, message: DistributedChannelMessage): Promise<void>;

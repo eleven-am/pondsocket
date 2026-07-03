@@ -83,7 +83,7 @@ export async function performAction (
     const ctx = getNestContext(input);
     const context = new Context(ctx, instance, propertyKey);
     const channel = context.channel;
-    const socketId = context.user.id;
+    const socketId = context.user?.id ?? '';
 
     const canProceed = await performGuards(moduleRef, globalGuards, context);
 

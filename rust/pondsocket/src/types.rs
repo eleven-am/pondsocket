@@ -96,6 +96,9 @@ pub struct Options {
     pub dispatch_concurrency: usize,
     pub max_connections: usize,
     pub node_id: String,
+    pub namespace: String,
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
     pub hooks: Option<Arc<Hooks>>,
 }
 
@@ -108,6 +111,9 @@ impl Default for Options {
             dispatch_concurrency: 32,
             max_connections: 0,
             node_id: String::new(),
+            namespace: "default".to_owned(),
+            heartbeat_interval: Duration::from_secs(30),
+            heartbeat_timeout: Duration::from_secs(90),
             hooks: None,
         }
     }

@@ -38,11 +38,11 @@ export class Context {
     }
 
     get presence () {
-        return this.user.presence;
+        return this.user?.presence ?? {};
     }
 
     get assigns () {
-        return this.user.assigns;
+        return this.user?.assigns ?? {};
     }
 
     get user () {
@@ -58,7 +58,7 @@ export class Context {
             return this.leaveEvent.user;
         }
 
-        return this.joinContext?.user ?? this.eventContext!.user;
+        return this.joinContext?.user ?? this.eventContext?.user ?? null;
     }
 
     get channel () {

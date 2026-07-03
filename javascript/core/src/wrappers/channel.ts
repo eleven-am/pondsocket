@@ -1,15 +1,21 @@
 import {
     SystemSender,
     ChannelReceiver,
+    AnyPondSchema,
+    AssignsOf,
+    EventsOf,
+    EventPayload,
     ServerActions,
     PondMessage,
-    PondAssigns,
-    PondPresence,
+    PresenceOf,
+    UserData,
+    UserAssigns,
+    UserPresences,
 } from '@eleven-am/pondsocket-common';
 
 import { ChannelEngine } from '../engines/channelEngine';
 
-export class Channel {
+export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     readonly #engine: ChannelEngine;
 
     constructor (engine: ChannelEngine) {
@@ -19,28 +25,28 @@ export class Channel {
     /**
      * Gets a user's data
      */
-    getUserData (userId: string) {
-        return this.#engine.getUserData(userId);
+    getUserData (userId: string): UserData<PresenceOf<Schema>, AssignsOf<Schema>> | null {
+        return this.#engine.getUserData(userId) as UserData<PresenceOf<Schema>, AssignsOf<Schema>> | null;
     }
 
     /**
      * Gets all presence data
      */
-    getPresences () {
-        return this.#engine.getPresence();
+    getPresences (): UserPresences<PresenceOf<Schema>> {
+        return this.#engine.getPresence() as UserPresences<PresenceOf<Schema>>;
     }
 
     /**
      * Gets all assigns data
      */
-    getAssigns () {
-        return this.#engine.getAssigns();
+    getAssigns (): UserAssigns<AssignsOf<Schema>> {
+        return this.#engine.getAssigns() as UserAssigns<AssignsOf<Schema>>;
     }
 
     /**
      * Broadcasts a message to all users
      */
-    broadcast (event: string, payload: PondMessage) {
+    broadcast<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
         this.#engine.sendMessage(
             SystemSender.CHANNEL,
             ChannelReceiver.ALL_USERS,
@@ -55,7 +61,7 @@ export class Channel {
     /**
      * Broadcasts a message from a specific user to all others
      */
-    broadcastFrom (userId: string, event: string, payload: PondMessage) {
+    broadcastFrom<Event extends Extract<keyof EventsOf<Schema>, string>> (userId: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
         this.#engine.sendMessage(
             userId,
             ChannelReceiver.ALL_EXCEPT_SENDER,
@@ -70,7 +76,7 @@ export class Channel {
     /**
      * Broadcasts a message to specific users
      */
-    broadcastTo (userIds: string | string[], event: string, payload: PondMessage) {
+    broadcastTo<Event extends Extract<keyof EventsOf<Schema>, string>> (userIds: string | string[], event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
         const users = Array.isArray(userIds) ? userIds : [userIds];
 
         this.#engine.sendMessage(
@@ -96,7 +102,7 @@ export class Channel {
     /**
      * Tracks a user's presence
      */
-    trackPresence (userId: string, presence: PondPresence) {
+    trackPresence (userId: string, presence: PresenceOf<Schema>) {
         this.#engine.trackPresence(userId, presence);
 
         return this;
@@ -105,7 +111,7 @@ export class Channel {
     /**
      * Updates a user's presence
      */
-    updatePresence (userId: string, presence: PondPresence) {
+    updatePresence (userId: string, presence: Partial<PresenceOf<Schema>>) {
         this.#engine.updatePresence(userId, presence);
 
         return this;
@@ -123,7 +129,7 @@ export class Channel {
     /**
      * Adds or updates a user's presence
      */
-    upsertPresence (userId: string, presence: PondPresence) {
+    upsertPresence (userId: string, presence: PresenceOf<Schema>) {
         this.#engine.upsertPresence(userId, presence);
 
         return this;
@@ -132,8 +138,24 @@ export class Channel {
     /**
      * Updates a user's assigns
      */
-    updateAssigns (userId: string, assigns: PondAssigns) {
+    updateAssigns (userId: string, assigns: Partial<AssignsOf<Schema>>) {
         this.#engine.updateAssigns(userId, assigns);
+
+        return this;
+    }
+
+    /**
+     * Resolves a user's data from any node in the distributed cluster
+     */
+    getUserAcrossNodes (userId: string, timeoutMs?: number): Promise<UserData<PresenceOf<Schema>, AssignsOf<Schema>> | null> {
+        return this.#engine.getUserAcrossNodes(userId, timeoutMs) as Promise<UserData<PresenceOf<Schema>, AssignsOf<Schema>> | null>;
+    }
+
+    /**
+     * Requests removal of a user across all nodes in the distributed cluster
+     */
+    requestUserRemoval (userId: string) {
+        this.#engine.requestUserRemoval(userId);
 
         return this;
     }

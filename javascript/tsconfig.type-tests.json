@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "moduleResolution": "node16",
+    "target": "es2022",
+    "module": "Node16",
+    "types": ["node"],
+    "skipLibCheck": false,
+    "baseUrl": ".",
+    "paths": {
+      "@eleven-am/pondsocket": ["./core/dist"],
+      "@eleven-am/pondsocket/types": ["./core/dist"],
+      "@eleven-am/pondsocket-client": ["./client/dist"],
+      "@eleven-am/pondsocket-common": ["./comnon/dist"]
+    }
+  },
+  "include": ["type-tests/**/*.ts"]
+}

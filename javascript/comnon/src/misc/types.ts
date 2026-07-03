@@ -27,6 +27,27 @@ export type PondMessage = PondObject;
 export type PondAssigns = PondObject;
 export type JoinParams = PondObject;
 
+export type PondEventMap = Record<string, [PondMessage, PondMessage] | PondMessage>;
+
+export interface PondSchema<
+    Events extends PondEventMap = PondEventMap,
+    Presence extends PondPresence = PondPresence,
+    Assigns extends PondAssigns = PondAssigns,
+    Params extends JoinParams = JoinParams,
+> {
+    events: Events;
+    presence: Presence;
+    assigns: Assigns;
+    joinParams: Params;
+}
+
+export type AnyPondSchema = PondSchema;
+
+export type EventsOf<Schema extends PondSchema> = Schema['events'];
+export type PresenceOf<Schema extends PondSchema> = Schema['presence'];
+export type AssignsOf<Schema extends PondSchema> = Schema['assigns'];
+export type JoinParamsOf<Schema extends PondSchema> = Schema['joinParams'];
+
 export interface PresencePayload<Presence extends PondPresence = PondPresence> {
     changed: Presence;
     presence: Presence[];
@@ -88,9 +109,9 @@ interface PubSubMessageEvent {
 
 export type PubSubEvent = PubSubGetPresenceCommand | PubSubPresenceEvent | PubSubMessageEvent;
 
-export type PondEventMap = Record<string, [PondMessage, PondMessage] | PondMessage>;
-
 export type ChannelReceivers = ChannelReceiver | string[];
+
+export type EventPayload<EventMap extends PondEventMap, Event extends keyof EventMap> = EventMap[Event] extends [PondMessage, PondMessage] ? EventMap[Event][0] : EventMap[Event];
 
 export type EventWithResponse<EventMap extends PondEventMap> = {
     [Event in keyof EventMap]: EventMap[Event] extends [PondMessage, PondMessage] ? Event : never;

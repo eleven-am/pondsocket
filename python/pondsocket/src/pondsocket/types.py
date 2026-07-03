@@ -52,6 +52,22 @@ class InternalActions(StrEnum):
     USER_COMMAND = "USER_COMMAND"
 
 
+class DistributedMessageType(StrEnum):
+    STATE_REQUEST = "STATE_REQUEST"
+    STATE_RESPONSE = "STATE_RESPONSE"
+    USER_JOINED = "USER_JOINED"
+    USER_LEFT = "USER_LEFT"
+    USER_MESSAGE = "USER_MESSAGE"
+    PRESENCE_UPDATE = "PRESENCE_UPDATE"
+    PRESENCE_REMOVED = "PRESENCE_REMOVED"
+    ASSIGNS_UPDATE = "ASSIGNS_UPDATE"
+    EVICT_USER = "EVICT_USER"
+    USER_REMOVE = "USER_REMOVE"
+    USER_GET_REQUEST = "USER_GET_REQUEST"
+    USER_GET_RESPONSE = "USER_GET_RESPONSE"
+    NODE_HEARTBEAT = "NODE_HEARTBEAT"
+
+
 class LeaveReason(StrEnum):
     EXPLICIT_LEAVE = "explicit_leave"
     CONNECTION_CLOSED = "connection_closed"
@@ -110,6 +126,11 @@ class Options:
     max_concurrent_handlers: int = DEFAULT_MAX_CONCURRENT_HANDLERS
     max_connections: int = 0
     node_id: str = ""
+    namespace: str = "default"
+    key_prefix: str = "pondsocket"
+    heartbeat_interval: float = 30.0
+    heartbeat_timeout: float = 90.0
+    user_get_timeout: float = 0.5
     hooks: Hooks | None = None
 
 

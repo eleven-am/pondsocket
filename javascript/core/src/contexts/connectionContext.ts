@@ -144,7 +144,10 @@ export class ConnectionContext<Path extends string> {
     /**
      * Accepts the connection request
      */
-    accept (): ConnectionContext<Path> {
+    accept (assigns?: PondAssigns): ConnectionContext<Path> {
+        if (assigns) {
+            this.assign(assigns);
+        }
         this.#performChecks();
 
         this.#webSocketServer.handleUpgrade(

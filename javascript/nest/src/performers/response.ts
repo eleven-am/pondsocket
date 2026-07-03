@@ -44,8 +44,12 @@ export function performResponse (
         ...rest
     } = data;
 
-    if (isConnectionContext(context) || isJoinContext(context)) {
+    if (isConnectionContext(context)) {
         context
+            .assign(typeof assigns === 'object' ? assigns : {})
+            .accept();
+    } else if (isJoinContext(context)) {
+        (context as JoinContext<string>)
             .assign(typeof assigns === 'object' ? assigns : {})
             .accept();
     } else {
