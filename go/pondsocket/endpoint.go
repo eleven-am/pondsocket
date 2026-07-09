@@ -91,6 +91,9 @@ func (e *Endpoint) CreateChannel(path string, handlerFunc JoinEventHandler, midd
 		if joinCtx.err != nil {
 			return joinCtx
 		}
+		if !joinCtx.HasResponded {
+			return joinCtx.Decline(StatusUnauthorized, "Unauthorized")
+		}
 		return nil
 	})
 
@@ -188,8 +191,9 @@ func (e *Endpoint) joinChannel(ev *Event, user Transport) error {
 			errMsg.Payload = pondErr
 		}
 		_ = user.SendJSON(errMsg)
+		return nil
 	}
-	return err
+	return nil
 }
 
 func (e *Endpoint) leaveChannel(ev *Event, user Transport) error {
@@ -207,7 +211,7 @@ func (e *Endpoint) leaveChannel(ev *Event, user Transport) error {
 			Payload:     notFound(ev.ChannelName, "Channel not found"),
 		})
 
-		return err
+		return nil
 	}
 	if err = currentChannel.RemoveUser(user.GetID(), "explicit_leave"); err != nil {
 		_ = user.SendJSON(Event{
@@ -215,10 +219,10 @@ func (e *Endpoint) leaveChannel(ev *Event, user Transport) error {
 			ChannelName: ev.ChannelName,
 			RequestId:   ev.RequestId,
 			Event:       string(internalErrorEvent),
-			Payload:     wrapF(err, "failed to leave channel"),
+			Payload:     internal(ev.ChannelName, "Failed to leave channel"),
 		})
 
-		return err
+		return nil
 	}
 	_ = user.SendJSON(Event{
 		Action:      system,
@@ -246,7 +250,7 @@ func (e *Endpoint) broadcastMessage(ev *Event, user Transport) error {
 			Payload:     notFound(ev.ChannelName, "Channel not found"),
 		})
 
-		return err
+		return nil
 	}
 	if err = currentChannel.broadcast(user.GetID(), ev); err != nil {
 		_ = user.SendJSON(Event{
@@ -254,10 +258,10 @@ func (e *Endpoint) broadcastMessage(ev *Event, user Transport) error {
 			ChannelName: ev.ChannelName,
 			RequestId:   ev.RequestId,
 			Event:       string(internalErrorEvent),
-			Payload:     wrapF(err, "failed to process broadcast"),
+			Payload:     internal(ev.ChannelName, "Failed to process broadcast"),
 		})
 
-		return err
+		return nil
 	}
 	return nil
 }
@@ -308,7 +312,7 @@ func (e *Endpoint) handleMessage() transportEventHandler {
 				Payload:     notFound(ev.ChannelName, "Unknown or unsupported event type").withDetails(map[string]string{"eventType": ev.Event}),
 			})
 
-			return badRequest(ev.ChannelName, "Unknown event type").withDetails(map[string]string{"eventType": ev.Event})
+			return nil
 		}
 	}
 }

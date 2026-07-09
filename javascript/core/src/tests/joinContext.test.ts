@@ -142,7 +142,7 @@ describe('JoinContext', () => {
             const addUserSpy = jest.spyOn(mockChannelEngine, 'addUser');
 
             joinContext.accept();
-            expect(addUserSpy).toHaveBeenCalledWith('user1', { role: 'user' }, expect.any(Function));
+            expect(addUserSpy).toHaveBeenCalledWith('user1', { role: 'user' }, expect.any(Function), 'request-123');
         });
 
         it('should throw an error if already executed', () => {
@@ -160,8 +160,14 @@ describe('JoinContext', () => {
                 event: ErrorTypes.UNAUTHORIZED_JOIN_REQUEST,
                 action: ServerActions.ERROR,
                 payload: {
+                    code: ErrorTypes.UNAUTHORIZED_JOIN_REQUEST,
                     message: 'Unauthorized',
-                    code: 401,
+                    status: 401,
+                    statusCode: 401,
+                    error: {
+                        message: 'Unauthorized',
+                        status: 401,
+                    },
                 },
             }));
         });
@@ -178,7 +184,7 @@ describe('JoinContext', () => {
 
             joinContext.assign(newAssigns);
             joinContext.accept();
-            expect(mockChannelEngine.addUser).toHaveBeenCalledWith('user1', { role: 'admin' }, expect.any(Function));
+            expect(mockChannelEngine.addUser).toHaveBeenCalledWith('user1', { role: 'admin' }, expect.any(Function), 'request-123');
         });
 
         it('should call updateAssigns on channel engine if already accepted', () => {

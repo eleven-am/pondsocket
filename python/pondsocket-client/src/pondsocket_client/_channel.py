@@ -173,19 +173,20 @@ class Channel:
             if self.channel_state == ChannelState.JOINED:
                 self._events.publish(event)
             return
-        if event.action == ServerActions.SYSTEM:
-            if event.event == Events.ACKNOWLEDGE.value:
-                self._acknowledge()
-                return
-            if event.event == Events.UNAUTHORIZED.value:
-                self._decline()
-                return
         if event.request_id in self._pending_responses:
             fut = self._pending_responses.pop(event.request_id)
             if not fut.done():
                 payload = event.payload if isinstance(event.payload, dict) else {}
                 fut.set_result(payload)
             return
+        if event.action == ServerActions.SYSTEM:
+            if event.event == Events.ACKNOWLEDGE.value:
+                self._acknowledge()
+                return
+            if event.event in (Events.UNAUTHORIZED.value, Events.NOT_FOUND.value):
+                if self.channel_state in (ChannelState.JOINING, ChannelState.STALLED):
+                    self._decline()
+                return
         if self.channel_state == ChannelState.JOINED:
             self._events.publish(event)
 
@@ -222,9 +223,7 @@ class Channel:
 
         return self._events.subscribe(filtered)
 
-    def on_message_event(
-        self, event_name: str, callback: MessageHandler
-    ) -> Unsubscribe:
+    def on_message_event(self, event_name: str, callback: MessageHandler) -> Unsubscribe:
         def filtered(ev: ChannelEvent) -> None:
             if isinstance(ev, ServerMessage) and ev.event == event_name:
                 callback(ev)
@@ -251,9 +250,7 @@ class Channel:
 
         return self._events.subscribe(filtered)
 
-    def _on_presence_kind(
-        self, kind: PresenceEventTypes, callback: PresenceHandler
-    ) -> Unsubscribe:
+    def _on_presence_kind(self, kind: PresenceEventTypes, callback: PresenceHandler) -> Unsubscribe:
         def filtered(ev: ChannelEvent) -> None:
             if isinstance(ev, PresenceMessage) and ev.event == kind:
                 callback(dict(ev.payload.changed))
@@ -277,10 +274,7 @@ class Channel:
             self._spawn(self._publish(msg))
             return
         is_join = msg.action == ClientActions.JOIN_CHANNEL
-        if (
-            self._connection_state.value == ConnectionState.CONNECTED
-            and is_join
-        ):
+        if self._connection_state.value == ConnectionState.CONNECTED and is_join:
             self._spawn(self._publish(msg))
             return
         self._queue.append(msg)
@@ -294,8 +288,9 @@ class Channel:
             self._spawn(self._publish(msg))
 
     def _acknowledge(self) -> None:
-        if self.channel_state != ChannelState.JOINED:
-            self._state.publish(ChannelState.JOINED)
+        if self.channel_state not in (ChannelState.JOINING, ChannelState.STALLED):
+            return
+        self._state.publish(ChannelState.JOINED)
         self._flush_queue()
 
     def _decline(self) -> None:

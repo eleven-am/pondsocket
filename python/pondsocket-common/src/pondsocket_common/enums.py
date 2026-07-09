@@ -57,6 +57,7 @@ class ChannelReceiver(StrEnum):
 class Events(StrEnum):
     ACKNOWLEDGE = "ACKNOWLEDGE"
     CONNECTION = "CONNECTION"
+    NOT_FOUND = "NOT_FOUND"
     UNAUTHORIZED = "UNAUTHORIZED"
 
 

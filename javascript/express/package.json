@@ -1,54 +1,58 @@
 {
   "name": "@eleven-am/pondsocket-express",
-  "version": "0.0.41",
-  "description": "PondSocket is a fast simple socket server",
+  "version": "0.0.42",
+  "description": "Express integration for the PondSocket server.",
   "keywords": [
-    "socket",
-    "server",
-    "ws",
+    "pondsocket",
+    "express",
     "websocket",
-    "pubsub",
-    "presence",
-    "realtime",
-    "realtime server"
+    "sse",
+    "realtime"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
   "author": "Roy OSSAI",
-  "main": "./index.js",
-  "types": "./index.d.ts",
   "license": "GPL-3.0",
+  "homepage": "https://github.com/eleven-am/pondsocket#readme",
+  "bugs": {
+    "url": "https://github.com/eleven-am/pondsocket/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eleven-am/pondsocket.git",
+    "directory": "javascript/express"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "scripts": {
+    "clean": "rimraf dist",
+    "build": "npm run clean && tsc --project tsconfig.json",
     "test": "jest --coverage --verbose --passWithNoTests",
-    "build": "rimraf dist && tsc --build tsconfig.json",
-    "lint": "eslint --ext .ts src",
-    "lint:fix": "eslint --fix --ext .ts src",
-    "copy": "cp package.json dist && cp README.md dist && cp LICENSE dist",
-    "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
-    "pipeline": "npm run lint:fix && npm run lint && npm run build && npm run push"
+    "lint": "eslint src --max-warnings=0",
+    "prepack": "npm run build"
   },
   "dependencies": {
-    "@eleven-am/pondsocket": "^0.1.218"
+    "@eleven-am/pondsocket": "^0.1.219"
   },
-  "devDependencies": {
-    "@eslint/compat": "^1.4.0",
-    "@eslint/eslintrc": "^3.3.4",
-    "@eslint/js": "^9.39.4",
-    "@stylistic/eslint-plugin-ts": "^4.4.1",
-    "@types/express": "^5.0.6",
-    "@types/jest": "^30.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.59.4",
-    "eslint": "^9.39.4",
-    "eslint-plugin-file-progress": "^3.0.2",
-    "eslint-plugin-import": "^2.32.0",
-    "globals": "^16.4.0",
-    "jest": "^30.2.0",
-    "prettier": "^3.8.3",
-    "ts-jest": "^29.4.11",
-    "ts-loader": "^9.5.7",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+  "peerDependencies": {
+    "express": "^4.18.0 || ^5.0.0"
   },
   "jest": {
     "moduleFileExtensions": [
@@ -59,12 +63,13 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.ts$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "**/*.ts",
+      "!**/*.test.ts"
     ],
-    "coverageDirectory": "../coverage",
+    "coverageDirectory": "../coverage/express",
     "testEnvironment": "node"
   }
 }

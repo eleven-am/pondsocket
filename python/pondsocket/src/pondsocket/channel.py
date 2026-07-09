@@ -126,9 +126,7 @@ class Channel:
         self._dispatch_queue: asyncio.Queue[_DispatchItem] = asyncio.Queue(
             self._options.internal_queue_buffer
         )
-        self._dispatch_semaphore = asyncio.Semaphore(
-            self._options.dispatch_concurrency
-        )
+        self._dispatch_semaphore = asyncio.Semaphore(self._options.dispatch_concurrency)
         self._dispatch_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._node_users: dict[str, set[str]] = {}
@@ -218,10 +216,10 @@ class Channel:
         reason: str = LeaveReason.EXPLICIT_LEAVE.value,
         *,
         skip_distributed: bool = False,
-    ) -> None:
+    ) -> bool:
         if not await self._connections.discard(user_id):
             await self._publish_user_command("user:remove", user_id, reason)
-            return
+            return False
         assigns = await self._assigns.get(user_id, {}) or {}
         presence: PondPresence | None = None
         if await self._presence.has(user_id):
@@ -242,6 +240,7 @@ class Channel:
 
         if await self._connections.len() == 0:
             await self._fire_on_destroy()
+        return True
 
     async def _fire_leave_handler(self, user: User, reason: str) -> None:
         if self._leave_handler is None:
@@ -315,9 +314,7 @@ class Channel:
             node_id=self.node_id,
         )
         await self._send_direct([user_id], ev)
-        await self.remove_user(
-            user_id, reason=LeaveReason.EVICTED.value, skip_distributed=True
-        )
+        await self.remove_user(user_id, reason=LeaveReason.EVICTED.value, skip_distributed=True)
 
     async def broadcast(self, event_name: str, payload: PondMessage) -> None:
         await self._send_event(
@@ -607,9 +604,7 @@ class Channel:
         if self._pubsub is None or not self._endpoint_path:
             return
         topic = self._channel_topic()
-        data = distributed_bytes(
-            msg_type, self.node_id, self._clean_endpoint(), self.name, extra
-        )
+        data = distributed_bytes(msg_type, self.node_id, self._clean_endpoint(), self.name, extra)
         try:
             await self._pubsub.publish(topic, data)
         except Exception:
@@ -696,9 +691,7 @@ class Channel:
             existed = await self._presence.has(user_id)
             await self._presence.set_remote(user_id, presence)
             event.event = (
-                PresenceEventTypes.UPDATE.value
-                if existed
-                else PresenceEventTypes.JOIN.value
+                PresenceEventTypes.UPDATE.value if existed else PresenceEventTypes.JOIN.value
             )
             if isinstance(event.payload, dict):
                 event.payload["presence"] = await self._presence.values()
@@ -786,9 +779,7 @@ class Channel:
             if not user_id or await self._connections.has(user_id):
                 continue
             assigns = user.get("assigns")
-            await self._assigns.upsert(
-                user_id, dict(assigns) if isinstance(assigns, dict) else {}
-            )
+            await self._assigns.upsert(user_id, dict(assigns) if isinstance(assigns, dict) else {})
             self._track_node_user(node_id, user_id)
             presence = user.get("presence")
             if isinstance(presence, dict) and presence:
@@ -800,9 +791,7 @@ class Channel:
             return
         node_id = str(raw.get("sourceNodeId") or "")
         assigns = raw.get("assigns")
-        await self._assigns.upsert(
-            user_id, dict(assigns) if isinstance(assigns, dict) else {}
-        )
+        await self._assigns.upsert(user_id, dict(assigns) if isinstance(assigns, dict) else {})
         self._track_node_user(node_id, user_id)
         presence = raw.get("presence")
         if isinstance(presence, dict) and presence:
@@ -868,9 +857,7 @@ class Channel:
                     "fromNode": self.node_id,
                 },
             )
-            return await asyncio.wait_for(
-                fut, timeout=self._options.user_get_timeout
-            )
+            return await asyncio.wait_for(fut, timeout=self._options.user_get_timeout)
         except (TimeoutError, asyncio.CancelledError):
             return None
         finally:
@@ -949,9 +936,7 @@ class Channel:
             return exc
         return None
 
-    async def _fire_after_message(
-        self, event: Event, err: BaseException | None
-    ) -> None:
+    async def _fire_after_message(self, event: Event, err: BaseException | None) -> None:
         hooks = self._options.hooks
         if hooks is None or hooks.after_message is None:
             return
@@ -1051,7 +1036,11 @@ def _event_from_envelope(raw: dict[str, Any]) -> Event | None:
     message_type = raw.get("type")
     channel_name = raw.get("channelName")
     node_id = raw.get("sourceNodeId")
-    if not isinstance(message_type, str) or not isinstance(channel_name, str) or not isinstance(node_id, str):
+    if (
+        not isinstance(message_type, str)
+        or not isinstance(channel_name, str)
+        or not isinstance(node_id, str)
+    ):
         return None
     request_id = str(raw.get("requestId") or uuid())
     if message_type == "USER_MESSAGE":

@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use pondsocket_common::{PondAssigns, PresenceEventType, ServerAction, uuid};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -10,8 +11,9 @@ use tokio::time::{sleep, timeout};
 
 use crate::contexts::{EventContext, LeaveContext, OutgoingContext};
 use crate::errors::{Result, conflict, internal, not_found};
+use crate::lobby::Lobby;
 use crate::parser::parse;
-use crate::pubsub::{PubSub, format_heartbeat_topic, format_topic};
+use crate::pubsub::{PubSub, SubscriptionId, format_heartbeat_topic, format_topic};
 use crate::transport::Transport;
 use crate::types::{Event, Options, User};
 
@@ -101,6 +103,10 @@ pub struct Channel {
     node_users: RwLock<HashMap<String, HashSet<String>>>,
     heartbeat_task: RwLock<Option<JoinHandle<()>>>,
     stale_task: RwLock<Option<JoinHandle<()>>>,
+    lobby: Weak<Lobby>,
+    in_flight_joins: AtomicUsize,
+    pubsub_sub_id: RwLock<Option<SubscriptionId>>,
+    heartbeat_sub_id: RwLock<Option<SubscriptionId>>,
 }
 
 pub struct ChannelConfig {
@@ -111,6 +117,7 @@ pub struct ChannelConfig {
     pub event_handlers: Vec<EventRegistration>,
     pub outgoing_handlers: Vec<OutgoingRegistration>,
     pub leave_handler: Option<Arc<dyn LeaveHandler>>,
+    pub lobby: Weak<Lobby>,
 }
 
 impl Channel {
@@ -139,7 +146,25 @@ impl Channel {
             node_users: RwLock::new(HashMap::new()),
             heartbeat_task: RwLock::new(None),
             stale_task: RwLock::new(None),
+            lobby: config.lobby,
+            in_flight_joins: AtomicUsize::new(0),
+            pubsub_sub_id: RwLock::new(None),
+            heartbeat_sub_id: RwLock::new(None),
         })
+    }
+
+    pub fn begin_join(&self) {
+        self.in_flight_joins.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn end_join(&self) {
+        self.in_flight_joins.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub async fn is_idle(&self) -> bool {
+        self.user_count().await == 0
+            && self.in_flight_joins.load(Ordering::SeqCst) == 0
+            && self.node_users.read().await.values().all(HashSet::is_empty)
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
@@ -158,10 +183,10 @@ impl Channel {
             });
             *self.dispatch_task.write().await = Some(task);
         }
-        if let Some(hooks) = &self.options.hooks {
-            if let Some(metrics) = &hooks.metrics {
-                metrics.channel_created(&self.name);
-            }
+        if let Some(hooks) = &self.options.hooks
+            && let Some(metrics) = &hooks.metrics
+        {
+            metrics.channel_created(&self.name);
         }
         Ok(())
     }
@@ -183,10 +208,10 @@ impl Channel {
         self.presence.write().await.clear();
         self.node_last_seen.write().await.clear();
         self.node_users.write().await.clear();
-        if let Some(hooks) = &self.options.hooks {
-            if let Some(metrics) = &hooks.metrics {
-                metrics.channel_destroyed(&self.name);
-            }
+        if let Some(hooks) = &self.options.hooks
+            && let Some(metrics) = &hooks.metrics
+        {
+            metrics.channel_destroyed(&self.name);
         }
         Ok(())
     }
@@ -215,10 +240,10 @@ impl Channel {
             .write()
             .await
             .insert(user_id.clone(), assigns.clone());
-        if let Some(hooks) = &self.options.hooks {
-            if let Some(metrics) = &hooks.metrics {
-                metrics.channel_joined(&user_id, &self.name);
-            }
+        if let Some(hooks) = &self.options.hooks
+            && let Some(metrics) = &hooks.metrics
+        {
+            metrics.channel_joined(&user_id, &self.name);
         }
         let _ = self.publish_user_joined(&user_id, &assigns).await;
         Ok(())
@@ -253,10 +278,13 @@ impl Channel {
             };
             let _ = handler.call(&mut ctx).await;
         }
-        if let Some(hooks) = &self.options.hooks {
-            if let Some(metrics) = &hooks.metrics {
-                metrics.channel_left(user_id, &self.name);
-            }
+        if let Some(hooks) = &self.options.hooks
+            && let Some(metrics) = &hooks.metrics
+        {
+            metrics.channel_left(user_id, &self.name);
+        }
+        if let Some(lobby) = self.lobby.upgrade() {
+            lobby.remove_channel_if_idle(&self.name).await;
         }
         Ok(())
     }
@@ -734,7 +762,7 @@ impl Channel {
             return Ok(());
         }
         let channel = self.clone();
-        pubsub
+        let id = pubsub
             .subscribe(
                 &self.pubsub_pattern(),
                 Arc::new(move |_topic, data| {
@@ -744,17 +772,23 @@ impl Channel {
                     });
                 }),
             )
-            .await
+            .await?;
+        *self.pubsub_sub_id.write().await = Some(id);
+        Ok(())
     }
 
     async fn unsubscribe_from_pubsub(&self) -> Result<()> {
         if let Some(pubsub) = &self.pubsub {
-            if !self.endpoint_path.is_empty() {
-                let _ = pubsub.unsubscribe(&self.pubsub_pattern()).await;
+            if !self.endpoint_path.is_empty()
+                && let Some(id) = self.pubsub_sub_id.write().await.take()
+            {
+                let _ = pubsub.unsubscribe(&self.pubsub_pattern(), id).await;
             }
-            let _ = pubsub
-                .unsubscribe(&format_heartbeat_topic(self.namespace()))
-                .await;
+            if let Some(id) = self.heartbeat_sub_id.write().await.take() {
+                let _ = pubsub
+                    .unsubscribe(&format_heartbeat_topic(self.namespace()), id)
+                    .await;
+            }
         }
         Ok(())
     }
@@ -920,7 +954,7 @@ impl Channel {
         let heartbeat_topic = format_heartbeat_topic(self.namespace());
 
         let handler_channel = self.clone();
-        pubsub
+        let heartbeat_id = pubsub
             .subscribe(
                 &heartbeat_topic,
                 Arc::new(move |_topic, data| {
@@ -931,6 +965,7 @@ impl Channel {
                 }),
             )
             .await?;
+        *self.heartbeat_sub_id.write().await = Some(heartbeat_id);
 
         let interval = self.options.heartbeat_interval;
         let hb_channel = self.clone();
@@ -988,6 +1023,9 @@ impl Channel {
             .filter(|(_, seen)| now.duration_since(**seen) >= timeout_duration)
             .map(|(node, _)| node.clone())
             .collect::<Vec<_>>();
+        if stale.is_empty() {
+            return;
+        }
         for node in stale {
             let users = self.node_users.write().await.remove(&node);
             if let Some(users) = users {
@@ -999,6 +1037,9 @@ impl Channel {
                 }
             }
             self.node_last_seen.write().await.remove(&node);
+        }
+        if let Some(lobby) = self.lobby.upgrade() {
+            lobby.remove_channel_if_idle(&self.name).await;
         }
     }
 
@@ -1122,10 +1163,7 @@ impl Channel {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        self.assigns
-            .write()
-            .await
-            .insert(id.to_owned(), assigns);
+        self.assigns.write().await.insert(id.to_owned(), assigns);
         if let Some(presence) = event.payload.get("presence").and_then(Value::as_object)
             && !presence.is_empty()
         {
@@ -1147,6 +1185,9 @@ impl Channel {
         self.assigns.write().await.remove(id);
         self.presence.write().await.remove(id);
         self.untrack_node_user(&event.node_id, id).await;
+        if let Some(lobby) = self.lobby.upgrade() {
+            lobby.remove_channel_if_idle(&self.name).await;
+        }
     }
 
     async fn publish_user_joined(&self, user_id: &str, assigns: &PondAssigns) -> Result<()> {
@@ -1657,6 +1698,7 @@ mod tests {
             event_handlers: Vec::new(),
             outgoing_handlers: Vec::new(),
             leave_handler: None,
+            lobby: std::sync::Weak::new(),
         });
         channel
             .send_event(
@@ -1688,6 +1730,52 @@ mod tests {
 
         assert_eq!(err.code, 500);
         assert!(err.message.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn adv_empty_channel_is_closed_after_last_user_leaves() {
+        let lobby = crate::lobby::Lobby::new("/chat/:room", "/", Options::default(), None);
+        let channel = lobby.get_or_create_channel("/chat/leak").await.unwrap();
+        let transport = Arc::new(crate::transport::MemoryTransport::new(
+            "u1",
+            PondAssigns::new(),
+        ));
+        channel.add_user(transport).await.unwrap();
+        assert_eq!(channel.user_count().await, 1);
+
+        channel.remove_user("u1", "explicit_leave").await.unwrap();
+
+        assert_eq!(channel.user_count().await, 0);
+        assert!(!*channel.active.read().await);
+        assert!(channel.dispatch_task.read().await.is_none());
+        assert!(lobby.get_channel("/chat/leak").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn adv_is_idle_requires_no_remote_users() {
+        let channel = Channel::new(ChannelConfig {
+            name: "/chat/remote".to_owned(),
+            endpoint_path: "/".to_owned(),
+            options: Options::default(),
+            pubsub: None,
+            event_handlers: Vec::new(),
+            outgoing_handlers: Vec::new(),
+            leave_handler: None,
+            lobby: std::sync::Weak::new(),
+        });
+        channel
+            .node_users
+            .write()
+            .await
+            .entry("node-b".to_owned())
+            .or_default()
+            .insert("remote-user".to_owned());
+
+        assert_eq!(channel.user_count().await, 0);
+        assert!(!channel.is_idle().await);
+
+        channel.untrack_node_user("node-b", "remote-user").await;
+        assert!(channel.is_idle().await);
     }
 
     fn encode(event: &Event, subtype: &str) -> Value {

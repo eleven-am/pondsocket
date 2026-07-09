@@ -1,11 +1,11 @@
-import { AnyPondSchema, Event, EventsOf, PondPath } from '@eleven-am/pondsocket-common';
+import { AnyPondSchema, compilePondRoute, Event, EventsOf, PondPath } from '@eleven-am/pondsocket-common';
 
 import { ChannelEngine } from './channelEngine';
 import { EndpointEngine } from './endpointEngine';
 import { Middleware } from '../abstracts/middleware';
 import { BroadcastEvent, EventHandler, LeaveCallback, OutgoingEventHandler } from '../abstracts/types';
 import { EventContext } from '../contexts/eventContext';
-import { OutgoingContext } from '../contexts/outgoingContext';
+import { OutgoingContext, OutgoingHandlerContext } from '../contexts/outgoingContext';
 import { HttpError } from '../errors/httpError';
 import { parseAddress } from '../matcher/matcher';
 import { IDistributedBackend } from '../types';
@@ -41,6 +41,10 @@ export class LobbyEngine {
      * Attaches a handler for a specific event pattern
      */
     onEvent<Schema extends AnyPondSchema, Path extends Extract<keyof EventsOf<Schema>, string>> (event: PondPath<Path>, handler: EventHandler<Path, Schema, Path>) {
+        if (typeof event === 'string') {
+            compilePondRoute(event);
+        }
+
         this.middleware.use((requestEvent, channel, next) => {
             const params = parseAddress(event, requestEvent.event);
 
@@ -58,6 +62,10 @@ export class LobbyEngine {
      * Attaches a handler for outgoing events
      */
     handleOutgoingEvent<Schema extends AnyPondSchema, Path extends Extract<keyof EventsOf<Schema>, string>> (event: PondPath<Path>, handler: OutgoingEventHandler<Path, Schema, Path>) {
+        if (typeof event === 'string') {
+            compilePondRoute(event);
+        }
+
         this.outgoing.use(async (context, chEvent, next) => {
             const params = parseAddress(event, chEvent.event);
 
@@ -65,18 +73,10 @@ export class LobbyEngine {
                 return next();
             }
 
-            const typedContext = context as OutgoingContext<Path, Schema, Path>;
+            const typedContext = context as OutgoingHandlerContext<Path, Schema, Path>;
 
             typedContext.updateParams(params);
-            const payload = await handler(typedContext, next);
-
-            if (payload === undefined || payload === null) {
-                return;
-            }
-
-            typedContext.transform(payload);
-
-            return next();
+            await handler(typedContext);
         });
     }
 
@@ -91,8 +91,10 @@ export class LobbyEngine {
         const params = parseAddress('*', event.event);
         const context = new OutgoingContext(event, params!, engine, userId);
 
-        await this.outgoing.runAsync(context, event, () => {
-            // no-op
+        await this.outgoing.runAsync(context, event, (error) => {
+            if (error) {
+                context.block();
+            }
         });
 
         if (context.isBlocked()) {

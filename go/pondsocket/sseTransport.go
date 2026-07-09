@@ -305,12 +305,12 @@ func (s *SSEConn) HandleMessages() {
 				s.mutex.RUnlock()
 
 				if handler == nil {
-					_ = s.SendJSON(errorEvent(internal(string(gatewayEntity), "no handler registered for SSE connection "+s.id)))
+					_ = s.SendJSON(errorEventWithRequestId(internal(string(gatewayEntity), "no handler registered for SSE connection "+s.id), event.RequestId))
 					continue
 				}
 
 				if !event.Validate() {
-					_ = s.SendJSON(errorEvent(internal(string(gatewayEntity), "invalid event received from SSE connection "+s.id)))
+					_ = s.SendJSON(errorEventWithRequestId(internal(string(gatewayEntity), "invalid event received from SSE connection "+s.id), event.RequestId))
 					continue
 				}
 
@@ -332,7 +332,7 @@ func (s *SSEConn) HandleMessages() {
 
 					if err := (*h)(ev, s); err != nil {
 						s.reportError("sse_handler", err)
-						if errEv := errorEvent(err); errEv != nil {
+						if errEv := errorEventWithRequestId(err, ev.RequestId); errEv != nil {
 							_ = s.SendJSON(errEv)
 						}
 					}

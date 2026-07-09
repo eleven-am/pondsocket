@@ -82,9 +82,7 @@ class ASGIWebSocketTransport:
         self._active = False
         try:
             async with self._send_lock:
-                await self._send(
-                    {"type": "websocket.close", "code": code, "reason": reason[:123]}
-                )
+                await self._send({"type": "websocket.close", "code": code, "reason": reason[:123]})
         except Exception:
             pass
         await self._fire_close_callbacks()
@@ -143,7 +141,7 @@ class ASGIWebSocketTransport:
                 return
         try:
             event = parse_inbound_text(text)
-        except ValidationError as e:
+        except (ValidationError, RecursionError) as e:
             await self._send_invalid_message(str(e))
             return
         if self._message_handler is None:

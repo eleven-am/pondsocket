@@ -1023,7 +1023,7 @@ func (c *Channel) handleRemotePresenceEvent(event *Event) {
 	if userID == "" {
 		return
 	}
-	change := payload["change"]
+	change := payload["changed"]
 
 	if event.Event == string(leave) {
 		c.presence.mutex.Lock()

@@ -220,7 +220,12 @@ mod tests {
     fn decode_payload_reads_typed_event() {
         let message = server_message("chat", json!({ "text": "hi" }));
         let payload = decode_payload::<Chat>(message).unwrap();
-        assert_eq!(payload, ChatPayload { text: "hi".to_owned() });
+        assert_eq!(
+            payload,
+            ChatPayload {
+                text: "hi".to_owned()
+            }
+        );
     }
 
     #[test]

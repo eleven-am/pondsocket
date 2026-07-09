@@ -1,10 +1,10 @@
 import { IncomingHttpHeaders } from 'http';
 
-import { ChannelReceiver, PresenceEventTypes, ServerActions, PubSubEvents } from '../enums';
+import { ChannelReceiver, ErrorTypes, PresenceEventTypes, ServerActions, PubSubEvents } from '../enums';
 
 export type Unsubscribe = () => void;
 
-type IsParam<Path> = Path extends `:${infer Param}` ? Param : never;
+type IsParam<Path> = Path extends `:${infer Param}` ? Param : Path extends '*' ? '*' : never;
 
 type FilteredParams<Path> = Path extends `${infer First}/${infer Second}`
     ? IsParam<First> | FilteredParams<Second>
@@ -13,6 +13,10 @@ type FilteredParams<Path> = Path extends `${infer First}/${infer Second}`
 export type Params<Path> = {
     [Key in FilteredParams<Path>]: string
 }
+
+export type RouteParamsArguments<Path extends string> = keyof Params<Path> extends never
+    ? [params?: Params<Path>]
+    : [params: Params<Path>];
 
 export type PondPath<Path extends string> = Path | RegExp;
 
@@ -42,6 +46,18 @@ export interface PondSchema<
 }
 
 export type AnyPondSchema = PondSchema;
+
+export interface PondErrorPayload extends PondObject {
+    code: ErrorTypes | string;
+    message: string;
+    status: number;
+    statusCode?: number;
+    error?: {
+        message: string;
+        status: number;
+    };
+    details?: unknown;
+}
 
 export type EventsOf<Schema extends PondSchema> = Schema['events'];
 export type PresenceOf<Schema extends PondSchema> = Schema['presence'];
@@ -112,6 +128,8 @@ export type PubSubEvent = PubSubGetPresenceCommand | PubSubPresenceEvent | PubSu
 export type ChannelReceivers = ChannelReceiver | string[];
 
 export type EventPayload<EventMap extends PondEventMap, Event extends keyof EventMap> = EventMap[Event] extends [PondMessage, PondMessage] ? EventMap[Event][0] : EventMap[Event];
+
+export type EventReplyPayload<EventMap extends PondEventMap, Event extends keyof EventMap> = EventMap[Event] extends [PondMessage, infer Response extends PondMessage] ? Response : EventPayload<EventMap, Event>;
 
 export type EventWithResponse<EventMap extends PondEventMap> = {
     [Event in keyof EventMap]: EventMap[Event] extends [PondMessage, PondMessage] ? Event : never;

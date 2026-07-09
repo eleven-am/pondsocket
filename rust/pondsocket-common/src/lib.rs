@@ -258,6 +258,52 @@ mod tests {
         assert!(matches!(ev, ChannelEvent::Presence(_)));
     }
 
+    #[test]
+    fn adv_presence_frame_with_unknown_event_is_dropped() {
+        let ev = parse_channel_event(
+            r#"{"action":"PRESENCE","event":"EVICTED","channelName":"/c","requestId":"r1","payload":{"presence":[],"changed":{}}}"#,
+        );
+        assert!(ev.is_err());
+    }
+
+    #[test]
+    fn adv_presence_frame_with_non_array_presence_is_dropped() {
+        let ev = parse_channel_event(
+            r#"{"action":"PRESENCE","event":"JOIN","channelName":"/c","requestId":"r1","payload":{"presence":{},"changed":{}}}"#,
+        );
+        assert!(ev.is_err());
+    }
+
+    #[test]
+    fn adv_presence_frame_missing_changed_parses_with_default() {
+        let ev = parse_channel_event(
+            r#"{"action":"PRESENCE","event":"JOIN","channelName":"/c","requestId":"r1","payload":{"presence":[{"id":"u1"}]}}"#,
+        )
+        .unwrap();
+        match ev {
+            ChannelEvent::Presence(message) => {
+                assert!(message.payload.changed.is_empty());
+                assert_eq!(message.payload.presence.len(), 1);
+            }
+            other => panic!("expected presence event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adv_system_evicted_frame_routes_as_message_not_presence() {
+        let ev = parse_channel_event(
+            r#"{"action":"SYSTEM","event":"EVICTED","channelName":"/c","requestId":"r1","payload":{"reason":"kicked"}}"#,
+        )
+        .unwrap();
+        match ev {
+            ChannelEvent::Message(message) => {
+                assert_eq!(message.event, "EVICTED");
+                assert_eq!(message.action, ServerAction::System);
+            }
+            other => panic!("expected message event, got {other:?}"),
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct Sample {
         id: String,

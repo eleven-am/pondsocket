@@ -1,14 +1,15 @@
-import { Logger } from '@nestjs/common';
 import type { ModuleRef } from '@nestjs/core';
 
 import { Constructor } from '../types';
 
-export function retrieveInstance<Interface> (moduleRef: ModuleRef, Guard: Constructor<Interface>): Interface {
+export async function retrieveInstance<Interface> (moduleRef: ModuleRef, Type: Constructor<Interface>): Promise<Interface> {
     try {
-        return moduleRef.get(Guard, { strict: false });
-    } catch (e) {
-        Logger.warn(`Unable to resolve instance: ${Guard.name}, creating new instance, WARNING: this will not inject dependencies. To fix this, add the instance to the providers array of the PondSocketModule.`);
-
-        return new Guard();
+        return moduleRef.get(Type, { strict: false });
+    } catch {
+        try {
+            return await moduleRef.resolve(Type, undefined, { strict: false });
+        } catch {
+            throw new Error(`Unable to resolve ${Type.name}. Register it in the PondSocketModule providers array.`);
+        }
     }
 }

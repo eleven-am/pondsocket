@@ -26,7 +26,9 @@ from pondsocket_common import (
 )
 
 
-def _client_event(action: str, channel: str, event: str, payload: dict[str, Any] | None = None) -> Event:
+def _client_event(
+    action: str, channel: str, event: str, payload: dict[str, Any] | None = None
+) -> Event:
     return Event(
         action=action,
         channel_name=channel,
@@ -141,9 +143,7 @@ async def test_join_channel_acknowledge_flow() -> None:
     join_req.request_id = "req-join-1"
     await transport.push_inbound(join_req)
 
-    ack = await _expect_event(
-        transport, ServerActions.SYSTEM.value, SystemEvents.ACKNOWLEDGE.value
-    )
+    ack = await _expect_event(transport, ServerActions.SYSTEM.value, SystemEvents.ACKNOWLEDGE.value)
     assert ack.request_id == "req-join-1"
     assert ack.channel_name == "/chat/42"
 
@@ -172,10 +172,32 @@ async def test_join_decline_sends_unauthorized() -> None:
     join_req = _client_event(ClientActions.JOIN_CHANNEL.value, "/chat/42", "join")
     await transport.push_inbound(join_req)
 
-    ev = await _expect_event(
-        transport, ServerActions.SYSTEM.value, SystemEvents.UNAUTHORIZED.value
-    )
+    ev = await _expect_event(transport, ServerActions.SYSTEM.value, SystemEvents.UNAUTHORIZED.value)
     assert ev.payload == {"code": 403, "message": "wrong room"}
+    await pond.close()
+
+
+async def test_join_handler_without_response_auto_declines() -> None:
+    pond = PondSocket()
+
+    async def auth(ctx: ConnectionContext) -> None:
+        ctx.accept()
+
+    endpoint = pond.create_endpoint("/api/socket", auth)
+
+    async def on_join(ctx: JoinContext) -> None:
+        return
+
+    endpoint.create_channel("/chat/:room_id", on_join)
+
+    transport, _ = await _connect(pond)
+    await _next_event(transport)
+
+    join_req = _client_event(ClientActions.JOIN_CHANNEL.value, "/chat/42", "join")
+    await transport.push_inbound(join_req)
+
+    ev = await _expect_event(transport, ServerActions.SYSTEM.value, SystemEvents.UNAUTHORIZED.value)
+    assert ev.payload == {"code": 401, "message": "Join handler did not respond"}
     await pond.close()
 
 
@@ -198,9 +220,7 @@ async def test_unknown_channel_pattern_sends_not_found() -> None:
     join_req = _client_event(ClientActions.JOIN_CHANNEL.value, "/missing/path", "join")
     await transport.push_inbound(join_req)
 
-    ev = await _expect_event(
-        transport, ServerActions.SYSTEM.value, SystemEvents.NOT_FOUND.value
-    )
+    ev = await _expect_event(transport, ServerActions.SYSTEM.value, SystemEvents.NOT_FOUND.value)
     assert ev.payload == {"channel": "/missing/path"}
     await pond.close()
 
@@ -233,9 +253,7 @@ async def test_broadcast_fanouts_to_other_members() -> None:
         await _expect_event(t, ServerActions.SYSTEM.value, SystemEvents.ACKNOWLEDGE.value)
 
     await alice_t.push_inbound(
-        _client_event(
-            ClientActions.BROADCAST.value, "/chat/1", "message", {"text": "hi"}
-        )
+        _client_event(ClientActions.BROADCAST.value, "/chat/1", "message", {"text": "hi"})
     )
 
     ev_a = await _expect_event(alice_t, ServerActions.BROADCAST.value, "message")

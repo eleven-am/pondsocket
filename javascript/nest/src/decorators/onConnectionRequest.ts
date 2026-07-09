@@ -18,9 +18,10 @@ export function OnConnectionRequest (): MethodDecorator {
                     originalMethod,
                     propertyKey as string,
                     ctx,
+                    'connection',
                 );
             } catch (error) {
-                performErrors(error, ctx);
+                performErrors(error, ctx, 'connection');
             }
         });
     };

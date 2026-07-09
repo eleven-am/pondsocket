@@ -55,7 +55,7 @@ describe('performResponse', () => {
             const ctx = createJoinContext();
             const data = { assigns: { role: 'admin' } };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'join');
 
             expect(ctx.assign).toHaveBeenCalledWith({ role: 'admin' });
             expect(ctx.accept).toHaveBeenCalled();
@@ -65,7 +65,7 @@ describe('performResponse', () => {
             const ctx = createJoinContext();
             const data = { event: 'welcome', message: 'hello' };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'join');
 
             expect(ctx.reply).toHaveBeenCalledWith('welcome', { message: 'hello' });
         });
@@ -74,7 +74,7 @@ describe('performResponse', () => {
             const ctx = createJoinContext();
             const data = { broadcast: 'user_joined', name: 'alice' };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'join');
 
             expect(ctx.broadcast).toHaveBeenCalledWith('user_joined', { name: 'alice' });
         });
@@ -83,7 +83,7 @@ describe('performResponse', () => {
             const ctx = createJoinContext();
             const data = { broadcastFrom: 'user_action', detail: 'moved' };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'join');
 
             expect(ctx.broadcastFrom).toHaveBeenCalledWith('user_action', { detail: 'moved' });
         });
@@ -92,7 +92,7 @@ describe('performResponse', () => {
             const ctx = createJoinContext();
             const data = { broadcastTo: { event: 'dm', users: ['u2', 'u3'] }, text: 'hi' };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'join');
 
             expect(ctx.broadcastTo).toHaveBeenCalledWith('dm', { text: 'hi' }, ['u2', 'u3']);
         });
@@ -103,7 +103,7 @@ describe('performResponse', () => {
             const ctx = createEventContext();
             const data = { event: 'response_event', value: 42 };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'event');
 
             expect(ctx.reply).toHaveBeenCalledWith('response_event', { value: 42 });
         });
@@ -112,7 +112,7 @@ describe('performResponse', () => {
             const ctx = createEventContext();
             const data = { assigns: { score: 10 } };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'event');
 
             expect(ctx.assign).toHaveBeenCalledWith({ score: 10 });
             expect((ctx as any).accept).toBeUndefined();
@@ -127,11 +127,24 @@ describe('performResponse', () => {
                 info: 'test',
             };
 
-            performResponse('u1', ctx.channel as any, data, ctx as any);
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'event');
 
             expect(ctx.broadcast).toHaveBeenCalledWith('bc_event', { info: 'test' });
             expect(ctx.broadcastFrom).toHaveBeenCalledWith('bf_event', { info: 'test' });
             expect(ctx.broadcastTo).toHaveBeenCalledWith('bt_event', { info: 'test' }, ['u2']);
+        });
+
+        it('resolves declarative event params before calling the two-argument context API', () => {
+            const ctx = createEventContext();
+            const data = {
+                broadcast: 'message/:messageId',
+                eventParams: { messageId: '42' },
+                payload: { text: 'hello' },
+            };
+
+            performResponse('u1', ctx.channel as any, data, ctx as any, 'event');
+
+            expect(ctx.broadcast).toHaveBeenCalledWith('message/42', { text: 'hello' });
         });
     });
 
@@ -141,7 +154,7 @@ describe('performResponse', () => {
             const channel = ctx.channel;
             const data = { presence: { status: 'active' } };
 
-            performResponse('u1', channel as any, data, ctx as any);
+            performResponse('u1', channel as any, data, ctx as any, 'join');
 
             expect(channel.upsertPresence).toHaveBeenCalledWith('u1', { status: 'active' });
         });
@@ -150,7 +163,7 @@ describe('performResponse', () => {
             const ctx = createEventContext();
             const data = { presence: { status: 'active' } };
 
-            performResponse('u1', null, data, ctx as any);
+            performResponse('u1', null, data, ctx as any, 'event');
         });
     });
 
@@ -158,7 +171,7 @@ describe('performResponse', () => {
         it('does nothing when data is null', () => {
             const ctx = createJoinContext();
 
-            performResponse('u1', ctx.channel as any, null, ctx as any);
+            performResponse('u1', ctx.channel as any, null, ctx as any, 'join');
 
             expect(ctx.accept).not.toHaveBeenCalled();
             expect(ctx.reply).not.toHaveBeenCalled();
@@ -167,7 +180,7 @@ describe('performResponse', () => {
         it('does nothing when data is undefined', () => {
             const ctx = createJoinContext();
 
-            performResponse('u1', ctx.channel as any, undefined, ctx as any);
+            performResponse('u1', ctx.channel as any, undefined, ctx as any, 'join');
 
             expect(ctx.accept).not.toHaveBeenCalled();
             expect(ctx.reply).not.toHaveBeenCalled();
@@ -178,13 +191,13 @@ describe('performResponse', () => {
         it('returns early when data is null', () => {
             const ctx = createLeaveEvent();
 
-            performResponse('u1', ctx.channel as any, null, ctx as any);
+            performResponse('u1', ctx.channel as any, null, ctx as any, 'leave');
         });
 
         it('returns early when data is undefined', () => {
             const ctx = createLeaveEvent();
 
-            performResponse('u1', ctx.channel as any, undefined, ctx as any);
+            performResponse('u1', ctx.channel as any, undefined, ctx as any, 'leave');
         });
     });
 
@@ -193,7 +206,7 @@ describe('performResponse', () => {
             const ctx = createConnectionContext();
             const data = { assigns: { token: 'abc' } };
 
-            performResponse('c1', null, data, ctx as any);
+            performResponse('c1', null, data, ctx as any, 'connection');
 
             expect(ctx.assign).toHaveBeenCalledWith({ token: 'abc' });
             expect(ctx.accept).toHaveBeenCalled();
@@ -204,7 +217,7 @@ describe('performResponse', () => {
             ctx.hasResponded = true;
             const data = { assigns: { token: 'abc' } };
 
-            performResponse('c1', null, data, ctx as any);
+            performResponse('c1', null, data, ctx as any, 'connection');
 
             expect(ctx.assign).not.toHaveBeenCalled();
             expect(ctx.accept).not.toHaveBeenCalled();

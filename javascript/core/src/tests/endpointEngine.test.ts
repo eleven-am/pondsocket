@@ -2,6 +2,7 @@ import {
     ChannelEvent,
     ClientActions,
     ClientMessage,
+    ErrorTypes,
     PondPath,
     ServerActions,
     SystemSender,
@@ -92,6 +93,10 @@ describe('EndpointEngine', () => {
 
             expect(channel1).toBeInstanceOf(PondChannel);
             expect(channel2).toBeInstanceOf(PondChannel);
+        });
+
+        it('should reject unsupported channel patterns during registration', () => {
+            expect(() => endpointEngine.createChannel('job:*', jest.fn())).toThrow(/wildcards must occupy an entire path segment/);
         });
     });
 
@@ -482,6 +487,19 @@ describe('EndpointEngine', () => {
             const lastCall = JSON.parse(calls[calls.length - 1][0]);
 
             expect(lastCall.action).toBe(ServerActions.ERROR);
+            expect(lastCall.event).toBe(ErrorTypes.CHANNEL_NOT_FOUND);
+            expect(lastCall.channelName).toBe('/nonexistent');
+            expect(lastCall.requestId).toBe('123');
+            expect(lastCall.payload).toEqual({
+                code: ErrorTypes.CHANNEL_NOT_FOUND,
+                message: 'GatewayEngine: Channel /nonexistent does not exist',
+                status: 404,
+                statusCode: 404,
+                error: {
+                    message: 'GatewayEngine: Channel /nonexistent does not exist',
+                    status: 404,
+                },
+            });
         });
     });
 });

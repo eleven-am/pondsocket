@@ -1,5 +1,27 @@
 export * from './decorators';
 export * from './modules/pondSocket';
+export * from './services/pondSocket';
 export * from './helpers/createParamDecorator';
 export { Context } from './context/context';
-export type { CanActivate, Metadata, AsyncMetadata, AsyncFactoryResult, PondResponse, Constructor, ParamDecoratorCallback, NestContext } from './types';
+export type {
+    AsyncFactoryResult,
+    AsyncMetadata,
+    CanActivate,
+    Constructor,
+    Metadata,
+    NestContext,
+    ParamDecoratorCallback,
+    PondEventContext,
+    PondEventHandler,
+    PondEventPayload,
+    PondCoreEventContext,
+    PondCoreJoinContext,
+    PondCoreOutgoingContext,
+    PondConnectionContext,
+    PondJoinContext,
+    PondOutgoingContext,
+    PondResponse,
+    PondResponseFor,
+    PondSchemaAssigns,
+    PondSchemaPresence,
+} from './types';

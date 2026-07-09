@@ -190,14 +190,10 @@ class Endpoint:
         for reg in list(self._channel_registrations):
             for channel in await reg.lobby.list_channels():
                 if await channel.has_user(user_id):
-                    await channel.remove_user(
-                        user_id, reason=LeaveReason.CONNECTION_CLOSED.value
-                    )
+                    await channel.remove_user(user_id, reason=LeaveReason.CONNECTION_CLOSED.value)
         await self._connections.discard(user_id)
         connect_at = self._connect_times.pop(user_id, None)
-        duration = (
-            time.monotonic() - connect_at if connect_at is not None else 0.0
-        )
+        duration = time.monotonic() - connect_at if connect_at is not None else 0.0
         self._fire_metric_connection_closed(user_id, duration)
         await self._fire_on_disconnect(transport)
 
@@ -246,9 +242,12 @@ class Endpoint:
         channel = await self._find_channel(event.channel_name)
         if channel is None:
             return
-        await channel.remove_user(
-            transport.get_id(), reason=LeaveReason.EXPLICIT_LEAVE.value
-        )
+        user_id = transport.get_id()
+        if not await channel.has_user(user_id):
+            return
+        removed = await channel.remove_user(user_id, reason=LeaveReason.EXPLICIT_LEAVE.value)
+        if not removed:
+            return
         ack = Event(
             action=ServerActions.SYSTEM.value,
             channel_name=event.channel_name,
@@ -344,9 +343,7 @@ class Endpoint:
         except Exception:
             return
 
-    async def _fire_before_join(
-        self, transport: Transport, channel_name: str
-    ) -> None:
+    async def _fire_before_join(self, transport: Transport, channel_name: str) -> None:
         hooks = self._options.hooks
         if hooks is None or hooks.before_join is None:
             return
@@ -359,9 +356,7 @@ class Endpoint:
         except Exception:
             return
 
-    async def _fire_after_join(
-        self, transport: Transport, channel_name: str
-    ) -> None:
+    async def _fire_after_join(self, transport: Transport, channel_name: str) -> None:
         hooks = self._options.hooks
         if hooks is None or hooks.after_join is None:
             return

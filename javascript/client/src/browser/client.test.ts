@@ -1,6 +1,17 @@
-import { ChannelEvent, ClientActions, Events, ServerActions } from '@eleven-am/pondsocket-common';
+import {
+    ChannelEvent,
+    ChannelState,
+    ClientActions,
+    definePondChannel,
+    definePondSchema,
+    ErrorTypes,
+    Events,
+    PondSchema,
+    ServerActions,
+} from '@eleven-am/pondsocket-common';
 
 import { PondClient } from './client';
+import { Channel } from '../core/channel';
 import { ConnectionState } from '../types';
 
 class MockWebSocket {
@@ -8,16 +19,16 @@ class MockWebSocket {
 
     static OPEN = 1;
 
-    send: Function = jest.fn();
+    send: (...args: unknown[]) => unknown = jest.fn();
 
-    close: Function = jest.fn();
+    close: (...args: unknown[]) => unknown = jest.fn();
 
     readyState = MockWebSocket.CONNECTING;
 
     constructor (readonly url: string) {}
 }
 
-// @ts-expect-error
+// @ts-expect-error the test installs a deliberately incomplete WebSocket implementation
 global.WebSocket = MockWebSocket;
 
 describe('PondClient', () => {
@@ -107,8 +118,60 @@ describe('PondClient', () => {
         const mockChannel = pondClient.createChannel('exampleChannel');
         const mockExistingChannel = pondClient.createChannel('exampleChannel');
 
-        expect(mockChannel).toBeInstanceOf(require('../core/channel').Channel);
+        expect(mockChannel).toBeInstanceOf(Channel);
         expect(mockExistingChannel).toBe(mockChannel);
+    });
+
+    test('createChannel builds a channel name from a shared definition', () => {
+        interface Schema extends PondSchema<{ message: { text: string } }, {}, {}, { token: string }> {}
+
+        const schema = definePondSchema<Schema>();
+        const definition = definePondChannel(schema, '/rooms/:roomId');
+        const channel = pondClient.createChannel(definition, {
+            params: {
+                roomId: 'general',
+            },
+            joinParams: {
+                token: 'secret',
+            },
+        });
+
+        expect(channel).toBe(pondClient.createChannel('/rooms/general', { token: 'secret' }));
+    });
+
+    test('channel-scoped errors decline the pending join', () => {
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket']! as any;
+        const channel = pondClient.createChannel('missing');
+
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: Events.CONNECTION,
+                action: ServerActions.CONNECT,
+                channelName: 'ENDPOINT',
+                requestId: 'connection',
+                payload: {},
+            }),
+        });
+        channel.join();
+        const joinRequest = JSON.parse(mockWebSocket.send.mock.calls[0][0]);
+
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: ErrorTypes.CHANNEL_NOT_FOUND,
+                action: ServerActions.ERROR,
+                channelName: 'missing',
+                requestId: joinRequest.requestId,
+                payload: {
+                    code: ErrorTypes.CHANNEL_NOT_FOUND,
+                    message: 'Missing channel',
+                    status: 404,
+                },
+            }),
+        });
+
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+        expect(channel.joinError?.message).toBe('Missing channel');
     });
 
     test('onConnectionChange method should subscribe to connection state changes', () => {

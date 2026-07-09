@@ -122,10 +122,10 @@ impl Endpoint {
         let uid = user_id.unwrap_or_else(uuid);
         incoming.id = uid.clone();
         let mut ctx = ConnectionContext::new(uid, incoming, route);
-        if let Err(err) = self.connection_handler.call(&mut ctx).await {
-            if ctx.decision() == ConnectionDecision::Pending {
-                let _ = ctx.decline(err.code, err.message);
-            }
+        if let Err(err) = self.connection_handler.call(&mut ctx).await
+            && ctx.decision() == ConnectionDecision::Pending
+        {
+            let _ = ctx.decline(err.code, err.message);
         }
         if ctx.decision() == ConnectionDecision::Pending {
             let _ = ctx.decline(401, "Connection handler did not accept or decline");
@@ -217,39 +217,41 @@ impl Endpoint {
             let Ok(route) = parse(&reg.pattern, &event.channel_name) else {
                 continue;
             };
-            let channel = reg.lobby.get_or_create_channel(&event.channel_name).await?;
-            if let Some(hooks) = &self.options.hooks {
-                if let Some(before) = &hooks.before_join {
-                    let user = User {
-                        id: transport.id().to_owned(),
-                        assigns: transport.clone_assigns().await,
-                        presence: None,
-                    };
-                    before.call(&user, &event.channel_name).await;
-                }
+            let channel = reg.lobby.acquire_for_join(&event.channel_name).await?;
+            if let Some(hooks) = &self.options.hooks
+                && let Some(before) = &hooks.before_join
+            {
+                let user = User {
+                    id: transport.id().to_owned(),
+                    assigns: transport.clone_assigns().await,
+                    presence: None,
+                };
+                before.call(&user, &event.channel_name).await;
             }
-            let mut ctx = JoinContext::new(channel, event.clone(), transport.clone(), route);
-            if let Err(err) = reg.handler.call(&mut ctx).await {
-                if !ctx.has_responded() {
-                    let _ = ctx.decline(err.code, err.message).await;
-                }
+            let mut ctx =
+                JoinContext::new(channel.clone(), event.clone(), transport.clone(), route);
+            if let Err(err) = reg.handler.call(&mut ctx).await
+                && !ctx.has_responded()
+            {
+                let _ = ctx.decline(err.code, err.message).await;
             }
+            let mut outcome = Ok(());
             if !ctx.has_responded() {
-                ctx.decline(401, "Join handler did not respond").await?;
+                outcome = ctx.decline(401, "Join handler did not respond").await;
             }
-            if ctx.is_accepted() {
-                if let Some(hooks) = &self.options.hooks {
-                    if let Some(after) = &hooks.after_join {
-                        let user = User {
-                            id: transport.id().to_owned(),
-                            assigns: transport.clone_assigns().await,
-                            presence: None,
-                        };
-                        after.call(&user, &event.channel_name).await;
-                    }
-                }
+            if ctx.is_accepted()
+                && let Some(hooks) = &self.options.hooks
+                && let Some(after) = &hooks.after_join
+            {
+                let user = User {
+                    id: transport.id().to_owned(),
+                    assigns: transport.clone_assigns().await,
+                    presence: None,
+                };
+                after.call(&user, &event.channel_name).await;
             }
-            return Ok(());
+            reg.lobby.finish_join(channel).await;
+            return outcome;
         }
         let channel_name = event.channel_name.clone();
         transport

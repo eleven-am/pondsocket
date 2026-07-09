@@ -1,10 +1,18 @@
-import { PondSocket } from '@eleven-am/pondsocket';
+import {
+    definePondChannel,
+    definePondEndpoint,
+    definePondSchema,
+    PondSocket,
+    ServerActions,
+} from '@eleven-am/pondsocket';
 import { PondClient } from '@eleven-am/pondsocket-client';
 
 type ChatSchema = {
     events: {
         chat: { text: string };
         ping: [{ n: number }, { ok: boolean }];
+        'typed/:eventId': { value: string };
+        'lookup/:lookupId': [{ query: string }, { result: string }];
     };
     presence: { userId: string; status: 'online' | 'away' };
     assigns: { role: 'admin' | 'user' };
@@ -31,10 +39,10 @@ const channel = endpoint.createChannel<'/room/:id', ChatSchema>('/room/:id', (ct
 channel.onEvent('chat', (ctx) => {
     ctx.payload.text.toUpperCase();
     ctx.user?.assigns.role;
-    ctx.reply('ping', { n: 1 });
-
-    // @ts-expect-error ping request payload is { n: number }
     ctx.reply('ping', { ok: true });
+
+    // @ts-expect-error ping response payload is { ok: boolean }
+    ctx.reply('ping', { n: 1 });
 });
 
 channel.broadcast('lobby', 'chat', { text: 'ok' });
@@ -108,3 +116,74 @@ clientChannel.onMessageEvent('chat', (message) => {
 clientChannel.presence.forEach((presence) => {
     presence.userId.toUpperCase();
 });
+
+const Chat = definePondChannel(
+    definePondSchema<ChatSchema>(),
+    '/room/:roomId',
+);
+const Socket = definePondEndpoint('/socket/:token');
+
+const typedEndpoint = pond.createEndpoint(Socket, (ctx) => {
+    ctx.params.token.toUpperCase();
+    ctx.accept();
+});
+
+const typedChannel = typedEndpoint.createChannel(Chat, (ctx) => {
+    ctx.params.roomId.toUpperCase();
+    ctx.joinParams.token.toUpperCase();
+    ctx.user.assigns.role.toUpperCase();
+    ctx.trackPresence({ userId: 'u1', status: 'online' });
+    ctx.accept({ role: 'admin' });
+});
+
+typedChannel.handleOutgoingEvent('ping', (ctx) => {
+    if (ctx.action === ServerActions.BROADCAST) {
+        ctx.payload.n.toFixed();
+        ctx.transform({ n: ctx.payload.n + 1 });
+
+        // @ts-expect-error broadcast payloads contain n, not ok
+        ctx.payload.ok;
+    } else {
+        ctx.payload.ok.valueOf();
+        ctx.transform({ ok: !ctx.payload.ok });
+
+        // @ts-expect-error system reply payloads contain ok, not n
+        ctx.payload.n;
+    }
+});
+
+const definedClientChannel = client.createChannel(Chat, {
+    params: { roomId: 'general' },
+    joinParams: { token: 'secret' },
+});
+
+definedClientChannel.sendMessage('chat', { text: 'typed' });
+definedClientChannel.sendForResponse('ping', { n: 1 }).then((response) => response.ok.valueOf());
+definedClientChannel.sendMessage('typed/:eventId', { value: 'typed' }, { eventId: 'event-1' });
+definedClientChannel.sendForResponse('lookup/:lookupId', { query: 'typed' }, { lookupId: 'lookup-1' })
+    .then((response) => response.result.toUpperCase());
+definedClientChannel.onMessageEvent('typed/:eventId', (message, event) => {
+    message.value.toUpperCase();
+    event.params.eventId.toUpperCase();
+});
+definedClientChannel.onJoin((presence) => presence.status.toUpperCase());
+definedClientChannel.onError((error) => error.status.toFixed());
+definedClientChannel.joinError?.message.toUpperCase();
+
+// @ts-expect-error route params are required by the channel definition
+client.createChannel(Chat, { joinParams: { token: 'secret' } });
+
+// @ts-expect-error join params are required by ChatSchema
+client.createChannel(Chat, { params: { roomId: 'general' } });
+
+// @ts-expect-error roomId is the route parameter name
+client.createChannel(Chat, { params: { id: 'general' }, joinParams: { token: 'secret' } });
+
+// @ts-expect-error join parameter token must be a string
+client.createChannel(Chat, { params: { roomId: 'general' }, joinParams: { token: 1 } });
+
+// @ts-expect-error dynamic events require their route params
+definedClientChannel.sendMessage('typed/:eventId', { value: 'typed' });
+
+// @ts-expect-error dynamic response events require their route params
+definedClientChannel.sendForResponse('lookup/:lookupId', { query: 'typed' });

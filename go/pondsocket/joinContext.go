@@ -104,15 +104,16 @@ func (c *JoinContext) Decline(statusCode int, message string) error {
 	}
 	c.HasResponded = true
 	c.accepted = false
+	declineErr := unauthorized(c.Channel.name, message)
+	declineErr.Code = statusCode
 	declineEvent := Event{
 		Action:      system,
 		ChannelName: c.Channel.name,
 		RequestId:   c.event.RequestId,
 		Event:       string(unauthorizedEvent),
-		Payload: unauthorized(c.Channel.name, message).
-			withDetails(map[string]int{
-				"statusCode": statusCode,
-			}),
+		Payload: declineErr.withDetails(map[string]int{
+			"statusCode": statusCode,
+		}),
 	}
 	return c.conn.SendJSON(declineEvent)
 }

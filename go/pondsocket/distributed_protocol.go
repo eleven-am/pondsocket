@@ -48,6 +48,8 @@ type distributedEnvelope struct {
 	RecipientDescriptor interface{}       `json:"recipientDescriptor,omitempty"`
 	UserID              string            `json:"userId,omitempty"`
 	Presence            interface{}       `json:"presence,omitempty"`
+	PresenceList        []interface{}     `json:"presenceList,omitempty"`
+	PresenceEvent       string            `json:"presenceEvent,omitempty"`
 	Assigns             interface{}       `json:"assigns,omitempty"`
 	Reason              string            `json:"reason,omitempty"`
 	FromNode            string            `json:"fromNode,omitempty"`
@@ -84,14 +86,22 @@ func distributedBytesFromEvent(endpoint string, event Event, sender string, reci
 			env.RecipientDescriptor = "ALL_USERS"
 		}
 	case msgPresenceUpdate:
+		env.PresenceEvent = event.Event
 		if payload, ok := event.Payload.(presencePayload); ok {
 			env.UserID = payload.UserID
 			env.Presence = payload.Change
+			if len(payload.Presence) > 0 {
+				env.PresenceList = payload.Presence
+			}
 		} else if payload, ok := event.Payload.(map[string]interface{}); ok {
 			env.UserID, _ = payload["userId"].(string)
-			env.Presence = payload["change"]
+			env.Presence = payload["changed"]
+			if list, ok := payload["presence"].([]interface{}); ok && len(list) > 0 {
+				env.PresenceList = list
+			}
 		}
 	case msgPresenceRemoved:
+		env.PresenceEvent = event.Event
 		if payload, ok := event.Payload.(presencePayload); ok {
 			env.UserID = payload.UserID
 		} else if payload, ok := event.Payload.(map[string]interface{}); ok {
@@ -247,11 +257,21 @@ func eventFromEnvelope(env *distributedEnvelope) (*Event, bool) {
 		}
 	case msgPresenceUpdate:
 		ev.Action = presence
-		ev.Event = string(update)
-		ev.Payload = map[string]interface{}{"userId": env.UserID, "change": env.Presence}
+		ev.Event = env.PresenceEvent
+		if ev.Event == "" {
+			ev.Event = string(update)
+		}
+		payload := map[string]interface{}{"userId": env.UserID, "changed": env.Presence}
+		if len(env.PresenceList) > 0 {
+			payload["presence"] = env.PresenceList
+		}
+		ev.Payload = payload
 	case msgPresenceRemoved:
 		ev.Action = presence
-		ev.Event = string(leave)
+		ev.Event = env.PresenceEvent
+		if ev.Event == "" {
+			ev.Event = string(leave)
+		}
 		ev.Payload = map[string]interface{}{"userId": env.UserID}
 	case msgAssignsUpdate:
 		ev.Action = assigns

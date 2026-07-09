@@ -1,10 +1,12 @@
+import { ServerActions } from '@eleven-am/pondsocket-common';
+
 import { OutgoingContext } from '../contexts/outgoingContext';
 import { MockChannelEngine } from './mocks/channelEnegine';
 
 describe('OutgoingContext', () => {
     let context: OutgoingContext<string>;
     let engine: MockChannelEngine;
-    const event = { event: 'test-event', payload: { data: 'hello' }, action: 'broadcast' as any, channelName: 'test-channel', requestId: 'req-1' };
+    const event = { event: 'test-event', payload: { data: 'hello' }, action: ServerActions.BROADCAST, channelName: 'test-channel', requestId: 'req-1' };
     const params = { params: {}, query: {} };
     const userId = 'user-1';
 
@@ -16,6 +18,11 @@ describe('OutgoingContext', () => {
     describe('payload', () => {
         it('should return the original payload', () => {
             expect(context.payload).toEqual({ data: 'hello' });
+        });
+
+        it('exposes the outgoing action', () => {
+            expect(context.action).toBe(ServerActions.BROADCAST);
+            expect(context.event.action).toBe(ServerActions.BROADCAST);
         });
     });
 
@@ -45,6 +52,7 @@ describe('OutgoingContext', () => {
 
             context.transform(newPayload);
             expect(context.payload).toEqual(newPayload);
+            expect(context.event.payload).toEqual(newPayload);
         });
 
         it('should return this for chaining', () => {

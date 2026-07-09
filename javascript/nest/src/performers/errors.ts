@@ -1,9 +1,16 @@
-import type { ConnectionContext, JoinContext, EventContext } from '@eleven-am/pondsocket/types';
-import { HttpException } from '@nestjs/common';
+import type { ConnectionContext, EventContext, JoinContext } from '@eleven-am/pondsocket/types';
+import { ErrorTypes } from '@eleven-am/pondsocket-common';
+import { HttpException, Logger } from '@nestjs/common';
 
-import { isEventContext } from './narrow';
+import { PondLifecycle } from '../types';
 
-export function performErrors (error: unknown, response: ConnectionContext<string> | JoinContext<string> | EventContext<string>) {
+const logger = new Logger('PondSocketHandler');
+
+export function performErrors (
+    error: unknown,
+    response: ConnectionContext<string> | JoinContext<string> | EventContext<string>,
+    lifecycle: 'connection' | 'join' | 'event',
+) {
     let message: string;
     let data: unknown;
     let status: number;
@@ -20,19 +27,26 @@ export function performErrors (error: unknown, response: ConnectionContext<strin
         status = 500;
     }
 
-    if (isEventContext(response)) {
-        return response.reply('UNKNOWN_ERROR', {
+    logger.error(message, error instanceof Error ? error.stack : undefined);
+
+    if (lifecycle === 'event') {
+        return (response as EventContext<string>).reply(ErrorTypes.INTERNAL_SERVER_ERROR, {
+            code: ErrorTypes.INTERNAL_SERVER_ERROR,
             message,
             data,
             status,
         });
     }
 
-    if (!response.hasResponded) {
-        return response.decline(message, status);
-    }
+    const pendingResponse = response as ConnectionContext<string> | JoinContext<string>;
 
-    if (process.env.NODE_ENV === 'development') {
-        console.error(error);
+    if (!pendingResponse.hasResponded) {
+        return pendingResponse.decline(message, status);
     }
+}
+
+export function logHandlerError (error: unknown, lifecycle: PondLifecycle, propertyKey: string | symbol) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    logger.error(`Error in ${lifecycle} handler "${String(propertyKey)}": ${message}`, error instanceof Error ? error.stack : undefined);
 }

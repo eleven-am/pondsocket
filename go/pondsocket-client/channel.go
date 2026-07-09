@@ -7,6 +7,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const maxQueueSize = 100
+
 // Channel represents a PondSocket channel
 type Channel struct {
 	name           string
@@ -340,11 +342,18 @@ func (c *Channel) OnChannelStateChange(callback ChannelStateHandler) func() {
 
 // Acknowledge acknowledges that the channel has been joined
 func (c *Channel) Acknowledge(eventChan <-chan ChannelEvent, unsubscribe ...func()) {
-	c.setState(Joined)
 	var cleanup func()
 	if len(unsubscribe) > 0 {
 		cleanup = unsubscribe[0]
 	}
+	state := c.State()
+	if state != Joining && state != Stalled {
+		if cleanup != nil {
+			cleanup()
+		}
+		return
+	}
+	c.setState(Joined)
 	c.init(eventChan, cleanup)
 	c.emptyQueue()
 }
@@ -420,9 +429,36 @@ func (c *Channel) close() {
 	})
 }
 
+func (c *Channel) decline(event ChannelEvent) {
+	state := c.State()
+	if state != Joining && state != Stalled {
+		c.surface(event)
+		return
+	}
+	c.setState(Declined)
+
+	c.mu.Lock()
+	c.queue = c.queue[:0]
+	c.mu.Unlock()
+
+	c.surface(event)
+}
+
+func (c *Channel) surface(event ChannelEvent) {
+	select {
+	case c.eventChan <- event:
+	case <-c.ctx:
+	default:
+	}
+}
+
 // setState updates the channel state and notifies subscribers
 func (c *Channel) setState(state ChannelState) {
 	c.stateMu.Lock()
+	if c.currentState == Closed && state != Closed {
+		c.stateMu.Unlock()
+		return
+	}
 	oldState := c.currentState
 	c.currentState = state
 	c.stateMu.Unlock()
@@ -438,13 +474,21 @@ func (c *Channel) setState(state ChannelState) {
 
 // publish sends a message, queuing it if the channel is not joined
 func (c *Channel) publish(message ClientMessage) {
-	if message.Action == JoinChannel || message.Action == LeaveChannel || c.State() == Joined {
+	if message.Action == JoinChannel || message.Action == LeaveChannel {
 		c.publisher(message)
 		return
 	}
 
 	c.mu.Lock()
+	if c.State() == Joined {
+		c.mu.Unlock()
+		c.publisher(message)
+		return
+	}
 	c.queue = append(c.queue, message)
+	if len(c.queue) > maxQueueSize {
+		c.queue = c.queue[len(c.queue)-maxQueueSize:]
+	}
 	c.mu.Unlock()
 }
 
@@ -476,7 +520,7 @@ func (c *Channel) subscribeToPresence(callback func(PresenceEventTypes, Presence
 				if event.Action == Presence {
 					payload, err := event.GetPresencePayload()
 					if err == nil {
-						callback(PresenceEventTypes(event.Event), *payload)
+						callback(normalizePresenceEventType(event.Event), *payload)
 					}
 				}
 			case <-sub.done:

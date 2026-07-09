@@ -84,9 +84,9 @@ type recipients struct {
 }
 
 const (
-	join                 presenceEventType = "presence:join"
-	leave                presenceEventType = "presence:leave"
-	update               presenceEventType = "presence:update"
+	join                 presenceEventType = "JOIN"
+	leave                presenceEventType = "LEAVE"
+	update               presenceEventType = "UPDATE"
 	userEvictCommand     userCommandType   = "user:evict"
 	userRemoveCommand    userCommandType   = "user:remove"
 	userGetRequest       userCommandType   = "user:get_request"

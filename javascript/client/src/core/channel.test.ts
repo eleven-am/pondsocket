@@ -3,8 +3,10 @@ import {
     ChannelEvent,
     ChannelState,
     ClientActions,
+    ErrorTypes,
     JoinParams,
     PresenceEventTypes,
+    PondSchema,
     ServerActions,
     Subject,
 } from '@eleven-am/pondsocket-common';
@@ -106,9 +108,9 @@ describe('Channel', () => {
         state2.publish(ConnectionState.CONNECTED);
         expect(publisher2).not.toHaveBeenCalled();
 
-        // if for some reason the server responds with an ack, the channel should still join, (The server is the source of truth)
+        // a late acknowledgement must not reopen an explicitly closed channel
         channel2.acknowledge(receiver);
-        expect(channel2.channelState).toBe(ChannelState.JOINED);
+        expect(channel2.channelState).toBe(ChannelState.CLOSED);
     });
 
     it('should notify subscribers when the channel state changes', () => {
@@ -223,6 +225,7 @@ describe('Channel', () => {
         expect(presenceListener).not.toHaveBeenCalled();
 
         // acknowledge the join
+        channel.join();
         channel.acknowledge(receiver);
 
         receiver.publish({
@@ -317,6 +320,7 @@ describe('Channel', () => {
         expect(presenceListener).not.toHaveBeenCalled();
 
         // acknowledge the join
+        channel.join();
         channel.acknowledge(receiver);
 
         receiver.publish({
@@ -411,6 +415,7 @@ describe('Channel', () => {
         expect(presenceListener).not.toHaveBeenCalled();
 
         // acknowledge the join
+        channel.join();
         channel.acknowledge(receiver);
 
         receiver.publish({
@@ -557,6 +562,7 @@ describe('Channel', () => {
         expect(presenceListener).not.toHaveBeenCalled();
 
         // acknowledge the join
+        channel.join();
         channel.acknowledge(receiver);
 
         receiver.publish({
@@ -794,6 +800,9 @@ describe('Channel', () => {
         expect(specificMessageListener).toHaveBeenCalledWith({
             id: 'test',
             message: 'test',
+        }, {
+            params: {},
+            query: {},
         });
 
         specificMessageListener.mockClear();
@@ -829,11 +838,56 @@ describe('Channel', () => {
     it('should handle decline by setting state to DECLINED and clearing queue', () => {
         const { channel } = createChannel();
 
+        channel.join();
         channel.sendMessage('queued', { data: 'test' });
 
-        channel.decline({ message: 'Not authorized', statusCode: 403 });
+        channel.decline({
+            code: ErrorTypes.UNAUTHORIZED_JOIN_REQUEST,
+            message: 'Not authorized',
+            status: 403,
+            statusCode: 403,
+        });
 
         expect(channel.channelState).toBe(ChannelState.DECLINED);
+        expect(channel.joinError).toEqual(expect.objectContaining({
+            message: 'Not authorized',
+            status: 403,
+        }));
+        expect(() => channel.sendMessage('queued', { data: 'test' })).toThrow(/Cannot send messages/);
+    });
+
+    it('should ignore a decline for a stale join request', () => {
+        const { channel, publisher } = createChannel();
+
+        channel.join();
+        const requestId = publisher.mock.calls[0][0].requestId;
+        const error = {
+            code: ErrorTypes.CHANNEL_NOT_FOUND,
+            message: 'Missing',
+            status: 404,
+        };
+
+        channel.decline(error, 'stale-request');
+        expect(channel.channelState).toBe(ChannelState.JOINING);
+
+        channel.decline(error, requestId);
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+    });
+
+    it('should time out a join that receives no terminal response', () => {
+        jest.useFakeTimers();
+        const publisher = jest.fn();
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
+        const channel = new Channel(publisher, state, 'missing', {}, 100, 50);
+
+        channel.join();
+        jest.advanceTimersByTime(50);
+
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+        expect(channel.joinError).toEqual(expect.objectContaining({
+            status: 408,
+        }));
+        jest.useRealTimers();
     });
 
     it('should not re-join when already in JOINED state', () => {
@@ -915,7 +969,6 @@ describe('Channel', () => {
 
         channel.acknowledge(receiver);
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         // @ts-expect-error - this is a test
         const response: any = await channel.sendForResponse('WAITING', {
             id: 'test',
@@ -925,6 +978,42 @@ describe('Channel', () => {
         expect(response).toEqual({
             id: 'test',
             response: 'second-test-response',
+        });
+    });
+
+    it('should build and match event route parameters', () => {
+        type RouteSchema = PondSchema<{
+            'message/:messageId': { text: string };
+        }>;
+        const publisher = jest.fn();
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
+        const receiver = new Subject<ChannelEvent>();
+        const channel = new Channel<RouteSchema>(publisher, state, 'test', {});
+        const listener = jest.fn();
+
+        channel.join();
+        channel.acknowledge(receiver);
+        publisher.mockClear();
+        channel.onMessageEvent('message/:messageId', listener);
+
+        channel.sendMessage('message/:messageId', { text: 'hello' }, { messageId: 'message 1' });
+
+        expect(publisher).toHaveBeenCalledWith(expect.objectContaining({
+            event: 'message/message%201',
+            payload: { text: 'hello' },
+        }));
+
+        receiver.publish({
+            requestId: 'request-1',
+            action: ServerActions.BROADCAST,
+            event: 'message/message%202?source=history',
+            channelName: 'test',
+            payload: { text: 'saved' },
+        });
+
+        expect(listener).toHaveBeenCalledWith({ text: 'saved' }, {
+            params: { messageId: 'message 2' },
+            query: { source: 'history' },
         });
     });
 });

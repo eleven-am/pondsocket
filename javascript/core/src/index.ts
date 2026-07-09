@@ -8,6 +8,7 @@ export { BaseContext } from './contexts/baseContext';
 export { JoinContext } from './contexts/joinContext';
 export { EventContext } from './contexts/eventContext';
 export { OutgoingContext } from './contexts/outgoingContext';
+export type { OutgoingHandlerContext, OutgoingPayload } from './contexts/outgoingContext';
 export { HttpError } from './errors/httpError';
 export type {
     ConnectionHandler,

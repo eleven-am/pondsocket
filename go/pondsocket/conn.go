@@ -244,12 +244,12 @@ func (c *Conn) HandleMessages() {
 				c.mutex.RUnlock()
 
 				if handler == nil {
-					_ = c.SendJSON(errorEvent(internal(string(gatewayEntity), "no handler registered for connection "+c.ID)))
+					_ = c.SendJSON(errorEventWithRequestId(internal(string(gatewayEntity), "no handler registered for connection "+c.ID), event.RequestId))
 					continue
 				}
 
 				if !event.Validate() {
-					_ = c.SendJSON(errorEvent(internal(string(gatewayEntity), "invalid event received from connection "+c.ID)))
+					_ = c.SendJSON(errorEventWithRequestId(internal(string(gatewayEntity), "invalid event received from connection "+c.ID), event.RequestId))
 					continue
 				}
 
@@ -271,7 +271,7 @@ func (c *Conn) HandleMessages() {
 
 					if err := (*h)(ev, c); err != nil {
 						c.reportError("connection_handler", err)
-						if errEv := errorEvent(err); errEv != nil {
+						if errEv := errorEventWithRequestId(err, ev.RequestId); errEv != nil {
 							_ = c.SendJSON(errEv)
 						}
 					}

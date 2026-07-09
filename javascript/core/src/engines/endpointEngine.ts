@@ -1,13 +1,18 @@
 import {
     ChannelEvent,
+    AnyPondChannelDefinition,
     AnyPondSchema,
+    compilePondRoute,
     ClientActions,
     ClientMessage,
     clientMessageSchema,
     ErrorTypes,
     Events,
     JoinParams,
+    isPondChannelDefinition,
+    PathOf,
     PondPath,
+    SchemaOf,
     ServerActions,
     SystemSender,
     uuid,
@@ -46,7 +51,21 @@ export class EndpointEngine {
     /**
      * Creates a new channel on a specified path
      */
-    createChannel<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> (path: PondPath<Path>, handler: AuthorizationHandler<Path, Schema>) {
+    createChannel<Definition extends AnyPondChannelDefinition> (definition: Definition, handler: AuthorizationHandler<PathOf<Definition>, SchemaOf<Definition>>): PondChannel<SchemaOf<Definition>>;
+
+    createChannel<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> (path: PondPath<Path>, handler: AuthorizationHandler<Path, Schema>): PondChannel<Schema>;
+
+    createChannel<Path extends string, Schema extends AnyPondSchema = AnyPondSchema> (pathOrDefinition: PondPath<Path> | AnyPondChannelDefinition, handler: AuthorizationHandler<Path, Schema>) {
+        const path = isPondChannelDefinition(pathOrDefinition) ? pathOrDefinition.path : pathOrDefinition;
+
+        if (typeof path === 'string') {
+            compilePondRoute(path);
+        }
+
+        if (this.#lobbyEngines.has(path)) {
+            throw new HttpError(409, `GatewayEngine: Channel pattern ${String(path)} is already registered`);
+        }
+
         const lobbyEngine = new LobbyEngine(this, this.#backend);
 
         this.#middleware.use((user, joinParams, next) => {
@@ -63,7 +82,18 @@ export class EndpointEngine {
                 const channel = lobbyEngine.getOrCreateChannel(user.channelName);
                 const context = new JoinContext<Path, Schema>(options, channel, user);
 
-                return Promise.resolve(handler(context, next)).then(() => undefined);
+                let delegated = false;
+                const delegate = (error?: HttpError) => {
+                    delegated = true;
+
+                    return next(error);
+                };
+
+                return Promise.resolve(handler(context, delegate)).then(() => {
+                    if (!delegated && !context.hasResponded) {
+                        context.decline('Join handler completed without accepting or declining the request', 500);
+                    }
+                });
             }
 
             next();
@@ -183,8 +213,10 @@ export class EndpointEngine {
         };
 
         this.#middleware.run(cache, joinParams, (error) => {
-            error = error || new HttpError(404, `GatewayEngine: Channel ${channel} does not exist`);
-            throw error;
+            const requestError = error || new HttpError(404, `GatewayEngine: Channel ${channel} does not exist`);
+            const errorType = error ? ErrorTypes.CHANNEL_ERROR : ErrorTypes.CHANNEL_NOT_FOUND;
+
+            this.sendMessage(socket.socket, this.#buildError(requestError, errorType, channel, requestId));
         });
     }
 
@@ -223,7 +255,12 @@ export class EndpointEngine {
     /**
      * Builds an error response
      */
-    #buildError (error: unknown) {
+    #buildError (
+        error: unknown,
+        errorType: ErrorTypes = ErrorTypes.INVALID_MESSAGE,
+        channelName: string = SystemSender.ENDPOINT,
+        requestId: string = uuid(),
+    ) {
         let message: string;
         let status: number;
 
@@ -239,11 +276,15 @@ export class EndpointEngine {
         }
 
         const event: ChannelEvent = {
-            event: ErrorTypes.INVALID_MESSAGE,
+            event: errorType,
             action: ServerActions.ERROR,
-            channelName: SystemSender.ENDPOINT,
-            requestId: uuid(),
+            channelName,
+            requestId,
             payload: {
+                code: errorType,
+                message,
+                status,
+                statusCode: status,
                 error: {
                     message,
                     status,

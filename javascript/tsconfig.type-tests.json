@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "experimentalDecorators": true,
     "strict": true,
     "moduleResolution": "node16",
     "target": "es2022",
@@ -11,6 +12,8 @@
       "@eleven-am/pondsocket": ["./core/dist"],
       "@eleven-am/pondsocket/types": ["./core/dist"],
       "@eleven-am/pondsocket-client": ["./client/dist"],
+      "@eleven-am/pondsocket-express": ["./express/dist"],
+      "@eleven-am/pondsocket-nest": ["./nest/dist"],
       "@eleven-am/pondsocket-common": ["./comnon/dist"]
     }
   },

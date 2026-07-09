@@ -1,6 +1,6 @@
 [project]
 name = "pondsocket-common"
-version = "0.0.5"
+version = "0.0.6"
 description = "Shared wire types, schemas, and reactive primitives for PondSocket."
 readme = "README.md"
 requires-python = ">=3.11"

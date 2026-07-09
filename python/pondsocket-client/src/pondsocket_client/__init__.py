@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
+
 from ._base import BaseClient, ConnectionStateHandler, ErrorHandler
 from ._channel import (
     Channel,
@@ -25,7 +27,10 @@ from .types import (
     Publisher,
 )
 
-__version__ = "0.0.4"
+try:
+    __version__ = version("pondsocket-client")
+except PackageNotFoundError:
+    __version__ = "0.0.1"
 
 __all__ = [
     "DEFAULT_BASE_RECONNECT_DELAY",

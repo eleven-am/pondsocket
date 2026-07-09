@@ -15,9 +15,9 @@ function wrapTransform <Input> (metadata: unknown, data: Input, handler: ParamDe
         const classTransforms = managePipes(context.getClass()).get();
         const methodTransforms = managePipes(context.getInstance(), context.getMethod()).get();
 
-        const transformers = globalPipes
+        const transformers = await Promise.all(globalPipes
             .concat(classTransforms, methodTransforms)
-            .map((Transformer) => retrieveInstance(moduleRef, Transformer));
+            .map((Transformer) => retrieveInstance(moduleRef, Transformer)));
 
         const argumentMetadata: ArgumentMetadata = {
             metatype: metadata as Constructor<unknown>,
@@ -37,7 +37,8 @@ function wrapTransform <Input> (metadata: unknown, data: Input, handler: ParamDe
 export function createParamDecorator<Input> (callback: ParamDecoratorCallback<Input>) {
     return (data: Input): ParameterDecorator => (target, propertyKey, index) => {
         const { set } = manageParameters(target, propertyKey as string);
-        const type = Reflect.getMetadata('design:paramtypes', target, propertyKey!)[index];
+        const parameterTypes = Reflect.getMetadata('design:paramtypes', target, propertyKey!) as unknown[] | undefined;
+        const type = parameterTypes?.[index];
 
         set(index, wrapTransform(type, data, callback));
     };

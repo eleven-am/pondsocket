@@ -23,6 +23,7 @@ export interface RedisDistributedBackendOptions {
 }
 
 export interface PondSocketOptions {
+    closeHttpServerOnShutdown?: boolean;
     server?: HTTPServer;
     socketServer?: WebSocketServer;
     exclusiveServer?: boolean;

@@ -10,6 +10,7 @@ export enum ConnectionState {
 
 export interface ClientOptions {
     connectionTimeout?: number;
+    joinTimeout?: number;
     maxReconnectDelay?: number;
     pingInterval?: number;
 }

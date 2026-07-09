@@ -27,7 +27,7 @@ export class SSEClient extends BaseClient {
 
         try {
             address = new URL(endpoint);
-        } catch (e) {
+        } catch {
             address = new URL(window.location.toString());
             address.pathname = endpoint;
         }
@@ -61,6 +61,7 @@ export class SSEClient extends BaseClient {
                 eventSource.close();
             }
         }, this._options.connectionTimeout);
+        this._unrefTimer(this._connectionTimeoutId);
 
         eventSource.onopen = () => {
             this._clearConnectionTimeout();
@@ -72,10 +73,15 @@ export class SSEClient extends BaseClient {
         };
 
         eventSource.onerror = () => {
+            if (this._eventSource !== eventSource) {
+                return;
+            }
+
             const error = new Error('SSE connection error');
 
             this._errorSubject.publish(error);
             eventSource.close();
+            this._eventSource = undefined;
 
             this._clearConnectionTimeout();
             this._connectionState.publish(ConnectionState.DISCONNECTED);
@@ -125,6 +131,7 @@ export class SSEClient extends BaseClient {
         }
 
         this._eventSource?.close();
+        this._eventSource = undefined;
         this._connectionId = undefined;
         this._clearChannels();
     }

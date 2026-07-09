@@ -1,13 +1,18 @@
-import { Subscriber, Unsubscribe } from './types';
+import { Subscriber, SubjectErrorHandler, Unsubscribe } from './types';
+
+const ignoreObserverError = () => undefined;
 
 export class Subject<T> {
     #isClosed: boolean;
 
     readonly #observers: Set<Subscriber<T>>;
 
-    constructor () {
+    readonly #onObserverError: SubjectErrorHandler<T>;
+
+    constructor (onObserverError: SubjectErrorHandler<T> = ignoreObserverError) {
         this.#isClosed = false;
         this.#observers = new Set<Subscriber<T>>();
+        this.#onObserverError = onObserverError;
     }
 
     /**
@@ -36,7 +41,7 @@ export class Subject<T> {
      * @param message - The message to publish
      */
     publish (message: T) {
-        this.#observers.forEach((observer) => observer(message));
+        this.#observers.forEach((observer) => this.notifyObserver(observer, message));
     }
 
     /**
@@ -45,5 +50,13 @@ export class Subject<T> {
     close () {
         this.#observers.clear();
         this.#isClosed = true;
+    }
+
+    protected notifyObserver (observer: Subscriber<T>, message: T) {
+        try {
+            observer(message);
+        } catch (error) {
+            this.#onObserverError(error, observer);
+        }
     }
 }

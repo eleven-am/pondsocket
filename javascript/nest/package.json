@@ -1,58 +1,62 @@
 {
   "name": "@eleven-am/pondsocket-nest",
-  "version": "0.0.137",
-  "description": "PondSocket is a fast simple socket server",
+  "version": "0.0.138",
+  "description": "NestJS decorators and dependency-injection integration for PondSocket.",
   "keywords": [
-    "socket",
-    "server",
-    "ws",
+    "pondsocket",
+    "nestjs",
     "websocket",
-    "pubsub",
-    "presence",
+    "sse",
     "realtime",
-    "realtime server"
+    "decorators"
+  ],
+  "author": "Roy OSSAI",
+  "license": "GPL-3.0",
+  "homepage": "https://github.com/eleven-am/pondsocket#readme",
+  "bugs": {
+    "url": "https://github.com/eleven-am/pondsocket/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eleven-am/pondsocket.git",
+    "directory": "javascript/nest"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   },
-  "author": "Roy OSSAI",
-  "main": "./index.js",
-  "types": "./index.d.ts",
-  "license": "GPL-3.0",
   "scripts": {
-    "build": "rimraf dist && tsc",
-    "lint": "eslint --ext .ts src",
-    "lint:fix": "eslint --fix --ext .ts src",
-    "copy": "cp package.json dist && cp README.md dist && cp LICENSE dist",
-    "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
-    "pipeline": "npm run build && npm run push"
+    "clean": "rimraf dist",
+    "build": "npm run clean && tsc --project tsconfig.json",
+    "test": "jest --runInBand",
+    "lint": "eslint src --max-warnings=0",
+    "prepack": "npm run build"
   },
   "dependencies": {
-    "@eleven-am/pondsocket": "^0.1.218",
-    "@golevelup/nestjs-discovery": "^6.1.2",
+    "@eleven-am/pondsocket": "^0.1.219",
+    "@eleven-am/pondsocket-common": "^0.0.41",
     "reflect-metadata": "^0.2.2"
   },
-  "devDependencies": {
-    "@eslint/compat": "^2.1.0",
-    "@eslint/eslintrc": "^3.3.5",
-    "@eslint/js": "^9.39.4",
-    "@nestjs/common": "^11.1.23",
-    "@nestjs/core": "^11.1.23",
-    "@stylistic/eslint-plugin-ts": "^4.4.1",
-    "@types/jest": "^30.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.59.4",
-    "@typescript-eslint/parser": "^8.59.4",
-    "eslint": "^9.39.4",
-    "eslint-plugin-file-progress": "^3.0.2",
-    "eslint-plugin-import": "^2.32.0",
-    "globals": "^17.6.0",
-    "jest": "^30.4.2",
-    "prettier": "^3.8.3",
-    "rxjs": "^7.8.2",
-    "ts-jest": "^29.4.11",
-    "ts-loader": "^9.5.7",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+  "peerDependencies": {
+    "@nestjs/common": "^10.0.0 || ^11.0.0",
+    "@nestjs/core": "^10.0.0 || ^11.0.0",
+    "rxjs": "^7.1.0"
   },
   "jest": {
     "moduleFileExtensions": [
@@ -63,7 +67,7 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": [
+      "^.+\\.ts$": [
         "ts-jest",
         {
           "tsconfig": "tsconfig.test.json"
@@ -71,9 +75,16 @@
       ]
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "**/*.ts",
+      "!**/*.test.ts",
+      "!**/index.ts"
     ],
-    "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "coverageDirectory": "../coverage/nest",
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^@eleven-am/pondsocket$": "<rootDir>/../../core/dist",
+      "^@eleven-am/pondsocket/types$": "<rootDir>/../../core/dist",
+      "^@eleven-am/pondsocket-common$": "<rootDir>/../../comnon/dist"
+    }
   }
 }

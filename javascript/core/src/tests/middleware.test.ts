@@ -54,7 +54,7 @@ describe('Middleware', () => {
     describe('run', () => {
         it('should execute middleware functions in order', () => {
             const order: number[] = [];
-            const middleware1: MiddlewareFunction<any, any> = (req, res, next) => {
+            const middleware1: MiddlewareFunction<any, any> = (_req, _res, next) => {
                 order.push(1);
                 next();
             };
@@ -75,7 +75,7 @@ describe('Middleware', () => {
 
         it('should stop execution if next is not called', () => {
             const order: number[] = [];
-            const middleware1: MiddlewareFunction<any, any> = (req, res, next) => {
+            const middleware1: MiddlewareFunction<any, any> = (_req, _res, _next) => {
                 order.push(1);
                 // next() is not called
             };

@@ -33,11 +33,12 @@ const (
 type ChannelState string
 
 const (
-	Idle    ChannelState = "IDLE"
-	Joining ChannelState = "JOINING"
-	Joined  ChannelState = "JOINED"
-	Stalled ChannelState = "STALLED"
-	Closed  ChannelState = "CLOSED"
+	Idle     ChannelState = "IDLE"
+	Joining  ChannelState = "JOINING"
+	Joined   ChannelState = "JOINED"
+	Stalled  ChannelState = "STALLED"
+	Declined ChannelState = "DECLINED"
+	Closed   ChannelState = "CLOSED"
 )
 
 // Presence Event Types
@@ -53,8 +54,11 @@ const (
 type Events string
 
 const (
-	EventAcknowledge Events = "ACKNOWLEDGE"
-	EventConnection  Events = "CONNECTION"
+	EventAcknowledge   Events = "ACKNOWLEDGE"
+	EventConnection    Events = "CONNECTION"
+	EventUnauthorized  Events = "UNAUTHORIZED"
+	EventNotFound      Events = "NOT_FOUND"
+	EventInternalError Events = "INTERNAL_ERROR"
 )
 
 // Error Types
@@ -137,16 +141,39 @@ func DefaultClientConfig() *ClientConfig {
 
 // Helper function to convert ChannelEvent payload to PresencePayload
 func (ce *ChannelEvent) GetPresencePayload() (*PresencePayload, error) {
-	var payload PresencePayload
 	data, err := json.Marshal(ce.Payload)
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(data, &payload)
-	if err != nil {
+	var raw struct {
+		Changed  PondPresence   `json:"changed"`
+		Change   PondPresence   `json:"change"`
+		Presence []PondPresence `json:"presence"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
+	payload := PresencePayload{
+		Changed:  raw.Changed,
+		Presence: raw.Presence,
+	}
+	if payload.Changed == nil {
+		payload.Changed = raw.Change
+	}
 	return &payload, nil
+}
+
+func normalizePresenceEventType(event string) PresenceEventTypes {
+	switch event {
+	case "presence:join":
+		return PresenceJoin
+	case "presence:leave":
+		return PresenceLeave
+	case "presence:update":
+		return PresenceUpdate
+	default:
+		return PresenceEventTypes(event)
+	}
 }
 
 // Helper function to convert interface{} to PondMessage

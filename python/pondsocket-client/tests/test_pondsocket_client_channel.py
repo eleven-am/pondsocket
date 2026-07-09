@@ -104,6 +104,7 @@ async def test_typed_channel_wraps_existing_channel_api() -> None:
     typed = typed_channel(channel, schema)
     received: list[TypedChatPayload] = []
 
+    channel.join()
     channel.handle_event(
         _server_msg(
             "/chat/1",
@@ -146,12 +147,11 @@ async def test_typed_channel_encodes_and_decodes_dataclass_payloads() -> None:
     schema: PondSchema[PresenceDataclass, TypedAssigns, TypedJoinParams] = pond_schema(
         "chat", PresenceDataclass
     )
-    chat: PondEvent[ChatDataclass, ChatDataclass] = pond_event(
-        "chat", ChatDataclass, ChatDataclass
-    )
+    chat: PondEvent[ChatDataclass, ChatDataclass] = pond_event("chat", ChatDataclass, ChatDataclass)
     typed = typed_channel(channel, schema)
     received: list[ChatDataclass] = []
 
+    channel.join()
     channel.handle_event(
         _server_msg(
             "/chat/1",
@@ -210,10 +210,9 @@ async def test_typed_channel_request_decodes_dataclass_response() -> None:
     schema: PondSchema[PresenceDataclass, TypedAssigns, TypedJoinParams] = pond_schema(
         "chat", PresenceDataclass
     )
-    ping: PondEvent[ChatDataclass, ChatDataclass] = pond_event(
-        "ping", ChatDataclass, ChatDataclass
-    )
+    ping: PondEvent[ChatDataclass, ChatDataclass] = pond_event("ping", ChatDataclass, ChatDataclass)
     typed = typed_channel(channel, schema)
+    channel.join()
     channel.handle_event(
         _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
     )
@@ -284,6 +283,38 @@ async def test_unauthorized_transitions_to_declined() -> None:
     assert channel.channel_state == ChannelState.DECLINED
 
 
+async def test_not_found_transitions_to_declined() -> None:
+    channel, _, _ = _make_channel()
+    channel.join()
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.NOT_FOUND.value,
+            action=ServerActions.SYSTEM,
+        )
+    )
+    assert channel.channel_state == ChannelState.DECLINED
+
+
+async def test_not_found_clears_queue_and_cancels_pending() -> None:
+    channel, _, _ = _make_channel(initial_state=ConnectionState.DISCONNECTED)
+    channel.join()
+    channel.send_message("queued", {"n": 1})
+    task = asyncio.create_task(channel.send_for_response("ping", {}, wait=1.0))
+    await asyncio.sleep(0)
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.NOT_FOUND.value,
+            action=ServerActions.SYSTEM,
+        )
+    )
+    assert channel.channel_state == ChannelState.DECLINED
+    assert len(channel._queue) == 0  # type: ignore[attr-defined]
+    with pytest.raises((asyncio.CancelledError, ResponseTimeoutError)):
+        await task
+
+
 async def test_send_message_before_joined_is_queued() -> None:
     channel, sent, _ = _make_channel()
     channel.join()
@@ -293,9 +324,7 @@ async def test_send_message_before_joined_is_queued() -> None:
     await asyncio.sleep(0)
     assert sent == []
     channel.handle_event(
-        _server_msg(
-            "/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM
-        )
+        _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
     )
     await asyncio.sleep(0)
     assert len(sent) == 1
@@ -306,9 +335,7 @@ async def test_on_message_fires_for_broadcasts() -> None:
     channel, _, _ = _make_channel()
     channel.join()
     channel.handle_event(
-        _server_msg(
-            "/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM
-        )
+        _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
     )
     received: list[str] = []
 
@@ -325,9 +352,7 @@ async def test_on_message_event_filters_by_event_name() -> None:
     channel, _, _ = _make_channel()
     channel.join()
     channel.handle_event(
-        _server_msg(
-            "/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM
-        )
+        _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
     )
     received: list[str] = []
     channel.on_message_event("chat", lambda m: received.append(m.event))
@@ -386,9 +411,7 @@ async def test_on_users_change_fires_for_every_presence_kind() -> None:
         PresenceEventTypes.LEAVE,
     ):
         channel.handle_event(
-            _presence_msg(
-                "/chat/1", kind, presence=[{"id": "alice"}], changed={"id": "alice"}
-            )
+            _presence_msg("/chat/1", kind, presence=[{"id": "alice"}], changed={"id": "alice"})
         )
     assert len(snapshots) == 3
 
@@ -403,9 +426,7 @@ async def test_send_for_response_correlates_by_request_id() -> None:
     async def respond() -> None:
         await asyncio.sleep(0.01)
         rid = sent[-1].request_id
-        channel.handle_event(
-            _server_msg("/chat/1", "pong", request_id=rid, payload={"echo": "hi"})
-        )
+        channel.handle_event(_server_msg("/chat/1", "pong", request_id=rid, payload={"echo": "hi"}))
 
     task = asyncio.create_task(respond())
     result = await channel.send_for_response("ping", {"text": "hi"}, wait=1.0)
@@ -471,9 +492,7 @@ async def test_reconnect_after_stalled_resends_join() -> None:
 
 
 async def test_outbound_queue_is_bounded() -> None:
-    channel, _sent, _ = _make_channel(
-        initial_state=ConnectionState.DISCONNECTED, queue_size=3
-    )
+    channel, _sent, _ = _make_channel(initial_state=ConnectionState.DISCONNECTED, queue_size=3)
     channel.join()
     for i in range(10):
         channel.send_message(f"e{i}", {"i": i})

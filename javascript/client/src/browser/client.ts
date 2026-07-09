@@ -6,7 +6,7 @@ export class PondClient extends WebSocketClient {
 
         try {
             address = new URL(endpoint);
-        } catch (e) {
+        } catch {
             address = new URL(window.location.toString());
             address.pathname = endpoint;
             address.hash = '';

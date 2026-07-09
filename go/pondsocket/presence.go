@@ -19,7 +19,7 @@ type presenceClient struct {
 type presencePayload struct {
 	Event     presenceEventType `json:"event"`
 	UserID    string            `json:"userId"`
-	Change    interface{}       `json:"change"`
+	Change    interface{}       `json:"changed"`
 	Presence  []interface{}     `json:"presence,omitempty"`
 	NodeID    string            `json:"nodeId,omitempty"`
 	RequestID string            `json:"requestId,omitempty"`

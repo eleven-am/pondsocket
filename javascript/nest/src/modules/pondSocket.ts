@@ -1,6 +1,5 @@
-import { DiscoveryModule, DiscoveryService } from '@golevelup/nestjs-discovery';
 import type { DynamicModule, Provider } from '@nestjs/common';
-import { HttpAdapterHost, ModuleRef } from '@nestjs/core';
+import { DiscoveryModule, DiscoveryService, HttpAdapterHost, ModuleRef } from '@nestjs/core';
 
 import { getLocalGuards } from '../managers/guards';
 import { getLocalPipes } from '../managers/pipes';
@@ -70,7 +69,7 @@ export class PondSocketModule {
         guards = [...new Set([...localGuards, ...guards])];
 
         return {
-            exports,
+            exports: [PondSocketService, ...exports],
             global: isGlobal,
             imports: [...imports, DiscoveryModule],
             module: PondSocketModule,

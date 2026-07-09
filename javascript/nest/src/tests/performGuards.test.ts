@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { Context } from '../context/context';
+import { manageParameters } from '../managers/parametres';
 
 jest.mock('../helpers/misc', () => ({
     retrieveInstance: (_moduleRef: any, Guard: any) => new Guard(),
@@ -18,7 +18,7 @@ jest.mock('../managers/guards', () => {
     };
 });
 
-const { __setClassGuards, __setMethodGuards } = require('../managers/guards') as any;
+const { __setClassGuards, __setMethodGuards } = jest.requireMock('../managers/guards') as any;
 
 async function importPerformAction() {
     const mod = await import('../performers/action');
@@ -61,9 +61,9 @@ describe('performGuards (via performAction)', () => {
 
         const { performAction } = await importPerformAction();
 
-        await performAction(instance, moduleRef, [], [], handler, 'handler', input as any);
+        await performAction(instance, moduleRef, [], [], handler, 'handler', input as any, 'join');
 
-        expect(handler).toHaveBeenCalled();
+        expect(handler).toHaveBeenCalledWith();
     });
 
     it('returns true and executes handler when all guards pass', async () => {
@@ -80,7 +80,7 @@ describe('performGuards (via performAction)', () => {
 
         const { performAction } = await importPerformAction();
 
-        await performAction(instance, moduleRef, [], [], handler, 'handler', input as any);
+        await performAction(instance, moduleRef, [], [], handler, 'handler', input as any, 'join');
 
         expect(handler).toHaveBeenCalled();
     });
@@ -97,7 +97,7 @@ describe('performGuards (via performAction)', () => {
 
         const { performAction } = await importPerformAction();
 
-        await performAction(instance, moduleRef, [FailGuard as any], [], handler, 'handler', input as any);
+        await performAction(instance, moduleRef, [FailGuard as any], [], handler, 'handler', input as any, 'join');
 
         expect(handler).not.toHaveBeenCalled();
         expect(input.decline).toHaveBeenCalledWith('Unauthorized', 403);
@@ -142,9 +142,73 @@ describe('performGuards (via performAction)', () => {
             handler,
             'handler',
             input as any,
+            'join',
         );
 
         expect(executionOrder).toEqual(['guard1', 'guard2']);
         expect(handler).not.toHaveBeenCalled();
+    });
+
+    it('replies when a guard rejects an event', async () => {
+        class FailGuard {
+            canActivate() { return false; }
+        }
+
+        const input = {
+            assign: jest.fn(),
+            reply: jest.fn(),
+            broadcast: jest.fn(),
+            broadcastFrom: jest.fn(),
+            broadcastTo: jest.fn(),
+            user: { id: 'u1', assigns: {}, presence: {} },
+            channel: {},
+            event: { params: {}, query: {}, payload: {}, event: 'message' },
+        };
+        const handler = jest.fn();
+        const instance = { constructor: class TestInstance {}, handler };
+
+        const { performAction } = await importPerformAction();
+
+        await performAction(instance, createModuleRef(), [FailGuard as any], [], handler, 'handler', input as any, 'event');
+
+        expect(handler).not.toHaveBeenCalled();
+        expect(input.reply).toHaveBeenCalledWith('UNAUTHORIZED_BROADCAST', {
+            code: 'UNAUTHORIZED_BROADCAST',
+            message: 'Unauthorized',
+            status: 403,
+        });
+    });
+
+    it('preserves explicitly decorated parameter indices', async () => {
+        const handler = jest.fn();
+        const instance = { constructor: class TestInstance {}, handler };
+
+        manageParameters(instance, 'handler').set(0, async () => 'first');
+        manageParameters(instance, 'handler').set(1, async () => 'second');
+        manageParameters(instance, 'handler').set(2, async () => 'third');
+
+        const { performAction } = await importPerformAction();
+
+        await performAction(instance, createModuleRef(), [], [], handler, 'handler', createJoinInput() as any, 'join');
+
+        expect(handler).toHaveBeenCalledWith('first', 'second', 'third');
+    });
+
+    it('ignores outgoing handler return values', async () => {
+        const handler = jest.fn().mockReturnValue({ text: 'trimmed' });
+        const instance = { constructor: class TestInstance {}, handler };
+        const outgoing = {
+            block: jest.fn(),
+            payload: { text: ' raw ' },
+            user: { id: 'u1', assigns: {}, presence: {} },
+            channel: {},
+            event: { params: {}, query: {}, payload: { text: ' raw ' }, event: 'message' },
+        };
+
+        const { performAction } = await importPerformAction();
+        const result = await performAction(instance, createModuleRef(), [], [], handler, 'handler', outgoing as any, 'outgoing');
+
+        expect(result).toBeUndefined();
+        expect(handler).toHaveBeenCalledWith();
     });
 });

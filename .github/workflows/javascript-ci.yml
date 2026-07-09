@@ -1,0 +1,46 @@
+name: JavaScript CI
+
+on:
+  pull_request:
+    paths:
+      - "javascript/**"
+      - ".github/workflows/javascript-ci.yml"
+  push:
+    paths:
+      - "javascript/**"
+      - ".github/workflows/javascript-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: javascript-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 24]
+    defaults:
+      run:
+        working-directory: javascript
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: javascript/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate packages
+        run: npm run validate

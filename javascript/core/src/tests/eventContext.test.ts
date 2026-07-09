@@ -144,6 +144,30 @@ describe('EventContext', () => {
                 'request-123',
             );
         });
+
+        it('rebroadcasts the concrete incoming event without rebuilding route params', () => {
+            const incomingEvent: BroadcastEvent = {
+                ...mockEvent,
+                event: 'message/42',
+                payload: { text: 'hello' },
+            };
+            const context = new EventContext(
+                incomingEvent,
+                { params: { messageId: '42' }, query: {} },
+                mockChannelEngine,
+            );
+
+            context.broadcast(context.event.event, context.payload);
+
+            expect(mockChannelEngine.sendMessage).toHaveBeenCalledWith(
+                'user1',
+                'ALL_USERS',
+                ServerActions.BROADCAST,
+                'message/42',
+                { text: 'hello' },
+                'request-123',
+            );
+        });
     });
 
     describe('broadcastFrom', () => {

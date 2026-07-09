@@ -49,9 +49,10 @@ describe('performErrors', () => {
             const ctx = createEventContext();
             const error = new HttpException({ message: 'Validation failed' }, HttpStatus.BAD_REQUEST);
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'event');
 
-            expect(ctx.reply).toHaveBeenCalledWith('UNKNOWN_ERROR', {
+            expect(ctx.reply).toHaveBeenCalledWith('INTERNAL_SERVER_ERROR', {
+                code: 'INTERNAL_SERVER_ERROR',
                 message: 'Validation failed',
                 data: 'Validation failed',
                 status: 400,
@@ -62,9 +63,10 @@ describe('performErrors', () => {
             const ctx = createEventContext();
             const error = new Error('Something broke');
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'event');
 
-            expect(ctx.reply).toHaveBeenCalledWith('UNKNOWN_ERROR', {
+            expect(ctx.reply).toHaveBeenCalledWith('INTERNAL_SERVER_ERROR', {
+                code: 'INTERNAL_SERVER_ERROR',
                 message: 'Something broke',
                 data: undefined,
                 status: 500,
@@ -74,9 +76,10 @@ describe('performErrors', () => {
         it('replies with UNKNOWN_ERROR for non-Error values', () => {
             const ctx = createEventContext();
 
-            performErrors('string error', ctx as any);
+            performErrors('string error', ctx as any, 'event');
 
-            expect(ctx.reply).toHaveBeenCalledWith('UNKNOWN_ERROR', {
+            expect(ctx.reply).toHaveBeenCalledWith('INTERNAL_SERVER_ERROR', {
+                code: 'INTERNAL_SERVER_ERROR',
                 message: 'An unknown error occurred',
                 data: undefined,
                 status: 500,
@@ -89,7 +92,7 @@ describe('performErrors', () => {
             const ctx = createConnectionContext();
             const error = new HttpException('Forbidden', HttpStatus.FORBIDDEN);
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'connection');
 
             expect(ctx.decline).toHaveBeenCalledWith('Forbidden', 403);
         });
@@ -98,7 +101,7 @@ describe('performErrors', () => {
             const ctx = createConnectionContext();
             const error = new Error('Connection failed');
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'connection');
 
             expect(ctx.decline).toHaveBeenCalledWith('Connection failed', 500);
         });
@@ -108,7 +111,7 @@ describe('performErrors', () => {
             ctx.hasResponded = true;
             const error = new Error('Too late');
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'connection');
 
             expect(ctx.decline).not.toHaveBeenCalled();
         });
@@ -119,7 +122,7 @@ describe('performErrors', () => {
             const ctx = createJoinContext();
             const error = new HttpException('Not allowed', HttpStatus.UNAUTHORIZED);
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'join');
 
             expect(ctx.decline).toHaveBeenCalledWith('Not allowed', 401);
         });
@@ -129,7 +132,7 @@ describe('performErrors', () => {
             ctx.hasResponded = true;
             const error = new Error('Already responded');
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'join');
 
             expect(ctx.decline).not.toHaveBeenCalled();
         });
@@ -143,9 +146,9 @@ describe('performErrors', () => {
                 HttpStatus.BAD_REQUEST,
             );
 
-            performErrors(error, ctx as any);
+            performErrors(error, ctx as any, 'event');
 
-            expect(ctx.reply).toHaveBeenCalledWith('UNKNOWN_ERROR', expect.objectContaining({
+            expect(ctx.reply).toHaveBeenCalledWith('INTERNAL_SERVER_ERROR', expect.objectContaining({
                 status: 400,
                 data: ['field1 is required', 'field2 must be a string'],
             }));

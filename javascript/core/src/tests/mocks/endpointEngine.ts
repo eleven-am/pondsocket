@@ -12,7 +12,7 @@ export class MockEndpointEngine extends EndpointEngine {
 
     manageSocket = jest.fn((user) => this.user = user);
 
-    getUser = jest.fn((x) => this.user);
+    getUser = jest.fn((_userId) => this.user);
 
     sendMessage = jest.fn();
 

@@ -6,8 +6,10 @@ import {
     EventsOf,
     EventPayload,
     ServerActions,
-    PondMessage,
+    Params,
     PresenceOf,
+    RouteParamsArguments,
+    buildPondRoute,
     UserData,
     UserAssigns,
     UserPresences,
@@ -25,8 +27,8 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     /**
      * Gets a user's data
      */
-    getUserData (userId: string): UserData<PresenceOf<Schema>, AssignsOf<Schema>> | null {
-        return this.#engine.getUserData(userId) as UserData<PresenceOf<Schema>, AssignsOf<Schema>> | null;
+    getUserData (userId: string): UserData<PresenceOf<Schema>, AssignsOf<Schema>> {
+        return this.#engine.getUserData(userId) as UserData<PresenceOf<Schema>, AssignsOf<Schema>>;
     }
 
     /**
@@ -46,12 +48,12 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     /**
      * Broadcasts a message to all users
      */
-    broadcast<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
+    broadcast<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventPayload<EventsOf<Schema>, Event>, ...args: RouteParamsArguments<Event>) {
         this.#engine.sendMessage(
             SystemSender.CHANNEL,
             ChannelReceiver.ALL_USERS,
             ServerActions.BROADCAST,
-            event,
+            buildPondRoute(event, args[0] ?? {} as Params<Event>),
             payload,
         );
 
@@ -61,12 +63,12 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     /**
      * Broadcasts a message from a specific user to all others
      */
-    broadcastFrom<Event extends Extract<keyof EventsOf<Schema>, string>> (userId: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
+    broadcastFrom<Event extends Extract<keyof EventsOf<Schema>, string>> (userId: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>, ...args: RouteParamsArguments<Event>) {
         this.#engine.sendMessage(
             userId,
             ChannelReceiver.ALL_EXCEPT_SENDER,
             ServerActions.BROADCAST,
-            event,
+            buildPondRoute(event, args[0] ?? {} as Params<Event>),
             payload,
         );
 
@@ -76,14 +78,14 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     /**
      * Broadcasts a message to specific users
      */
-    broadcastTo<Event extends Extract<keyof EventsOf<Schema>, string>> (userIds: string | string[], event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
+    broadcastTo<Event extends Extract<keyof EventsOf<Schema>, string>> (userIds: string | string[], event: Event, payload: EventPayload<EventsOf<Schema>, Event>, ...args: RouteParamsArguments<Event>) {
         const users = Array.isArray(userIds) ? userIds : [userIds];
 
         this.#engine.sendMessage(
             SystemSender.CHANNEL,
             users,
             ServerActions.BROADCAST,
-            event,
+            buildPondRoute(event, args[0] ?? {} as Params<Event>),
             payload,
         );
 

@@ -23,7 +23,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { ConnectionContext } from '../contexts/connectionContext';
 import { EventContext } from '../contexts/eventContext';
 import { JoinContext } from '../contexts/joinContext';
-import { OutgoingContext } from '../contexts/outgoingContext';
+import { OutgoingHandlerContext } from '../contexts/outgoingContext';
 import { EndpointEngine } from '../engines/endpointEngine';
 import { HttpError } from '../errors/httpError';
 import { Channel } from '../wrappers/channel';
@@ -52,7 +52,7 @@ export type AuthorizationHandler<Path extends string, Schema extends AnyPondSche
 
 export type EventHandler<Path extends string, Schema extends AnyPondSchema = AnyPondSchema, Event extends EventKey<Schema> = EventKey<Schema>> = (ctx: EventContext<Path, Schema, Event>, next: NextFunction) => unknown | Promise<unknown>;
 
-export type OutgoingEventHandler<Path extends string, Schema extends AnyPondSchema = AnyPondSchema, Event extends EventKey<Schema> = EventKey<Schema>> = (event: OutgoingContext<Path, Schema, Event>, next: NextFunction) => EventPayload<EventsOf<Schema>, Event> | Promise<EventPayload<EventsOf<Schema>, Event>> | void | Promise<void>;
+export type OutgoingEventHandler<Path extends string, Schema extends AnyPondSchema = AnyPondSchema, Event extends EventKey<Schema> = EventKey<Schema>> = (event: OutgoingHandlerContext<Path, Schema, Event>) => void | Promise<void>;
 
 export interface ConnectionParams {
     head: Buffer;
@@ -104,4 +104,4 @@ export interface LeaveEvent {
     channel: Channel;
 }
 
-export type LeaveCallback = (event: LeaveEvent) => void;
+export type LeaveCallback = (event: LeaveEvent) => unknown | Promise<unknown>;

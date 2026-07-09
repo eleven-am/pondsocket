@@ -17,7 +17,7 @@ export abstract class WebSocketClient extends BaseClient {
         this._disconnecting = false;
         this._connectionState.publish(ConnectionState.CONNECTING);
 
-        const socket = new WebSocket(this._address.toString());
+        const socket = this._createSocket(this._address.toString());
 
         this._connectionTimeoutId = setTimeout(() => {
             if (socket.readyState === WebSocket.CONNECTING) {
@@ -27,6 +27,7 @@ export abstract class WebSocketClient extends BaseClient {
                 socket.close();
             }
         }, this._options.connectionTimeout);
+        this._unrefTimer(this._connectionTimeoutId);
 
         socket.onopen = () => {
             this._clearConnectionTimeout();
@@ -57,6 +58,11 @@ export abstract class WebSocketClient extends BaseClient {
         };
 
         socket.onclose = () => {
+            if (this._socket !== socket) {
+                return;
+            }
+
+            this._socket = undefined;
             this._clearConnectionTimeout();
             this._clearPingInterval();
             this._clearPongTimeout();
@@ -76,6 +82,10 @@ export abstract class WebSocketClient extends BaseClient {
         this._connectionState.publish(ConnectionState.DISCONNECTED);
         this._socket?.close();
         this._clearChannels();
+    }
+
+    protected _createSocket (address: string): WebSocket {
+        return new WebSocket(address);
     }
 
     protected _createPublisher () {
@@ -114,5 +124,6 @@ export abstract class WebSocketClient extends BaseClient {
 
             this._schedulePongTimeout(socket);
         }, timeout);
+        this._unrefTimer(this._pongTimeoutId);
     }
 }

@@ -30,7 +30,7 @@ class MockEventSource {
     }
 }
 
-// @ts-expect-error
+// @ts-expect-error the test installs a deliberately incomplete EventSource implementation
 global.EventSource = MockEventSource;
 
 global.fetch = jest.fn(() =>
@@ -202,6 +202,7 @@ describe('SSEClient', () => {
             payload: {},
         };
 
+        channel.join();
         sseClient['_broadcaster'].publish(connectEvent);
 
         channel.sendMessage('testEvent', { data: 'test' });

@@ -18,9 +18,10 @@ export function OnEvent (event = '*'): MethodDecorator {
                     originalMethod,
                     propertyKey as string,
                     ctx,
+                    'event',
                 );
             } catch (error) {
-                performErrors(error, ctx);
+                performErrors(error, ctx, 'event');
             }
         });
     };

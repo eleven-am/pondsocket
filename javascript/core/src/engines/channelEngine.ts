@@ -73,7 +73,7 @@ export class ChannelEngine {
 
     #nodeUsers: Map<string, Set<string>> = new Map();
 
-    #pendingUserGets: Map<string, { resolve: (data: UserData | null) => void; timer: ReturnType<typeof setTimeout> }> = new Map();
+    #pendingUserGets: Map<string, { resolve: (data: UserData | null) => void, timer: ReturnType<typeof setTimeout> }> = new Map();
 
     #staleNodeTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -103,7 +103,7 @@ export class ChannelEngine {
         return new Set(this.#assignsCache.keys());
     }
 
-    addUser (userId: string, assigns: PondAssigns, onMessage: (event: ChannelEvent) => void): Unsubscribe {
+    addUser (userId: string, assigns: PondAssigns, onMessage: (event: ChannelEvent) => void, requestId = uuid()): Unsubscribe {
         if (this.users.has(userId)) {
             const message = `ChannelEngine: User with id ${userId} already exists in channel ${this.name}`;
 
@@ -114,7 +114,7 @@ export class ChannelEngine {
 
         onMessage({
             channelName: this.#name,
-            requestId: uuid(),
+            requestId,
             action: ServerActions.SYSTEM,
             event: Events.ACKNOWLEDGE,
             payload: {},
@@ -367,10 +367,17 @@ export class ChannelEngine {
     }
 
     removeUser (userId: string, skipDistributedBroadcast = false): void {
-        try {
-            const userData = this.getUserData(userId);
-            const unsubscribe = this.#userSubscriptions.get(userId);
+        let userData: UserData;
 
+        try {
+            userData = this.getUserData(userId);
+        } catch {
+            return;
+        }
+
+        const unsubscribe = this.#userSubscriptions.get(userId);
+
+        try {
             this.#assignsCache.delete(userId);
             this.#safeRemovePresence(userId);
 
@@ -387,19 +394,25 @@ export class ChannelEngine {
                     userId,
                 });
             }
+        } catch (_) {
+            void 0;
+        }
 
-            if (this.parent.leaveCallback) {
-                this.parent.leaveCallback({
+        if (this.users.size === 0) {
+            this.close();
+        }
+
+        if (this.parent.leaveCallback) {
+            try {
+                const result = this.parent.leaveCallback({
                     user: userData,
                     channel: this.parent.wrapChannel(this),
                 });
-            }
 
-            if (this.users.size === 0) {
-                this.close();
+                void Promise.resolve(result).catch(() => {});
+            } catch (_) {
+                void 0;
             }
-        } catch (_) {
-            void 0;
         }
     }
 

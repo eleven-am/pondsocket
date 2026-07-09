@@ -3,6 +3,7 @@
     "target": "es2015",
     "module": "commonjs",
     "outDir": "./dist",
+    "declaration": true,
     "esModuleInterop": true,
     "strict": true,
     "baseUrl": ".",
@@ -11,5 +12,5 @@
     }
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "**/__tests__/*"]
+  "exclude": ["node_modules", "**/__tests__/*", "**/*.test.ts"]
 }

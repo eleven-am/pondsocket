@@ -173,7 +173,7 @@ describe('LobbyEngine', () => {
         it('should return the event when no outgoing middleware is set', async () => {
             const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
             channelEngine.addUser('user-1', {}, jest.fn());
-            const event = { event: 'test', payload: { data: 'hello' }, action: 'broadcast' as any, channelName: 'test-ch', requestId: 'req-1' };
+            const event = { event: 'test', payload: { data: 'hello' }, action: ServerActions.BROADCAST, channelName: 'test-ch', requestId: 'req-1' };
 
             const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
 
@@ -190,24 +190,67 @@ describe('LobbyEngine', () => {
                 ctx.block();
             });
 
-            const event = { event: 'test', payload: { data: 'hello' }, action: 'broadcast' as any, channelName: 'test-ch', requestId: 'req-1' };
+            const event = { event: 'test', payload: { data: 'hello' }, action: ServerActions.BROADCAST, channelName: 'test-ch', requestId: 'req-1' };
             const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
 
             expect(result).toBeUndefined();
         });
 
-        it('should transform payload when handler returns a value', async () => {
+        it('should transform payload through the outgoing context', async () => {
+            const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
+            channelEngine.addUser('user-1', {}, jest.fn());
+
+            lobbyEngine.handleOutgoingEvent('test', (context) => {
+                context.transform({ transformed: true });
+            });
+
+            const event = { event: 'test', payload: { data: 'hello' }, action: ServerActions.BROADCAST, channelName: 'test-ch', requestId: 'req-1' };
+            const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
+
+            expect(result?.payload).toEqual({ transformed: true });
+        });
+
+        it('ignores outgoing handler return values', async () => {
+            const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
+            channelEngine.addUser('user-1', {}, jest.fn());
+
+            lobbyEngine.handleOutgoingEvent('test', (() => ({ transformed: true })) as any);
+
+            const event = { event: 'test', payload: { data: 'hello' }, action: ServerActions.BROADCAST, channelName: 'test-ch', requestId: 'req-1' };
+            const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
+
+            expect(result?.payload).toEqual({ data: 'hello' });
+        });
+
+        it('stops after the first matching outgoing handler', async () => {
+            const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
+            channelEngine.addUser('user-1', {}, jest.fn());
+            const first = jest.fn();
+            const second = jest.fn();
+
+            lobbyEngine.handleOutgoingEvent('*', first);
+            lobbyEngine.handleOutgoingEvent('test', second);
+
+            const event = { event: 'test', payload: { data: 'hello' }, action: ServerActions.BROADCAST, channelName: 'test-ch', requestId: 'req-1' };
+
+            await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
+
+            expect(first).toHaveBeenCalledTimes(1);
+            expect(second).not.toHaveBeenCalled();
+        });
+
+        it('blocks delivery when an outgoing handler throws', async () => {
             const channelEngine = lobbyEngine.getOrCreateChannel('test-ch');
             channelEngine.addUser('user-1', {}, jest.fn());
 
             lobbyEngine.handleOutgoingEvent('test', () => {
-                return { transformed: true };
+                throw new Error('transform failed');
             });
 
-            const event = { event: 'test', payload: { data: 'hello' }, action: 'broadcast' as any, channelName: 'test-ch', requestId: 'req-1' };
+            const event = { event: 'test', payload: { data: 'hello' }, action: ServerActions.BROADCAST, channelName: 'test-ch', requestId: 'req-1' };
             const result = await lobbyEngine.processOutgoingEvents(event, channelEngine, 'user-1');
 
-            expect(result).toBeDefined();
+            expect(result).toBeUndefined();
         });
     });
 });

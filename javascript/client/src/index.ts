@@ -8,3 +8,7 @@ import { ConnectionState } from './types';
 const PondClient = typeof window === 'undefined' ? NodeClient : BrowserClient;
 
 export { ChannelState, ConnectionState, PondClient, SSEClient };
+export { Channel } from './core/channel';
+export type { DefinedChannelOptions } from './core/baseClient';
+export type { ClientOptions } from './types';
+export type { SSEClientOptions } from './browser/sseClient';

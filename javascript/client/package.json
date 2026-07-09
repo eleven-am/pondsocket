@@ -1,56 +1,70 @@
 {
   "name": "@eleven-am/pondsocket-client",
-  "version": "0.0.38",
-  "description": "PondSocket is a fast simple socket server",
+  "version": "0.0.39",
+  "description": "Typed browser and Node.js client for PondSocket.",
   "keywords": [
-    "socket",
-    "server",
-    "ws",
+    "pondsocket",
     "websocket",
-    "pubsub",
-    "presence",
+    "sse",
     "realtime",
-    "realtime server"
+    "client",
+    "presence"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
   "author": "Roy OSSAI",
-  "main": "./index.js",
-  "types": "./index.d.ts",
-  "sideEffects": false,
   "license": "GPL-3.0",
+  "homepage": "https://github.com/eleven-am/pondsocket#readme",
+  "bugs": {
+    "url": "https://github.com/eleven-am/pondsocket/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eleven-am/pondsocket.git",
+    "directory": "javascript/client"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "commonjs",
+  "main": "./dist/node-entry.js",
+  "browser": "./dist/browser-entry.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": "./dist/browser-entry.js",
+      "node": "./dist/node-entry.js",
+      "require": "./dist/node-entry.js",
+      "default": "./dist/browser-entry.js"
+    },
+    "./browser": {
+      "types": "./dist/browser-entry.d.ts",
+      "require": "./dist/browser-entry.js",
+      "default": "./dist/browser-entry.js"
+    },
+    "./node": {
+      "types": "./dist/node-entry.d.ts",
+      "require": "./dist/node-entry.js",
+      "default": "./dist/node-entry.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "scripts": {
+    "clean": "rimraf dist",
+    "build": "npm run clean && tsc --project tsconfig.json",
     "test": "jest --coverage --verbose",
-    "build": "rimraf dist && tsc",
-    "lint": "eslint --ext .ts src",
-    "lint:fix": "eslint --fix --ext .ts src",
-    "copy": "cp package.json dist && cp README.md dist && cp LICENSE dist && cp src/index.d.ts dist && cp src/dist.d.ts dist",
-    "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
-    "pipeline": "npm run test && npm run build && npm run push"
+    "lint": "eslint src --max-warnings=0",
+    "prepack": "npm run build"
   },
   "dependencies": {
-    "@eleven-am/pondsocket-common": "^0.0.40"
-  },
-  "devDependencies": {
-    "@eslint/compat": "^2.1.0",
-    "@eslint/eslintrc": "^3.3.5",
-    "@eslint/js": "^9.39.4",
-    "@stylistic/eslint-plugin-ts": "^4.4.1",
-    "@types/jest": "^30.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.59.4",
-    "@typescript-eslint/parser": "^8.59.4",
-    "eslint": "^9.39.4",
-    "eslint-plugin-file-progress": "^3.0.2",
-    "eslint-plugin-import": "^2.32.0",
-    "globals": "^17.6.0",
-    "jest": "^30.4.2",
-    "prettier": "^3.8.3",
-    "supertest": "^7.2.2",
-    "ts-jest": "^29.4.11",
-    "ts-loader": "^9.5.7",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "@eleven-am/pondsocket-common": "^0.0.41",
+    "ws": "^8.21.0"
   },
   "jest": {
     "moduleFileExtensions": [
@@ -61,7 +75,7 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": [
+      "^.+\\.ts$": [
         "ts-jest",
         {
           "diagnostics": false
@@ -69,14 +83,12 @@
       ]
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s",
+      "**/*.ts",
       "!**/*.test.ts",
-      "!**/*.d.ts",
       "!**/index.ts",
-      "!**/index.d.ts",
-      "!**/dist.d.ts"
+      "!**/*-entry.ts"
     ],
-    "coverageDirectory": "../coverage",
+    "coverageDirectory": "../coverage/client",
     "testEnvironment": "node",
     "moduleNameMapper": {
       "^@eleven-am/pondsocket-common$": "<rootDir>/../../comnon/dist"

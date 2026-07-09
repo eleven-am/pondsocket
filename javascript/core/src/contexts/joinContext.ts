@@ -6,7 +6,6 @@ import {
     ErrorTypes,
     EventsOf,
     JoinParamsOf,
-    PondAssigns,
     PondMessage,
     PondObject,
     PresenceOf,
@@ -62,7 +61,7 @@ export class JoinContext<Path extends string, Schema extends AnyPondSchema = Any
         this.#performChecks();
         const onMessage = this.engine.parent.parent.sendMessage.bind(this.engine.parent.parent, this.#user.socket);
 
-        const subscription = this.engine.addUser(this.#user.clientId, this.#newAssigns, onMessage);
+        const subscription = this.engine.addUser(this.#user.clientId, this.#newAssigns, onMessage, this.#user.requestId);
         const wrappedSubscription = () => {
             subscription();
             this.#user.subscriptions.delete(wrappedSubscription);
@@ -82,8 +81,14 @@ export class JoinContext<Path extends string, Schema extends AnyPondSchema = Any
         const errorMessage: ChannelEvent = {
             event: ErrorTypes.UNAUTHORIZED_JOIN_REQUEST,
             payload: {
+                code: ErrorTypes.UNAUTHORIZED_JOIN_REQUEST,
                 message: message || 'Unauthorized connection',
-                code: errorCode || 401,
+                status: errorCode || 401,
+                statusCode: errorCode || 401,
+                error: {
+                    message: message || 'Unauthorized connection',
+                    status: errorCode || 401,
+                },
             },
             channelName: this.engine.name,
             action: ServerActions.ERROR,

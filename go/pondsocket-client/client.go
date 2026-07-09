@@ -231,6 +231,16 @@ func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 			case <-sub.done:
 				return
 			case <-c.ctx.Done():
+				draining := true
+				for draining {
+					select {
+					case state := <-sub.ch:
+						callback(state)
+					default:
+						draining = false
+					}
+				}
+				callback(c.GetState())
 				return
 			}
 		}
@@ -490,6 +500,14 @@ func (c *PondClient) init() {
 				if event.Action == Connect {
 					c.setConnectionState(true)
 				}
+			case string(EventUnauthorized), string(EventNotFound):
+				if event.Action == System {
+					c.handleDecline(event)
+				}
+			case string(EventInternalError):
+				if event.Action == System {
+					c.handleError(event)
+				}
 			}
 		}
 	}()
@@ -502,13 +520,31 @@ func (c *PondClient) handleAcknowledge(event ChannelEvent) {
 
 	channel, exists := c.channels[event.ChannelName]
 	if !exists {
-		connectionChan, unsubscribeConnection := c.subscribeToConnection()
-		channel = NewChannelWithCleanup(c.createPublisher(), connectionChan, unsubscribeConnection, event.ChannelName, JoinParams{})
-		c.channels[event.ChannelName] = channel
+		return
 	}
 
 	eventChan, unsubscribe := c.subscribeToEventsWithUnsubscribe()
 	channel.Acknowledge(eventChan, unsubscribe)
+}
+
+func (c *PondClient) handleDecline(event ChannelEvent) {
+	c.channelsMu.RLock()
+	channel, exists := c.channels[event.ChannelName]
+	c.channelsMu.RUnlock()
+
+	if exists {
+		channel.decline(event)
+	}
+}
+
+func (c *PondClient) handleError(event ChannelEvent) {
+	c.channelsMu.RLock()
+	channel, exists := c.channels[event.ChannelName]
+	c.channelsMu.RUnlock()
+
+	if exists {
+		channel.surface(event)
+	}
 }
 
 func (c *PondClient) safeSendBool(sub *boolSubscriber, value bool) {

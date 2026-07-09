@@ -105,8 +105,11 @@ func TestDistributedRoundTripAllTypes(t *testing.T) {
 		}
 		m := decodeWire(t, data)
 		assertEnvelope(t, m, msgPresenceUpdate)
-		mustHave(t, m, "userId", "presence")
+		mustHave(t, m, "userId", "presence", "presenceEvent")
 		mustNotHave(t, m, "event", "requestId")
+		if m["presenceEvent"] != string(join) {
+			t.Errorf("presenceEvent = %v, want %s", m["presenceEvent"], join)
+		}
 		if m["userId"] != "user-1" {
 			t.Errorf("userId = %v", m["userId"])
 		}
@@ -135,8 +138,11 @@ func TestDistributedRoundTripAllTypes(t *testing.T) {
 		}
 		m := decodeWire(t, data)
 		assertEnvelope(t, m, msgPresenceRemoved)
-		mustHave(t, m, "userId")
+		mustHave(t, m, "userId", "presenceEvent")
 		mustNotHave(t, m, "event", "presence", "requestId")
+		if m["presenceEvent"] != string(leave) {
+			t.Errorf("presenceEvent = %v, want %s", m["presenceEvent"], leave)
+		}
 		if m["userId"] != "user-1" {
 			t.Errorf("userId = %v", m["userId"])
 		}

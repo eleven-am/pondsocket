@@ -31,7 +31,7 @@ export abstract class BaseContext<
 
     readonly #sender: string;
 
-    readonly #payload: Payload;
+    #payload: Payload;
 
     protected constructor (
         engine: ChannelEngine,
@@ -112,6 +112,14 @@ export abstract class BaseContext<
 
     protected get sender (): string {
         return this.#sender;
+    }
+
+    protected get currentPayload (): Payload {
+        return this.#payload;
+    }
+
+    protected updatePayload (payload: Payload): void {
+        this.#payload = payload;
     }
 
     protected updateParams (params: EventParams<Path>): void {

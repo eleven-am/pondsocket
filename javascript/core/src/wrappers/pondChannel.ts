@@ -3,6 +3,7 @@ import {
     EventPayload,
     EventsOf,
     PondPath,
+    RouteParamsArguments,
 } from '@eleven-am/pondsocket-common';
 
 import { Channel } from './channel';
@@ -43,20 +44,20 @@ export class PondChannel<Schema extends AnyPondSchema = AnyPondSchema> {
         }
     }
 
-    public broadcast<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>): PondChannel<Schema> {
-        this.#getChannel(channelName).broadcast(event, payload);
+    public broadcast<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>, ...args: RouteParamsArguments<Event>): PondChannel<Schema> {
+        this.#getChannel(channelName).broadcast(event, payload, ...args);
 
         return this;
     }
 
-    public broadcastFrom<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, userId: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>): PondChannel<Schema> {
-        this.#getChannel(channelName).broadcastFrom(userId, event, payload);
+    public broadcastFrom<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, userId: string, event: Event, payload: EventPayload<EventsOf<Schema>, Event>, ...args: RouteParamsArguments<Event>): PondChannel<Schema> {
+        this.#getChannel(channelName).broadcastFrom(userId, event, payload, ...args);
 
         return this;
     }
 
-    public broadcastTo<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, userIds: string | string[], event: Event, payload: EventPayload<EventsOf<Schema>, Event>): PondChannel<Schema> {
-        this.#getChannel(channelName).broadcastTo(userIds, event, payload);
+    public broadcastTo<Event extends Extract<keyof EventsOf<Schema>, string>> (channelName: string, userIds: string | string[], event: Event, payload: EventPayload<EventsOf<Schema>, Event>, ...args: RouteParamsArguments<Event>): PondChannel<Schema> {
+        this.#getChannel(channelName).broadcastTo(userIds, event, payload, ...args);
 
         return this;
     }

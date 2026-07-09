@@ -56,6 +56,22 @@ describe('Subject', () => {
         expect(() => emptySubject.publish(10)).not.toThrow();
     });
 
+    it('should isolate subscriber errors and continue fan-out', () => {
+        const onError = jest.fn();
+        const subject = new Subject<number>(onError);
+        const second = jest.fn();
+        const error = new Error('subscriber failed');
+
+        subject.subscribe(() => {
+            throw error;
+        });
+        subject.subscribe(second);
+        subject.publish(42);
+
+        expect(onError).toHaveBeenCalledWith(error, expect.any(Function));
+        expect(second).toHaveBeenCalledWith(42);
+    });
+
     it('should handle double unsubscribe gracefully', () => {
         const newObserver = jest.fn();
         const unsub = testSubject.subscribe(newObserver);

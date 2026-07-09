@@ -1,16 +1,15 @@
-import {
+import type {
     Channel,
-    JoinContext,
+    ConnectionContext,
     EventContext,
-    ConnectionContext, LeaveEvent,
+    JoinContext,
+    LeaveEvent,
 } from '@eleven-am/pondsocket/types';
+import { buildPondRoute } from '@eleven-am/pondsocket-common';
 
-import { PondResponse } from '../types';
-import {
-    isJoinContext,
-    isEventContext,
-    isConnectionContext, isLeaveEvent,
-} from './narrow';
+import { PondLifecycle, PondResponse } from '../types';
+
+type ResponseContext = JoinContext<string> | EventContext<string> | ConnectionContext<string> | LeaveEvent;
 
 function isNotEmpty<TValue> (value: TValue | null | undefined): value is TValue {
     if (value === null || value === undefined) {
@@ -28,56 +27,72 @@ export function performResponse (
     socketId: string,
     channel: Channel | null,
     data: PondResponse | null | undefined,
-    context: JoinContext<string> | EventContext<string> | ConnectionContext<string> | LeaveEvent,
+    context: ResponseContext,
+    lifecycle: Exclude<PondLifecycle, 'outgoing'>,
 ) {
-    if ((isLeaveEvent(context) || !isNotEmpty(data)) || (!isEventContext(context) && context.hasResponded)) {
+    if (lifecycle === 'leave' || !isNotEmpty(data)) {
+        return;
+    }
+
+    if ((lifecycle === 'join' || lifecycle === 'connection') && (context as JoinContext<string> | ConnectionContext<string>).hasResponded) {
         return;
     }
 
     const {
         event,
+        eventParams,
         presence,
         assigns,
         broadcast,
         broadcastFrom,
         broadcastTo,
-        ...rest
+        decline,
+        payload: explicitPayload,
+        ...legacyPayload
     } = data;
+    const responseContext = context as JoinContext<string> | EventContext<string> | ConnectionContext<string>;
 
-    if (isConnectionContext(context)) {
-        context
-            .assign(typeof assigns === 'object' ? assigns : {})
-            .accept();
-    } else if (isJoinContext(context)) {
-        (context as JoinContext<string>)
-            .assign(typeof assigns === 'object' ? assigns : {})
-            .accept();
-    } else {
-        (context as EventContext<string>)
-            .assign(typeof assigns === 'object' ? assigns : {});
+    if (decline && (lifecycle === 'join' || lifecycle === 'connection')) {
+        const options = typeof decline === 'string' ? { message: decline } : decline;
+
+        (responseContext as JoinContext<string> | ConnectionContext<string>).decline(options.message, options.status);
+
+        return;
     }
 
-    const payload = isNotEmpty(rest) ? rest : {};
+    if (assigns !== undefined) {
+        responseContext.assign(assigns);
+    }
+
+    if (lifecycle === 'connection' || lifecycle === 'join') {
+        (responseContext as JoinContext<string> | ConnectionContext<string>).accept();
+    }
+
+    const payload = explicitPayload ?? (isNotEmpty(legacyPayload) ? legacyPayload : {});
 
     if (event) {
-        context.reply(event, payload);
+        responseContext.reply(eventParams ? buildPondRoute(event, eventParams) : event, payload);
     }
 
-    if (isJoinContext(context) || isEventContext(context)) {
+    if (lifecycle === 'join' || lifecycle === 'event') {
+        const channelContext = responseContext as JoinContext<string> | EventContext<string>;
+
         if (broadcast) {
-            context.broadcast(broadcast, payload);
+            channelContext.broadcast(eventParams ? buildPondRoute(broadcast, eventParams) : broadcast, payload);
         }
 
         if (broadcastFrom) {
-            context.broadcastFrom(broadcastFrom, payload);
+            channelContext.broadcastFrom(eventParams ? buildPondRoute(broadcastFrom, eventParams) : broadcastFrom, payload);
         }
 
         if (broadcastTo) {
-            context.broadcastTo(broadcastTo.event, payload, broadcastTo.users);
+            const broadcastEvent = eventParams ? buildPondRoute(broadcastTo.event, eventParams) : broadcastTo.event;
+
+            channelContext.broadcastTo(broadcastEvent, payload, broadcastTo.users);
         }
     }
 
-    if (channel && isNotEmpty(presence)) {
+    if (channel && presence !== undefined) {
         channel.upsertPresence(socketId, presence);
     }
 }

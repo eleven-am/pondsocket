@@ -133,10 +133,14 @@ mod integration_tests {
     #[tokio::test]
     async fn local_pubsub_delivers_broadcasts_across_nodes() {
         let pubsub = Arc::new(LocalPubSub::new(100));
-        let mut opts_a = Options::default();
-        opts_a.node_id = "node-a".to_owned();
-        let mut opts_b = Options::default();
-        opts_b.node_id = "node-b".to_owned();
+        let opts_a = Options {
+            node_id: "node-a".to_owned(),
+            ..Options::default()
+        };
+        let opts_b = Options {
+            node_id: "node-b".to_owned(),
+            ..Options::default()
+        };
         let pond_a = PondSocket::new(opts_a, Some(pubsub.clone()));
         let pond_b = PondSocket::new(opts_b, Some(pubsub));
         let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await;
@@ -281,6 +285,7 @@ mod integration_tests {
             event_handlers: Vec::new(),
             outgoing_handlers: Vec::new(),
             leave_handler: None,
+            lobby: std::sync::Weak::new(),
         });
         let weak = Arc::downgrade(&channel);
         channel.start().await.unwrap();
@@ -297,12 +302,15 @@ mod integration_tests {
 
     #[async_trait]
     impl PubSub for CountingPubSub {
-        async fn subscribe(&self, _pattern: &str, _handler: pubsub::PubSubHandler) -> Result<()> {
-            self.subscribe_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+        async fn subscribe(
+            &self,
+            _pattern: &str,
+            _handler: pubsub::PubSubHandler,
+        ) -> Result<pubsub::SubscriptionId> {
+            Ok(self.subscribe_count.fetch_add(1, Ordering::SeqCst) as u64)
         }
 
-        async fn unsubscribe(&self, _pattern: &str) -> Result<()> {
+        async fn unsubscribe(&self, _pattern: &str, _id: pubsub::SubscriptionId) -> Result<()> {
             Ok(())
         }
 

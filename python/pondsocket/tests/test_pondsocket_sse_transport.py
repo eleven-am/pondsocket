@@ -117,13 +117,71 @@ async def test_push_message_silently_drops_invalid_schema() -> None:
         received.append(ev)
 
     t.on_message(handler)
-    await t.push_message(b'{"action":"BOGUS","event":"x","channelName":"c","requestId":"r","payload":{}}')
+    await t.push_message(
+        b'{"action":"BOGUS","event":"x","channelName":"c","requestId":"r","payload":{}}'
+    )
     assert received == []
+
+
+async def test_push_message_emits_invalid_message_frame_for_bad_json() -> None:
+    t = SSEServerTransport(id="u1")
+    received: list[Event] = []
+
+    async def handler(ev: Event, _t: Transport) -> None:
+        received.append(ev)
+
+    t.on_message(handler)
+    await t.push_message(b"{not json}")
+    assert received == []
+    frame = await t.next_event()
+    assert frame is not None
+    assert frame.action == "ERROR"
+    assert frame.event == "INVALID_MESSAGE"
+    assert frame.channel_name == "GATEWAY"
+    assert "error" in frame.payload
+
+
+async def test_push_message_emits_invalid_message_frame_for_bad_schema() -> None:
+    t = SSEServerTransport(id="u1")
+    received: list[Event] = []
+
+    async def handler(ev: Event, _t: Transport) -> None:
+        received.append(ev)
+
+    t.on_message(handler)
+    await t.push_message(
+        b'{"action":"BOGUS","event":"x","channelName":"c","requestId":"r","payload":{}}'
+    )
+    assert received == []
+    frame = await t.next_event()
+    assert frame is not None
+    assert frame.action == "ERROR"
+    assert frame.event == "INVALID_MESSAGE"
+    assert frame.channel_name == "GATEWAY"
+
+
+async def test_push_message_emits_invalid_message_frame_for_non_utf8() -> None:
+    t = SSEServerTransport(id="u1")
+    received: list[Event] = []
+
+    async def handler(ev: Event, _t: Transport) -> None:
+        received.append(ev)
+
+    t.on_message(handler)
+    await t.push_message(b"\xff\xfe\xff")
+    assert received == []
+    frame = await t.next_event()
+    assert frame is not None
+    assert frame.action == "ERROR"
+    assert frame.event == "INVALID_MESSAGE"
+    assert frame.payload == {"error": "Binary frame is not valid UTF-8"}
 
 
 async def test_push_message_with_no_handler_is_safe() -> None:
     t = SSEServerTransport(id="u1")
-    await t.push_message(b'{"action":"BROADCAST","event":"x","channelName":"c","requestId":"r","payload":{}}')
+    await t.push_message(
+        b'{"action":"BROADCAST","event":"x","channelName":"c","requestId":"r","payload":{}}'
+    )
 
 
 async def test_handle_messages_is_no_op() -> None:

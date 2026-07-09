@@ -18,9 +18,10 @@ export function OnJoinRequest (): MethodDecorator {
                     originalMethod,
                     propertyKey as string,
                     ctx,
+                    'join',
                 );
             } catch (error) {
-                performErrors(error, ctx);
+                performErrors(error, ctx, 'join');
             }
         });
     };

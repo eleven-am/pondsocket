@@ -2,6 +2,8 @@
 javascript/*/node_modules
 javascript/*/dist
 javascript/*/coverage
+javascript/coverage
+javascript/.pack
 /.idea
 /.claude
 node_modules

@@ -30,13 +30,15 @@ Every distributed message is a UTF-8 JSON object:
   "type": "USER_MESSAGE",
   "messageId": "uuid",
   "sourceNodeId": "node-id",
-  "endpointName": "/api/socket",
+  "endpointName": "api/socket",
   "channelName": "/chat/1",
   "timestamp": 1730000000000
 }
 ```
 
 Implementations must ignore messages with their own `sourceNodeId`.
+`endpointName` is the endpoint path with its leading slash removed, matching the
+endpoint segment used in the Redis topic.
 
 ## Message Types
 
@@ -80,7 +82,6 @@ Presence updates are distributed as:
 {
   "type": "PRESENCE_UPDATE",
   "userId": "user-1",
-  "event": "JOIN",
   "presence": { "status": "online" }
 }
 ```
@@ -90,13 +91,14 @@ Presence removals are distributed as:
 ```json
 {
   "type": "PRESENCE_REMOVED",
-  "userId": "user-1",
-  "event": "LEAVE"
+  "userId": "user-1"
 }
 ```
 
-Implementations may include a client-shaped `payload` for local compatibility,
-but `userId` and `presence` are the canonical cross-runtime fields.
+Implementations may include a client-shaped `payload`, `event`, or
+`presenceEvent` for local or legacy compatibility, but `userId` and `presence`
+are the canonical cross-runtime fields. Consumers must not require those
+optional compatibility fields.
 
 ## Assigns
 

@@ -1,52 +1,53 @@
 {
   "name": "@eleven-am/pondsocket-common",
-  "version": "0.0.40",
-  "description": "PondSocket is a fast simple socket server",
+  "version": "0.0.41",
+  "description": "Shared protocol, schema, routing, and observable primitives for PondSocket.",
   "keywords": [
-    "socket",
-    "server",
-    "ws",
+    "pondsocket",
     "websocket",
-    "pubsub",
-    "presence",
     "realtime",
-    "realtime server"
+    "schema",
+    "presence",
+    "pubsub"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
   "author": "Roy OSSAI",
-  "main": "./index.js",
-  "types": "./index.d.ts",
-  "sideEffects": false,
   "license": "GPL-3.0",
+  "homepage": "https://github.com/eleven-am/pondsocket#readme",
+  "bugs": {
+    "url": "https://github.com/eleven-am/pondsocket/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eleven-am/pondsocket.git",
+    "directory": "javascript/comnon"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "scripts": {
+    "clean": "rimraf dist",
+    "build": "npm run clean && tsc --project tsconfig.json",
     "test": "jest --coverage --verbose",
-    "build": "rimraf dist && tsc",
-    "lint": "eslint --ext .ts src",
-    "lint:fix": "eslint --fix --ext .ts src",
-    "push": "npm version patch && cp package.json dist && cd dist && npm publish && cd ..",
-    "pipeline": "npm run lint && npm run test && npm run build && npm run push"
-  },
-  "dependencies": {
-    "@types/node": "^25.3.3"
-  },
-  "devDependencies": {
-    "@eslint/compat": "^1.4.0",
-    "@eslint/js": "^9.39.4",
-    "@types/jest": "^30.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.59.4",
-    "eslint": "^9.39.4",
-    "eslint-plugin-file-progress": "^3.0.2",
-    "eslint-plugin-import": "^2.32.0",
-    "jest": "^30.2.0",
-    "prettier": "^3.8.3",
-    "rimraf": "^6.1.3",
-    "ts-jest": "^29.4.11",
-    "ts-loader": "^9.5.7",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.59.4"
+    "lint": "eslint src --max-warnings=0",
+    "prepack": "npm run build"
   },
   "jest": {
     "moduleFileExtensions": [
@@ -57,12 +58,14 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.ts$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "**/*.ts",
+      "!**/*.test.ts",
+      "!**/index.ts"
     ],
-    "coverageDirectory": "../coverage",
+    "coverageDirectory": "../coverage/common",
     "testEnvironment": "node"
   }
 }

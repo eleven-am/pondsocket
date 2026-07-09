@@ -91,7 +91,7 @@ describe('Integration Tests', () => {
 
     describe('connection', () => {
         it('should connect a client to a server endpoint', async () => {
-            server.createEndpoint('/ws', (ctx, next) => {
+            server.createEndpoint('/ws', (ctx, _next) => {
                 ctx.accept();
             });
 
@@ -105,7 +105,7 @@ describe('Integration Tests', () => {
         it('should support query parameters on connection', async () => {
             let receivedQuery: Record<string, string> = {};
 
-            server.createEndpoint('/ws', (ctx, next) => {
+            server.createEndpoint('/ws', (ctx, _next) => {
                 receivedQuery = ctx.query;
                 ctx.accept();
             });
@@ -183,9 +183,57 @@ describe('Integration Tests', () => {
             const channel = client.createChannel('/chat/private');
             channel.join();
 
-            await delay(500);
+            await waitForChannelState(channel, ChannelState.DECLINED);
             expect(declineCalled).toBe(true);
-            expect(channel.channelState).not.toBe(ChannelState.JOINED);
+            expect(channel.channelState).toBe(ChannelState.DECLINED);
+            expect(channel.joinError).toEqual(expect.objectContaining({
+                message: 'Not allowed',
+                status: 403,
+            }));
+        });
+
+        it('should decline an unmatched channel instead of hanging in JOINING', async () => {
+            const endpoint = server.createEndpoint('/ws', (ctx) => {
+                ctx.accept();
+            });
+
+            endpoint.createChannel('/chat/:room', (ctx) => {
+                ctx.accept();
+            });
+
+            const client = createClient();
+            client.connect();
+            await waitForState(client, ConnectionState.CONNECTED);
+
+            const channel = client.createChannel('/jobs/42');
+            channel.join();
+
+            await waitForChannelState(channel, ChannelState.DECLINED);
+            expect(channel.joinError).toEqual(expect.objectContaining({
+                code: 'CHANNEL_NOT_FOUND',
+                status: 404,
+            }));
+        });
+
+        it('should decline when a join handler completes without responding', async () => {
+            const endpoint = server.createEndpoint('/ws', (ctx) => {
+                ctx.accept();
+            });
+
+            endpoint.createChannel('/undecided/:room', () => {});
+
+            const client = createClient();
+            client.connect();
+            await waitForState(client, ConnectionState.CONNECTED);
+
+            const channel = client.createChannel('/undecided/general');
+            channel.join();
+
+            await waitForChannelState(channel, ChannelState.DECLINED);
+            expect(channel.joinError).toEqual(expect.objectContaining({
+                status: 500,
+                message: expect.stringContaining('without accepting or declining'),
+            }));
         });
     });
 
@@ -259,12 +307,16 @@ describe('Integration Tests', () => {
 
             const msg1Promise = new Promise<any>((resolve) => {
                 ch1.onMessage((event, payload) => {
-                    if (event === 'pong') resolve(payload);
+                    if (event === 'pong') {
+                        resolve(payload);
+                    }
                 });
             });
             const msg2Promise = new Promise<any>((resolve) => {
                 ch2.onMessage((event, payload) => {
-                    if (event === 'pong') resolve(payload);
+                    if (event === 'pong') {
+                        resolve(payload);
+                    }
                 });
             });
 
@@ -308,12 +360,16 @@ describe('Integration Tests', () => {
 
             let client1Received = false;
             ch1.onMessage((event) => {
-                if (event === 'announcement') client1Received = true;
+                if (event === 'announcement') {
+                    client1Received = true;
+                }
             });
 
             const msg2Promise = new Promise<any>((resolve) => {
                 ch2.onMessage((event, payload) => {
-                    if (event === 'announcement') resolve(payload);
+                    if (event === 'announcement') {
+                        resolve(payload);
+                    }
                 });
             });
 
@@ -333,7 +389,7 @@ describe('Integration Tests', () => {
                 ctx.accept();
             });
 
-            const pondChannel = endpoint.createChannel('/chat/:room', (ctx) => {
+            endpoint.createChannel('/chat/:room', (ctx) => {
                 ctx.accept();
                 ctx.trackPresence({ username: ctx.joinParams.username as string, status: 'online' });
             });
@@ -466,7 +522,9 @@ describe('Integration Tests', () => {
 
             const joinPromise = new Promise<void>((resolve) => {
                 ch1.onJoin((p) => {
-                    if (p.username === 'bob') resolve();
+                    if (p.username === 'bob') {
+                        resolve();
+                    }
                 });
             });
             ch2.join();
@@ -632,12 +690,16 @@ describe('Integration Tests', () => {
 
             const msg1Promise = new Promise<any>((resolve) => {
                 ch1.onMessage((event, payload) => {
-                    if (event === 'message') resolve(payload);
+                    if (event === 'message') {
+                        resolve(payload);
+                    }
                 });
             });
             const msg2Promise = new Promise<any>((resolve) => {
                 ch2.onMessage((event, payload) => {
-                    if (event === 'message') resolve(payload);
+                    if (event === 'message') {
+                        resolve(payload);
+                    }
                 });
             });
 

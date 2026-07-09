@@ -564,6 +564,8 @@ func TestChannel_Acknowledge(t *testing.T) {
 	// Create event channel
 	eventChan := make(chan ChannelEvent, 10)
 
+	channel.Join()
+
 	// Acknowledge
 	channel.Acknowledge(eventChan)
 

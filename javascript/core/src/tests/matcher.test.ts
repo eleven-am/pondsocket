@@ -48,8 +48,12 @@ describe('parseAddress', () => {
         const pattern = '/test:id';
         const string = '/test5';
 
-        expect(parseAddress(pattern, string))
-            .toBe(null);
+        expect(() => parseAddress(pattern, string))
+            .toThrow(/parameters must occupy an entire path segment/);
+    });
+
+    it('should reject unsupported colon wildcard patterns', () => {
+        expect(() => parseAddress('job:*', 'job:42')).toThrow(/wildcards must occupy an entire path segment/);
     });
 
     it('should match when there is a *', () => {

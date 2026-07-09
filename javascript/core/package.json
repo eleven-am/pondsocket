@@ -1,80 +1,65 @@
 {
   "name": "@eleven-am/pondsocket",
-  "version": "0.1.218",
-  "description": "PondSocket is a fast simple socket server",
+  "version": "0.1.219",
+  "description": "Typed WebSocket and SSE server with presence and distributed messaging.",
   "keywords": [
-    "socket",
-    "server",
-    "ws",
+    "pondsocket",
     "websocket",
-    "pubsub",
-    "presence",
+    "sse",
     "realtime",
-    "realtime server"
+    "presence",
+    "pubsub",
+    "redis"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "scripts": {
-    "test": "jest --coverage --verbose --forceExit --detectOpenHandles --runInBand --bail",
-    "build": "rimraf dist && tsc --project tsconfig.build.json && rm -rf dist/tests",
-    "lint": "eslint --ext .ts src",
-    "lint:fix": "eslint --fix --ext .ts src",
-    "copy": "cp package.json dist && cp README.md dist && cp LICENSE dist",
-    "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
-    "pipeline": "npm run lint:fix && npm run lint && npm run test && npm run build && npm run push"
-  },
   "author": "Roy OSSAI",
   "license": "GPL-3.0",
-  "main": "./index.js",
-  "types": "./index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./index.d.ts",
-      "default": "./index.js"
-    },
-    "./types": {
-      "types": "./index.d.ts",
-      "default": "./index.js"
-    }
+  "homepage": "https://github.com/eleven-am/pondsocket#readme",
+  "bugs": {
+    "url": "https://github.com/eleven-am/pondsocket/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Eleven-am/pondSocket.git"
+    "url": "git+https://github.com/eleven-am/pondsocket.git",
+    "directory": "javascript/core"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./types": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "clean": "rimraf dist",
+    "build": "npm run clean && tsc --project tsconfig.build.json",
+    "test": "jest --coverage --verbose --detectOpenHandles --runInBand --bail",
+    "lint": "eslint src --max-warnings=0",
+    "prepack": "npm run build"
   },
   "dependencies": {
-    "@eleven-am/pondsocket-common": "^0.0.40",
-    "@types/node": "^25.3.3",
+    "@eleven-am/pondsocket-common": "^0.0.41",
+    "@types/node": "^20.19.43",
     "@types/ws": "^8.18.1",
-    "redis": "^5.12.1",
-    "ws": "^8.20.1"
-  },
-  "devDependencies": {
-    "@eslint/compat": "^1.4.0",
-    "@eslint/eslintrc": "^3.3.4",
-    "@eslint/js": "^9.39.4",
-    "@stylistic/eslint-plugin-ts": "^4.4.1",
-    "@types/jest": "^30.0.0",
-    "@types/node": "^25.3.3",
-    "@types/ws": "^8.18.1",
-    "@typescript-eslint/eslint-plugin": "^8.59.4",
-    "@typescript-eslint/parser": "^8.59.4",
-    "eslint": "^9.39.4",
-    "eslint-config-prettier": "^10.1.8",
-    "eslint-import-resolver-node": "^0.3.9",
-    "eslint-plugin-file-progress": "^3.0.2",
-    "eslint-plugin-import": "^2.32.0",
-    "eslint-plugin-prettier": "^5.5.5",
-    "globals": "^16.4.0",
-    "jest": "^30.2.0",
-    "prettier": "^3.8.3",
-    "source-map-support": "^0.5.21",
-    "supertest": "^7.2.2",
-    "ts-jest": "^29.4.11",
-    "ts-loader": "^9.5.7",
-    "ts-node": "^10.9.2",
-    "tsconfig-paths": "^4.2.0",
-    "typescript": "^5.9.3"
+    "redis": "^6.1.0",
+    "ws": "^8.21.0"
   },
   "jest": {
     "moduleFileExtensions": [
@@ -85,7 +70,7 @@
     "rootDir": "src",
     "testRegex": ".*\\.test\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": [
+      "^.+\\.ts$": [
         "ts-jest",
         {
           "diagnostics": false
@@ -93,15 +78,14 @@
       ]
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s",
+      "**/*.ts",
       "!**/*.test.ts",
       "!**/*.d.ts",
       "!**/index.ts",
       "!**/tests/**",
-      "!**/types.d.ts",
       "!**/abstracts/distributor.ts"
     ],
-    "coverageDirectory": "../coverage",
+    "coverageDirectory": "../coverage/core",
     "testEnvironment": "node",
     "moduleNameMapper": {
       "^@eleven-am/pondsocket-common$": "<rootDir>/../../comnon/dist"

@@ -94,6 +94,7 @@ struct ChannelInner {
     presence: Mutex<Vec<PondPresence>>,
     queue: Mutex<VecDeque<ClientMessage>>,
     pending: Mutex<HashMap<String, oneshot::Sender<PondMessage>>>,
+    decline_reason: Mutex<Option<PondMessage>>,
     conn_task: Mutex<Option<JoinHandle<()>>>,
     closed: Mutex<bool>,
 }
@@ -141,11 +142,11 @@ impl PondClient {
     ) -> Channel {
         let name = name.into();
         let mut channels = self.inner.channels.lock().await;
-        if let Some(channel) = channels.get(&name) {
-            if channel.state() != ChannelState::Closed && channel.state() != ChannelState::Declined
-            {
-                return channel.clone();
-            }
+        if let Some(channel) = channels.get(&name)
+            && channel.state() != ChannelState::Closed
+            && channel.state() != ChannelState::Declined
+        {
+            return channel.clone();
         }
 
         let (state, _) = watch::channel(ChannelState::Idle);
@@ -160,6 +161,7 @@ impl PondClient {
                 presence: Mutex::new(Vec::new()),
                 queue: Mutex::new(VecDeque::new()),
                 pending: Mutex::new(HashMap::new()),
+                decline_reason: Mutex::new(None),
                 conn_task: Mutex::new(None),
                 closed: Mutex::new(false),
             }),
@@ -246,7 +248,8 @@ impl PondClient {
             task.abort();
         }
         *self.inner.outbound.lock().await = None;
-        self.inner.set_connection_state(ConnectionState::Disconnected);
+        self.inner
+            .set_connection_state(ConnectionState::Disconnected);
         let channels: Vec<Channel> = self.inner.channels.lock().await.values().cloned().collect();
         for channel in channels {
             channel.force_close().await;
@@ -307,6 +310,10 @@ impl Channel {
 
     pub async fn presence(&self) -> Vec<PondPresence> {
         self.inner.presence.lock().await.clone()
+    }
+
+    pub async fn decline_reason(&self) -> Option<PondMessage> {
+        self.inner.decline_reason.lock().await.clone()
     }
 
     pub async fn join(&self) {
@@ -389,10 +396,11 @@ impl Channel {
         let connected = *self.inner.client.state.borrow() == ConnectionState::Connected;
         let joined = self.state() == ChannelState::Joined;
         let is_join = message.action == ClientAction::JoinChannel;
-        if connected && (joined || is_join) {
-            if self.inner.client.publish(message.clone()).await.is_ok() {
-                return;
-            }
+        if connected
+            && (joined || is_join)
+            && self.inner.client.publish(message.clone()).await.is_ok()
+        {
+            return;
         }
         let mut queue = self.inner.queue.lock().await;
         if queue.len() == self.inner.client.options.max_queue_size {
@@ -407,12 +415,18 @@ impl Channel {
         }
         match state {
             ConnectionState::Disconnected => {
-                if self.state() == ChannelState::Joined {
+                if matches!(self.state(), ChannelState::Joined | ChannelState::Joining) {
                     self.inner.state.send_replace(ChannelState::Stalled);
                 }
             }
             ConnectionState::Connected => {
-                if self.state() == ChannelState::Stalled {
+                if matches!(self.state(), ChannelState::Stalled | ChannelState::Joining) {
+                    self.inner
+                        .queue
+                        .lock()
+                        .await
+                        .retain(|message| message.action != ClientAction::JoinChannel);
+                    self.inner.state.send_replace(ChannelState::Stalled);
                     self.join().await;
                 }
             }
@@ -437,16 +451,31 @@ impl Channel {
     }
 
     async fn handle_message(&self, message: ServerMessage) {
+        if message.action == ServerAction::System && message.event == "EVICTED" {
+            let _ = self.inner.events.send(ChannelEvent::Message(message));
+            self.force_close().await;
+            return;
+        }
         if message.action == ServerAction::System
             && message.event == event_name(EventName::Acknowledge)
         {
-            self.acknowledge().await;
+            if matches!(self.state(), ChannelState::Joining | ChannelState::Stalled) {
+                self.acknowledge().await;
+            }
             return;
         }
         if message.action == ServerAction::System
             && message.event == event_name(EventName::Unauthorized)
+            && matches!(self.state(), ChannelState::Joining | ChannelState::Stalled)
         {
-            self.decline().await;
+            self.decline(message.payload).await;
+            return;
+        }
+        if message.action == ServerAction::System
+            && message.event == event_name(EventName::NotFound)
+            && matches!(self.state(), ChannelState::Joining | ChannelState::Stalled)
+        {
+            self.decline(message.payload).await;
             return;
         }
         if let Some(tx) = self.inner.pending.lock().await.remove(&message.request_id) {
@@ -470,7 +499,8 @@ impl Channel {
         }
     }
 
-    async fn decline(&self) {
+    async fn decline(&self, reason: PondMessage) {
+        *self.inner.decline_reason.lock().await = Some(reason);
         self.inner.state.send_replace(ChannelState::Declined);
         self.inner.queue.lock().await.clear();
         self.inner.pending.lock().await.clear();
@@ -726,7 +756,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while channel.state() != target {
             if tokio::time::Instant::now() > deadline {
-                panic!("timed out waiting for {target:?}, still {:?}", channel.state());
+                panic!(
+                    "timed out waiting for {target:?}, still {:?}",
+                    channel.state()
+                );
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -785,5 +818,626 @@ mod tests {
         assert_eq!(joins.load(Ordering::SeqCst), 2);
 
         assert_eq!(recv_greeting(&mut events).await, 2);
+    }
+
+    async fn serve_not_found(stream: TcpStream, mut kill: broadcast::Receiver<()>) {
+        let Ok(ws) = accept_async(stream).await else {
+            return;
+        };
+        let (mut writer, mut reader) = ws.split();
+        loop {
+            tokio::select! {
+                _ = kill.recv() => {
+                    let _ = writer.close().await;
+                    return;
+                }
+                frame = reader.next() => {
+                    let message = match frame {
+                        Some(Ok(Message::Text(text))) => text.to_string(),
+                        Some(Ok(_)) => continue,
+                        _ => return,
+                    };
+                    let Ok(request) = serde_json::from_str::<ClientMessage>(&message) else {
+                        continue;
+                    };
+                    if request.action != ClientAction::JoinChannel {
+                        continue;
+                    }
+                    let mut payload = Map::new();
+                    payload.insert("channel".to_owned(), Value::from(request.channel_name.clone()));
+                    let not_found = ServerMessage {
+                        action: ServerAction::System,
+                        event: event_name(EventName::NotFound),
+                        channel_name: request.channel_name.clone(),
+                        request_id: request.request_id.clone(),
+                        payload,
+                    };
+                    let _ = writer
+                        .send(Message::Text(serde_json::to_string(&not_found).unwrap().into()))
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn serve_join_without_ack(
+        stream: TcpStream,
+        joins: Arc<AtomicUsize>,
+        mut kill: broadcast::Receiver<()>,
+    ) {
+        let Ok(ws) = accept_async(stream).await else {
+            return;
+        };
+        let (mut writer, mut reader) = ws.split();
+        loop {
+            tokio::select! {
+                _ = kill.recv() => {
+                    let _ = writer.close().await;
+                    return;
+                }
+                frame = reader.next() => {
+                    match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(request) = serde_json::from_str::<ClientMessage>(&text)
+                                && request.action == ClientAction::JoinChannel
+                            {
+                                joins.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transitions_to_declined_on_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (kill, _) = broadcast::channel::<()>(4);
+
+        let server_kill = kill.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve_not_found(stream, server_kill.subscribe()));
+            }
+        });
+
+        let url = format!("ws://{addr}/socket");
+        let client = PondClient::new(&url, None).unwrap();
+        client.connect().await.unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.join().await;
+
+        wait_for_state(&channel, ChannelState::Declined).await;
+        let reason = channel.decline_reason().await.unwrap();
+        assert_eq!(reason.get("channel").and_then(Value::as_str), Some("room"));
+        assert!(channel.inner.queue.lock().await.is_empty());
+        assert!(channel.inner.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejoins_channel_that_was_mid_join_when_socket_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let joins = Arc::new(AtomicUsize::new(0));
+        let (kill, _) = broadcast::channel::<()>(4);
+
+        let server_joins = Arc::clone(&joins);
+        let server_kill = kill.clone();
+        tokio::spawn(async move {
+            let mut conn_id = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                conn_id += 1;
+                let joins = Arc::clone(&server_joins);
+                if conn_id == 1 {
+                    tokio::spawn(serve_join_without_ack(
+                        stream,
+                        joins,
+                        server_kill.subscribe(),
+                    ));
+                } else {
+                    tokio::spawn(serve_session(
+                        stream,
+                        joins,
+                        conn_id,
+                        server_kill.subscribe(),
+                    ));
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}/socket");
+        let client = PondClient::new(&url, None).unwrap();
+        client.connect().await.unwrap();
+        let channel = client.create_channel("room", None).await;
+        let mut events = channel.subscribe_events();
+        channel.join().await;
+
+        assert_eq!(channel.state(), ChannelState::Joining);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while joins.load(Ordering::SeqCst) < 1 {
+            if tokio::time::Instant::now() > deadline {
+                panic!("server never observed the initial join");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        kill.send(()).unwrap();
+        wait_for_state(&channel, ChannelState::Stalled).await;
+
+        client.connect().await.unwrap();
+        wait_for_state(&channel, ChannelState::Joined).await;
+        assert_eq!(joins.load(Ordering::SeqCst), 2);
+        assert_eq!(recv_greeting(&mut events).await, 2);
+    }
+
+    fn system_message(
+        event: EventName,
+        channel: &str,
+        mut payload: Map<String, Value>,
+    ) -> ServerMessage {
+        payload
+            .entry("channel".to_owned())
+            .or_insert_with(|| Value::from(channel.to_owned()));
+        ServerMessage {
+            action: ServerAction::System,
+            event: event_name(event),
+            channel_name: channel.to_owned(),
+            request_id: uuid(),
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_not_found_after_joined_leaves_live_channel_intact() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        let mut events = channel.subscribe_events();
+
+        channel
+            .handle_message(system_message(EventName::NotFound, "room", Map::new()))
+            .await;
+
+        assert_eq!(channel.state(), ChannelState::Joined);
+        assert!(channel.decline_reason().await.is_none());
+        match events.try_recv() {
+            Ok(ChannelEvent::Message(m)) => assert_eq!(m.event, event_name(EventName::NotFound)),
+            other => panic!("expected NOT_FOUND surfaced as message event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_unauthorized_after_joined_leaves_live_channel_intact() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+
+        channel
+            .handle_message(system_message(EventName::Unauthorized, "room", Map::new()))
+            .await;
+
+        assert_eq!(channel.state(), ChannelState::Joined);
+        assert!(channel.decline_reason().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn adv_decline_errors_pending_response_promptly() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+
+        let asker = channel.clone();
+        let handle = tokio::spawn(async move {
+            asker
+                .send_for_response("ask", None, Some(Duration::from_secs(30)))
+                .await
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while channel.inner.pending.lock().await.is_empty() {
+            if tokio::time::Instant::now() > deadline {
+                panic!("pending request never registered");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        channel.decline(Map::new()).await;
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("send_for_response hung after decline instead of returning")
+            .unwrap();
+        assert!(joined.is_err());
+        assert!(channel.inner.pending.lock().await.is_empty());
+        assert!(channel.inner.queue.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adv_duplicate_decline_keeps_latest_reason_without_panic() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+
+        let mut first = Map::new();
+        first.insert("code".to_owned(), Value::from("first"));
+        channel.decline(first).await;
+
+        let mut second = Map::new();
+        second.insert("code".to_owned(), Value::from("second"));
+        channel.decline(second).await;
+
+        assert_eq!(channel.state(), ChannelState::Declined);
+        assert_eq!(
+            channel
+                .decline_reason()
+                .await
+                .unwrap()
+                .get("code")
+                .and_then(Value::as_str),
+            Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn adv_leave_during_stall_blocks_rejoin_on_reconnect() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.join().await;
+        assert_eq!(channel.state(), ChannelState::Joining);
+
+        channel
+            .on_connection_change(ConnectionState::Disconnected)
+            .await;
+        assert_eq!(channel.state(), ChannelState::Stalled);
+
+        channel.leave().await;
+        assert_eq!(channel.state(), ChannelState::Closed);
+
+        channel
+            .on_connection_change(ConnectionState::Connected)
+            .await;
+        assert_eq!(channel.state(), ChannelState::Closed);
+        assert!(channel.inner.queue.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adv_join_before_connect_completes_on_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let joins = Arc::new(AtomicUsize::new(0));
+        let (kill, _) = broadcast::channel::<()>(4);
+
+        let server_joins = Arc::clone(&joins);
+        let server_kill = kill.clone();
+        tokio::spawn(async move {
+            let mut conn_id = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                conn_id += 1;
+                tokio::spawn(serve_session(
+                    stream,
+                    Arc::clone(&server_joins),
+                    conn_id,
+                    server_kill.subscribe(),
+                ));
+            }
+        });
+
+        let url = format!("ws://{addr}/socket");
+        let client = PondClient::new(&url, None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.join().await;
+        assert_eq!(channel.state(), ChannelState::Joining);
+        assert_eq!(channel.inner.queue.lock().await.len(), 1);
+
+        client.connect().await.unwrap();
+        wait_for_state(&channel, ChannelState::Joined).await;
+        assert_eq!(joins.load(Ordering::SeqCst), 1);
+        assert!(channel.inner.queue.lock().await.is_empty());
+    }
+
+    async fn wait_for_pending(channel: &Channel) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(id) = channel.inner.pending.lock().await.keys().next().cloned() {
+                return id;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("pending request never registered");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_event_not_found_on_joined_channel_resolves_pending_fast() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+
+        let asker = channel.clone();
+        let handle = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let result = asker
+                .send_for_response("no_handler", None, Some(Duration::from_millis(300)))
+                .await;
+            (start.elapsed(), result)
+        });
+        let request_id = wait_for_pending(&channel).await;
+
+        let mut payload = Map::new();
+        payload.insert("channel".to_owned(), Value::from("room"));
+        payload.insert("event".to_owned(), Value::from("no_handler"));
+        let not_found = ServerMessage {
+            action: ServerAction::System,
+            event: event_name(EventName::NotFound),
+            channel_name: "room".to_owned(),
+            request_id,
+            payload,
+        };
+        channel.handle_message(not_found).await;
+
+        let (elapsed, result) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("request hung")
+            .unwrap();
+        let resolved = result.expect("pending request should resolve, not time out");
+        assert_eq!(
+            resolved.get("event").and_then(Value::as_str),
+            Some("no_handler")
+        );
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(channel.state(), ChannelState::Joined);
+        assert!(channel.decline_reason().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn adv_evicted_closes_client_channel() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        let mut events = channel.subscribe_events();
+
+        let mut payload = Map::new();
+        payload.insert("reason".to_owned(), Value::from("kicked"));
+        let evicted = ServerMessage {
+            action: ServerAction::System,
+            event: "EVICTED".to_owned(),
+            channel_name: "room".to_owned(),
+            request_id: uuid(),
+            payload,
+        };
+        channel.handle_message(evicted).await;
+
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Ok(ChannelEvent::Message(m))) => assert_eq!(m.event, "EVICTED"),
+            other => panic!("expected EVICTED forwarded as message event, got {other:?}"),
+        }
+        assert_eq!(channel.state(), ChannelState::Closed);
+    }
+
+    #[tokio::test]
+    async fn adv_late_response_after_timeout_surfaces_as_message() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        let mut events = channel.subscribe_events();
+
+        let mut payload = Map::new();
+        payload.insert("ok".to_owned(), Value::from(true));
+        let late = ServerMessage {
+            action: ServerAction::Broadcast,
+            event: "reply".to_owned(),
+            channel_name: "room".to_owned(),
+            request_id: "already-timed-out".to_owned(),
+            payload,
+        };
+        channel.handle_message(late).await;
+
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Ok(ChannelEvent::Message(m))) => assert_eq!(m.event, "reply"),
+            other => panic!("expected late response surfaced as message event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_duplicate_response_second_surfaces_as_message() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        let mut events = channel.subscribe_events();
+
+        let asker = channel.clone();
+        let handle = tokio::spawn(async move {
+            asker
+                .send_for_response("ask", None, Some(Duration::from_secs(30)))
+                .await
+        });
+        let request_id = wait_for_pending(&channel).await;
+
+        let mut first_payload = Map::new();
+        first_payload.insert("n".to_owned(), Value::from(1));
+        let first = ServerMessage {
+            action: ServerAction::Broadcast,
+            event: "reply".to_owned(),
+            channel_name: "room".to_owned(),
+            request_id: request_id.clone(),
+            payload: first_payload,
+        };
+        channel.handle_message(first).await;
+
+        let resolved = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("request hung")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.get("n").and_then(Value::as_i64), Some(1));
+
+        let mut second_payload = Map::new();
+        second_payload.insert("n".to_owned(), Value::from(2));
+        let second = ServerMessage {
+            action: ServerAction::Broadcast,
+            event: "reply".to_owned(),
+            channel_name: "room".to_owned(),
+            request_id,
+            payload: second_payload,
+        };
+        channel.handle_message(second).await;
+
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Ok(ChannelEvent::Message(m))) => {
+                assert_eq!(m.payload.get("n").and_then(Value::as_i64), Some(2))
+            }
+            other => panic!("expected duplicate response surfaced as message event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_leave_cancels_inflight_request_with_error() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+
+        let asker = channel.clone();
+        let handle = tokio::spawn(async move {
+            asker
+                .send_for_response("ask", None, Some(Duration::from_secs(30)))
+                .await
+        });
+        wait_for_pending(&channel).await;
+
+        channel.leave().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("request hung after leave")
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(channel.state(), ChannelState::Closed);
+    }
+
+    #[tokio::test]
+    async fn adv_double_leave_is_safe() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        channel.leave().await;
+        channel.leave().await;
+        assert_eq!(channel.state(), ChannelState::Closed);
+    }
+
+    #[tokio::test]
+    async fn adv_not_found_on_joined_with_pending_now_resolves_request() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+
+        let asker = channel.clone();
+        let handle = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let result = asker
+                .send_for_response("no_handler", None, Some(Duration::from_secs(30)))
+                .await;
+            (start.elapsed(), result)
+        });
+        let request_id = wait_for_pending(&channel).await;
+
+        let mut payload = Map::new();
+        payload.insert("channel".to_owned(), Value::from("room"));
+        payload.insert("event".to_owned(), Value::from("no_handler"));
+        let not_found = ServerMessage {
+            action: ServerAction::System,
+            event: event_name(EventName::NotFound),
+            channel_name: "room".to_owned(),
+            request_id,
+            payload,
+        };
+        channel.handle_message(not_found).await;
+
+        let (elapsed, result) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("request hung")
+            .unwrap();
+        let payload = result.expect("expected NOT_FOUND to resolve the pending request");
+        assert_eq!(
+            payload.get("event").and_then(Value::as_str),
+            Some("no_handler")
+        );
+        assert!(elapsed < Duration::from_secs(5));
+        assert_eq!(channel.state(), ChannelState::Joined);
+    }
+
+    #[tokio::test]
+    async fn adv_stray_acknowledge_on_joined_is_consumed() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        let mut events = channel.subscribe_events();
+
+        channel
+            .handle_message(system_message(EventName::Acknowledge, "room", Map::new()))
+            .await;
+
+        assert_eq!(channel.state(), ChannelState::Joined);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn adv_evicted_cancels_inflight_request_and_closes() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+
+        let asker = channel.clone();
+        let handle = tokio::spawn(async move {
+            asker
+                .send_for_response("ask", None, Some(Duration::from_secs(30)))
+                .await
+        });
+        wait_for_pending(&channel).await;
+
+        let mut payload = Map::new();
+        payload.insert("reason".to_owned(), Value::from("kicked"));
+        let evicted = ServerMessage {
+            action: ServerAction::System,
+            event: "EVICTED".to_owned(),
+            channel_name: "room".to_owned(),
+            request_id: uuid(),
+            payload,
+        };
+        channel.handle_message(evicted).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("request hung after eviction")
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(channel.state(), ChannelState::Closed);
+    }
+
+    #[tokio::test]
+    async fn adv_evicted_for_unknown_channel_is_safe() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let _present = client.create_channel("room", None).await;
+
+        let mut payload = Map::new();
+        payload.insert("reason".to_owned(), Value::from("kicked"));
+        let evicted = ServerMessage {
+            action: ServerAction::System,
+            event: "EVICTED".to_owned(),
+            channel_name: "ghost".to_owned(),
+            request_id: uuid(),
+            payload,
+        };
+        client
+            .inner
+            .route_event(ChannelEvent::Message(evicted))
+            .await;
+
+        assert_eq!(
+            client.create_channel("ghost", None).await.state(),
+            ChannelState::Idle
+        );
     }
 }

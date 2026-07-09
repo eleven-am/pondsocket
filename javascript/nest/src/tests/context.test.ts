@@ -1,3 +1,5 @@
+import { ServerActions } from '@eleven-am/pondsocket-common';
+
 import { Context } from '../context/context';
 import { NestContext } from '../types';
 
@@ -26,6 +28,7 @@ function createJoinNestContext(): NestContext {
             broadcast: jest.fn(),
             broadcastFrom: jest.fn(),
             broadcastTo: jest.fn(),
+            trackPresence: jest.fn(),
             hasResponded: false,
             user: { id: 'user-1', assigns: { role: 'admin' }, presence: { status: 'online' } },
             channel: { upsertPresence: jest.fn(), name: 'room-1' },
@@ -47,6 +50,26 @@ function createEventNestContext(): NestContext {
             event: { params: { action: 'move' }, query: { piece: 'knight' }, payload: { x: 3, y: 5 }, event: 'make_move' },
         } as any,
     };
+}
+
+function createOutgoingNestContext(): NestContext {
+    const outgoing = {
+        action: ServerActions.SYSTEM,
+        block: jest.fn(),
+        transform: jest.fn(),
+        user: { id: 'user-4', assigns: { role: 'member' }, presence: { status: 'online' } },
+        channel: { name: 'game-room' },
+        event: {
+            action: ServerActions.SYSTEM,
+            params: { messageId: '42' },
+            query: {},
+            payload: { receivedAt: 123 },
+            event: 'ping',
+        },
+        payload: { receivedAt: 123 },
+    };
+
+    return { outgoing: outgoing as any };
 }
 
 function createLeaveNestContext(): NestContext {
@@ -143,6 +166,16 @@ describe('Context', () => {
 
             expect(ctx.event).toBe(nestCtx.join!.event);
         });
+
+        it('forwards join actions from the typed context', () => {
+            const nestCtx = createJoinNestContext();
+            const ctx = new Context(nestCtx, new TestInstance(), 'handler');
+
+            ctx.accept({ role: 'member' }).trackPresence({ status: 'online' });
+
+            expect(nestCtx.join!.accept).toHaveBeenCalledWith({ role: 'member' });
+            expect(nestCtx.join!.trackPresence).toHaveBeenCalledWith({ status: 'online' });
+        });
     });
 
     describe('event lifecycle', () => {
@@ -176,6 +209,45 @@ describe('Context', () => {
             const ctx = new Context(nestCtx, new TestInstance(), 'handler');
 
             expect(ctx.event).toBe(nestCtx.event!.event);
+        });
+
+        it('forwards event actions from the typed context', () => {
+            const nestCtx = createEventNestContext();
+            const ctx = new Context(nestCtx, new TestInstance(), 'handler');
+
+            ctx.assign({ score: 11 })
+                .reply('make_move', { accepted: true })
+                .broadcast('make_move', { x: 4, y: 6 })
+                .broadcastTo('make_move', { x: 4, y: 6 }, ['user-3']);
+
+            expect(nestCtx.event!.assign).toHaveBeenCalledWith({ score: 11 });
+            expect(nestCtx.event!.reply).toHaveBeenCalledWith('make_move', { accepted: true });
+            expect(nestCtx.event!.broadcast).toHaveBeenCalledWith('make_move', { x: 4, y: 6 });
+            expect(nestCtx.event!.broadcastTo).toHaveBeenCalledWith('make_move', { x: 4, y: 6 }, ['user-3']);
+        });
+
+        it('replies to the current event when only a payload is provided', () => {
+            const nestCtx = createEventNestContext();
+            const ctx = new Context(nestCtx, new TestInstance(), 'handler');
+
+            ctx.reply({ accepted: true });
+
+            expect(nestCtx.event!.reply).toHaveBeenCalledWith('make_move', { accepted: true });
+        });
+    });
+
+    describe('outgoing lifecycle', () => {
+        it('exposes the action and forwards explicit transform and block operations', () => {
+            const nestCtx = createOutgoingNestContext();
+            const ctx = new Context(nestCtx, new TestInstance(), 'handler');
+
+            expect(ctx.action).toBe(ServerActions.SYSTEM);
+            expect(ctx.payload).toEqual({ receivedAt: 123 });
+
+            ctx.transform({ receivedAt: 456 }).block();
+
+            expect(nestCtx.outgoing!.transform).toHaveBeenCalledWith({ receivedAt: 456 });
+            expect(nestCtx.outgoing!.block).toHaveBeenCalled();
         });
     });
 

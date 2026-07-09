@@ -4,8 +4,8 @@ import {
     AssignsOf,
     EventParams,
     EventPayload,
+    EventReplyPayload,
     EventsOf,
-    PondMessage,
     PondObject,
     PresenceOf,
     ServerActions,
@@ -41,7 +41,7 @@ export class EventContext<
         return this;
     }
 
-    reply<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventPayload<EventsOf<Schema>, Event>) {
+    reply<Event extends Extract<keyof EventsOf<Schema>, string>> (event: Event, payload: EventReplyPayload<EventsOf<Schema>, Event>) {
         this.engine.sendMessage(
             SystemSender.CHANNEL,
             [this.#event.sender],

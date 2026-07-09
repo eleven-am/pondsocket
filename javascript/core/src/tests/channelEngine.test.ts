@@ -528,6 +528,28 @@ describe('ChannelEngine', () => {
                 channelEngine.removeUser('nonexistent');
             }).not.toThrow();
         });
+
+        it('should close the channel even when the leave callback throws', () => {
+            const deleteChannelSpy = jest.spyOn(mockLobbyEngine as any, 'deleteChannel').mockImplementation(() => {});
+
+            mockLobbyEngine.leaveCallback = () => {
+                throw new Error('leave failed');
+            };
+
+            expect(() => channelEngine.removeUser(userId)).not.toThrow();
+            expect(deleteChannelSpy).toHaveBeenCalledWith(channelName);
+        });
+
+        it('should absorb rejected asynchronous leave callbacks', async () => {
+            const deleteChannelSpy = jest.spyOn(mockLobbyEngine as any, 'deleteChannel').mockImplementation(() => {});
+
+            mockLobbyEngine.leaveCallback = jest.fn().mockRejectedValue(new Error('async leave failed'));
+
+            channelEngine.removeUser(userId);
+            await flushPromises(0);
+
+            expect(deleteChannelSpy).toHaveBeenCalledWith(channelName);
+        });
     });
 
     describe('destroy', () => {

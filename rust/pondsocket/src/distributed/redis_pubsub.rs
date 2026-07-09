@@ -2,17 +2,25 @@ use async_trait::async_trait;
 use redis::AsyncCommands;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use crate::errors::{Result, unavailable};
-use crate::pubsub::{PubSub, PubSubHandler, match_topic};
+use crate::pubsub::{PubSub, PubSubHandler, SubscriptionId, match_topic};
+
+#[derive(Clone)]
+struct RedisSubscription {
+    id: SubscriptionId,
+    handler: PubSubHandler,
+}
 
 pub struct RedisPubSub {
     client: redis::Client,
-    subscriptions: Arc<RwLock<HashMap<String, Vec<PubSubHandler>>>>,
+    subscriptions: Arc<RwLock<HashMap<String, Vec<RedisSubscription>>>>,
     listeners: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+    next_id: AtomicU64,
 }
 
 impl RedisPubSub {
@@ -29,6 +37,7 @@ impl RedisPubSub {
             client,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             listeners: Arc::new(RwLock::new(HashMap::new())),
+            next_id: AtomicU64::new(0),
         })
     }
 
@@ -59,8 +68,8 @@ impl RedisPubSub {
                 let snapshot = subscriptions.read().await.clone();
                 for (local_pattern, handlers) in snapshot {
                     if match_topic(&local_pattern, &topic) {
-                        for handler in handlers {
-                            handler(topic.clone(), payload.clone());
+                        for subscription in handlers {
+                            (subscription.handler)(topic.clone(), payload.clone());
                         }
                     }
                 }
@@ -76,21 +85,35 @@ impl RedisPubSub {
 
 #[async_trait]
 impl PubSub for RedisPubSub {
-    async fn subscribe(&self, pattern: &str, handler: PubSubHandler) -> Result<()> {
+    async fn subscribe(&self, pattern: &str, handler: PubSubHandler) -> Result<SubscriptionId> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut subs = self.subscriptions.write().await;
         let first = !subs.contains_key(pattern);
-        subs.entry(pattern.to_owned()).or_default().push(handler);
+        subs.entry(pattern.to_owned())
+            .or_default()
+            .push(RedisSubscription { id, handler });
         drop(subs);
         if first {
             self.ensure_listener(pattern.to_owned()).await?;
         }
-        Ok(())
+        Ok(id)
     }
 
-    async fn unsubscribe(&self, pattern: &str) -> Result<()> {
-        self.subscriptions.write().await.remove(pattern);
-        if let Some(handle) = self.listeners.write().await.remove(pattern) {
-            handle.abort();
+    async fn unsubscribe(&self, pattern: &str, id: SubscriptionId) -> Result<()> {
+        let mut subs = self.subscriptions.write().await;
+        let now_empty = match subs.get_mut(pattern) {
+            Some(list) => {
+                list.retain(|subscription| subscription.id != id);
+                list.is_empty()
+            }
+            None => false,
+        };
+        if now_empty {
+            subs.remove(pattern);
+            drop(subs);
+            if let Some(handle) = self.listeners.write().await.remove(pattern) {
+                handle.abort();
+            }
         }
         Ok(())
     }

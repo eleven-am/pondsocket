@@ -547,8 +547,12 @@ func TestEndpointLeaveChannel(t *testing.T) {
 		}
 
 		err := endpoint.leaveChannel(ev, conn)
-		if err == nil {
-			t.Error("expected error for non-existent channel")
+		if err != nil {
+			t.Errorf("expected no error after delivering NOT_FOUND, got %v", err)
+		}
+		frame := readConnFrame(t, conn, time.Second)
+		if frame["event"] != string(notFoundEvent) {
+			t.Errorf("expected NOT_FOUND frame, got %v", frame["event"])
 		}
 	})
 
@@ -621,8 +625,12 @@ func TestEndpointBroadcastMessage(t *testing.T) {
 		}
 
 		err := endpoint.broadcastMessage(ev, conn)
-		if err == nil {
-			t.Error("expected error for non-existent channel")
+		if err != nil {
+			t.Errorf("expected no error after delivering NOT_FOUND, got %v", err)
+		}
+		frame := readConnFrame(t, conn, time.Second)
+		if frame["event"] != string(notFoundEvent) {
+			t.Errorf("expected NOT_FOUND frame, got %v", frame["event"])
 		}
 	})
 
@@ -731,8 +739,12 @@ func TestEndpointHandleMessage(t *testing.T) {
 		}
 
 		err := handler(ev, conn)
-		if err == nil {
-			t.Error("expected error for unknown event type")
+		if err != nil {
+			t.Errorf("expected no error after delivering NOT_FOUND, got %v", err)
+		}
+		frame := readConnFrame(t, conn, time.Second)
+		if frame["event"] != string(notFoundEvent) {
+			t.Errorf("expected NOT_FOUND frame, got %v", frame["event"])
 		}
 	})
 

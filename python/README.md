@@ -73,7 +73,7 @@ python/
 
 ## Status
 
-302 tests passing. ruff clean. mypy strict in 41 source files. The WebSocket wire format is aligned with the existing JS client, and the SSE `CONNECTION` event now carries the same `connectionId` field the browser client expects.
+417 tests passing. ruff clean. mypy strict in 53 source files. The WebSocket wire format is aligned with the existing JS client, and the SSE `CONNECTION` event now carries the same `connectionId` field the browser client expects.
 
 See [`PARITY.md`](./PARITY.md) for the Go → Python mapping and a list of intentional divergences.
 
@@ -97,6 +97,7 @@ Build each publishable package from its own directory:
 cd pondsocket-common && uv build
 cd ../pondsocket && uv build
 cd ../pondsocket-asgi && uv build
+cd ../pondsocket-client && uv build
 ```
 
 Do not publish from the workspace root.

@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from pondsocket_common import ErrorTypes, ServerActions, uuid
+
 from .errors import internal
 from .transport import OnCloseCallback, OnMessageHandler
-from .types import Event, TransportType
+from .types import Event, SystemEntity, TransportType
 
 
 class SSEServerTransport:
@@ -74,11 +76,29 @@ class SSEServerTransport:
 
         try:
             text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            await self._send_invalid_message("Binary frame is not valid UTF-8")
+            return
+        try:
             event = parse_inbound_text(text)
-        except (UnicodeDecodeError, ValidationError):
+        except (ValidationError, RecursionError) as e:
+            await self._send_invalid_message(str(e))
             return
         try:
             await self._message_handler(event, self)
+        except Exception:
+            return
+
+    async def _send_invalid_message(self, detail: str) -> None:
+        ev = Event(
+            action=ServerActions.ERROR.value,
+            channel_name=SystemEntity.GATEWAY.value,
+            request_id=uuid(),
+            event=ErrorTypes.INVALID_MESSAGE.value,
+            payload={"error": detail},
+        )
+        try:
+            await self.send_event(ev)
         except Exception:
             return
 

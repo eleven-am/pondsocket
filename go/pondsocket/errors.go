@@ -200,8 +200,17 @@ func addError(base, new error) error {
 }
 
 func errorEvent(err error) *Event {
+	return errorEventWithRequestId(err, "")
+}
+
+func errorEventWithRequestId(err error, requestId string) *Event {
 	if err == nil {
 		return nil
+	}
+
+	reqId := requestId
+	if reqId == "" {
+		reqId = uuid.NewString()
 	}
 
 	var e *Error
@@ -213,7 +222,7 @@ func errorEvent(err error) *Event {
 		return &Event{
 			Action:      system,
 			ChannelName: e.ChannelName,
-			RequestId:   uuid.NewString(),
+			RequestId:   reqId,
 			Event:       string(internalErrorEvent),
 			Payload: map[string]interface{}{
 				"code":      e.Code,
@@ -227,7 +236,7 @@ func errorEvent(err error) *Event {
 	return &Event{
 		Action:      system,
 		ChannelName: string(gatewayEntity),
-		RequestId:   uuid.NewString(),
+		RequestId:   reqId,
 		Event:       string(internalErrorEvent),
 		Payload: map[string]interface{}{
 			"message": err.Error(),

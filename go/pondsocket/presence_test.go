@@ -103,8 +103,8 @@ func TestPresenceTrack(t *testing.T) {
 			}
 			msgStr := string(msg)
 
-			if !contains(msgStr, "presence:join") {
-				t.Error("expected presence:join event in broadcast")
+			if !contains(msgStr, "JOIN") {
+				t.Error("expected JOIN event in broadcast")
 			}
 		default:
 			t.Error("expected broadcast message to be sent")
@@ -183,14 +183,14 @@ func TestPresenceUpdate(t *testing.T) {
 		case msg := <-conn.send:
 			msgStr := string(msg)
 
-			if !contains(msgStr, "presence:update") {
-				t.Error("expected presence:update event in broadcast")
+			if !contains(msgStr, "UPDATE") {
+				t.Error("expected UPDATE event in broadcast")
 			}
 		case msg := <-conn2.send:
 			msgStr := string(msg)
 
-			if !contains(msgStr, "presence:update") {
-				t.Error("expected presence:update event in broadcast")
+			if !contains(msgStr, "UPDATE") {
+				t.Error("expected UPDATE event in broadcast")
 			}
 		default:
 			t.Error("expected broadcast message to be sent")
@@ -263,8 +263,8 @@ func TestPresenceUnTrack(t *testing.T) {
 		case msg := <-conn.send:
 			msgStr := string(msg)
 
-			if !contains(msgStr, "presence:leave") {
-				t.Error("expected presence:leave event in broadcast")
+			if !contains(msgStr, "LEAVE") {
+				t.Error("expected LEAVE event in broadcast")
 			}
 		default:
 			t.Error("expected broadcast message to be sent to user1")

@@ -1,11 +1,11 @@
 import { Subject } from './subject';
-import { Unsubscribe, Subscriber } from './types';
+import { Unsubscribe, Subscriber, SubjectErrorHandler } from './types';
 
 export class BehaviorSubject<T> extends Subject<T> {
     #lastMessage: T | undefined;
 
-    constructor (initialValue?: T) {
-        super();
+    constructor (initialValue?: T, onObserverError?: SubjectErrorHandler<T>) {
+        super(onObserverError);
 
         this.#lastMessage = initialValue;
     }
@@ -32,7 +32,7 @@ export class BehaviorSubject<T> extends Subject<T> {
      */
     subscribe (observer: Subscriber<T>): Unsubscribe {
         if (this.#lastMessage !== undefined) {
-            observer(this.#lastMessage);
+            this.notifyObserver(observer, this.#lastMessage);
         }
 
         return super.subscribe(observer);
