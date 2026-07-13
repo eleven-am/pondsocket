@@ -82,6 +82,7 @@ class Channel:
     __slots__ = (
         "_active",
         "_assigns",
+        "_close_task",
         "_connections",
         "_dispatch_queue",
         "_dispatch_semaphore",
@@ -121,6 +122,7 @@ class Channel:
         self._on_destroy = opts.on_destroy
         self._active: bool = False
         self._connections: Store[Transport] = Store()
+        self._close_task: asyncio.Task[None] | None = None
         self._assigns: Store[PondAssigns] = Store()
         self._presence = PresenceClient(self)
         self._dispatch_queue: asyncio.Queue[_DispatchItem] = asyncio.Queue(
@@ -133,9 +135,13 @@ class Channel:
         self._user_get_waiters: dict[str, asyncio.Future[User | None]] = {}
 
     async def start(self) -> None:
+        close_task = self._close_task
+        if close_task is not None:
+            await asyncio.shield(close_task)
         async with self._lifecycle_lock:
             if self._active:
                 return
+            self._close_task = None
             self._active = True
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
         await self._subscribe_to_pubsub()
@@ -145,14 +151,30 @@ class Channel:
 
     async def close(self) -> None:
         async with self._lifecycle_lock:
-            if not self._active:
-                return
-            self._active = False
-            if self._dispatch_task is not None and not self._dispatch_task.done():
-                self._dispatch_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._dispatch_task
-            self._dispatch_task = None
+            close_task = self._close_task
+            if close_task is None:
+                if not self._active:
+                    return
+                self._active = False
+                close_task = asyncio.create_task(
+                    self._finish_close(),
+                    name=f"pondsocket-channel-close:{self.name}",
+                )
+                self._close_task = close_task
+
+        if close_task is asyncio.current_task():
+            return
+        if self._dispatch_task is asyncio.current_task():
+            return
+        await asyncio.shield(close_task)
+
+    async def _finish_close(self) -> None:
+        dispatch_task = self._dispatch_task
+        self._dispatch_task = None
+        if dispatch_task is not None and not dispatch_task.done():
+            dispatch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await dispatch_task
         await self._unsubscribe_from_pubsub()
         self._stop_liveness()
         self._node_users.clear()
@@ -239,7 +261,7 @@ class Channel:
         await self._fire_leave_handler(user, reason)
 
         if await self._connections.len() == 0:
-            await self._fire_on_destroy()
+            await self.close()
         return True
 
     async def _fire_leave_handler(self, user: User, reason: str) -> None:
