@@ -138,6 +138,9 @@ func (c *PondClient) Connect() error {
 	if c.disconnecting {
 		return fmt.Errorf("client is disconnecting")
 	}
+	if c.conn != nil {
+		return nil
+	}
 
 	c.disconnecting = false
 
@@ -149,12 +152,20 @@ func (c *PondClient) Connect() error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s: %w", c.address.String(), err)
 	}
+	if err := c.refreshReadDeadline(conn); err != nil {
+		conn.Close()
+		return fmt.Errorf("failed to configure WebSocket read deadline: %w", err)
+	}
+	conn.SetPongHandler(func(string) error {
+		return c.refreshReadDeadline(conn)
+	})
 
 	c.conn = conn
 	c.reconnectCount = 0
+	done := make(chan struct{})
 
-	// Start message reading goroutine
-	go c.readMessages()
+	go c.writePings(conn, done)
+	go c.readMessages(conn, done)
 
 	return nil
 }
@@ -403,9 +414,14 @@ func (c *PondClient) dispatchEvents() {
 	}
 }
 
-// readMessages handles incoming WebSocket messages
-func (c *PondClient) readMessages() {
+// readMessages handles incoming WebSocket messages for one connection.
+func (c *PondClient) readMessages(conn *websocket.Conn, done chan struct{}) {
 	defer func() {
+		close(done)
+		conn.Close()
+		if !c.releaseConnection(conn) {
+			return
+		}
 		c.setConnectionState(false)
 		c.handleDisconnect()
 	}()
@@ -417,20 +433,14 @@ func (c *PondClient) readMessages() {
 		case <-c.ctx.Done():
 			return
 		default:
-			c.connMu.RLock()
-			conn := c.conn
-			c.connMu.RUnlock()
-
-			if conn == nil {
-				return
-			}
-
-			conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
 			_, data, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					// Log unexpected close
 				}
+				return
+			}
+			if err := c.refreshReadDeadline(conn); err != nil {
 				return
 			}
 
@@ -446,6 +456,60 @@ func (c *PondClient) readMessages() {
 			}
 		}
 	}
+}
+
+func (c *PondClient) writePings(conn *websocket.Conn, done <-chan struct{}) {
+	if c.config.PingInterval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(c.config.PingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			deadline := time.Time{}
+			if c.config.WriteTimeout > 0 {
+				deadline = time.Now().Add(c.config.WriteTimeout)
+			}
+
+			c.writeMu.Lock()
+			err := conn.WriteControl(websocket.PingMessage, nil, deadline)
+			c.writeMu.Unlock()
+			if err != nil {
+				conn.Close()
+				return
+			}
+		}
+	}
+}
+
+func (c *PondClient) refreshReadDeadline(conn *websocket.Conn) error {
+	wait := c.config.ReadTimeout
+	if c.config.PingInterval > 0 && c.config.PongTimeout > 0 {
+		wait = c.config.PingInterval + c.config.PongTimeout
+	}
+
+	deadline := time.Time{}
+	if wait > 0 {
+		deadline = time.Now().Add(wait)
+	}
+	return conn.SetReadDeadline(deadline)
+}
+
+func (c *PondClient) releaseConnection(conn *websocket.Conn) bool {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn != conn {
+		return false
+	}
+	c.conn = nil
+	return true
 }
 
 // handleDisconnect handles disconnection and reconnection logic
