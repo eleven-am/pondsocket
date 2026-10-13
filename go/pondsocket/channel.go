@@ -41,7 +41,6 @@ type Channel struct {
 	heartbeatTimeout        time.Duration
 	internalQueueTimeout    time.Duration
 	hooks                   *Hooks
-	dispatchSem             chan struct{}
 }
 
 func newChannel(ctx context.Context, options options) *Channel {
@@ -75,7 +74,6 @@ func newChannel(ctx context.Context, options options) *Channel {
 		heartbeatInterval:    30 * time.Second,
 		heartbeatTimeout:     90 * time.Second,
 		internalQueueTimeout: options.InternalQueueTimeout,
-		dispatchSem:          make(chan struct{}, 32),
 	}
 	c.presence = newPresence(&c)
 
@@ -813,28 +811,16 @@ func (c *Channel) handleMessageEvents() {
 				if !ok {
 					return
 				}
-
-				select {
-				case c.dispatchSem <- struct{}{}:
-				case <-c.ctx.Done():
-					return
-				}
-
-				go func(event internalEvent) {
+				func() {
 					defer func() {
-						<-c.dispatchSem
 						if r := recover(); r != nil {
 							c.reportError("channel_dispatch_panic", fmt.Errorf("panic recovered: %v", r))
 						}
 					}()
-
-					if err := c.onMessage(&event); err != nil {
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							return
-						}
+					if err := c.onMessage(&ev); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						c.reportError("channel_dispatch", err)
 					}
-				}(ev)
+				}()
 
 			case <-c.ctx.Done():
 				return

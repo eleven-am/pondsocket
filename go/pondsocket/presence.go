@@ -6,6 +6,7 @@ package pondsocket
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -175,33 +176,29 @@ func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userI
 		if err != nil {
 			return err
 		}
-		return p.channel.pubsub.Publish(topic, data)
-	} else {
-		p.channel.presence.mutex.RLock()
-
-		trackedUsers := p.channel.presence.store.Keys()
-
-		p.channel.presence.mutex.RUnlock()
-
-		connectedUsers := p.channel.connections.Keys()
-
-		recipientIDs := trackedUsers.filter(func(userID string) bool {
-			return connectedUsers.some(func(connID string) bool {
-				return connID == userID
-			})
-		})
-
-		if recipientIDs.length() > 0 {
-			internalEv := internalEvent{
-				Event:      evt,
-				Recipients: recipientIDs,
-			}
-			select {
-			case p.channel.channel <- internalEv:
-			case <-p.channel.ctx.Done():
-			default:
-			}
+		if err := p.channel.pubsub.Publish(topic, data); err != nil {
+			return err
 		}
 	}
-	return nil
+	p.channel.presence.mutex.RLock()
+	trackedUsers := p.channel.presence.store.Keys()
+	p.channel.presence.mutex.RUnlock()
+	connectedUsers := p.channel.connections.Keys()
+	recipientIDs := trackedUsers.filter(func(userID string) bool {
+		return connectedUsers.some(func(connID string) bool {
+			return connID == userID
+		})
+	})
+	if recipientIDs.length() == 0 {
+		return nil
+	}
+	internalEv := internalEvent{Event: evt, Recipients: recipientIDs}
+	select {
+	case p.channel.channel <- internalEv:
+		return nil
+	case <-p.channel.ctx.Done():
+		return p.channel.ctx.Err()
+	case <-time.After(p.channel.internalQueueTimeout):
+		return timeout(p.channel.name, "timeout queueing presence event")
+	}
 }
