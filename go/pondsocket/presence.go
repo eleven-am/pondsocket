@@ -16,14 +16,16 @@ type presenceClient struct {
 	channel *Channel
 }
 
-type presencePayload struct {
+type PresencePayload struct {
 	Event     presenceEventType `json:"event"`
 	UserID    string            `json:"userId"`
 	Change    interface{}       `json:"changed"`
-	Presence  []interface{}     `json:"presence,omitempty"`
+	Presence  []interface{}     `json:"presence"`
 	NodeID    string            `json:"nodeId,omitempty"`
 	RequestID string            `json:"requestId,omitempty"`
 }
+
+type presencePayload = PresencePayload
 
 func newPresence(channel *Channel) *presenceClient {
 	return &presenceClient{
@@ -148,12 +150,10 @@ func (p *presenceClient) Get(userID string) (interface{}, error) {
 
 func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userID string, change interface{}, currentPresenceList []interface{}) error {
 	payload := presencePayload{
-		Event:  eventType,
-		UserID: userID,
-		Change: change,
-	}
-	if eventType == join {
-		payload.Presence = currentPresenceList
+		Event:    eventType,
+		UserID:   userID,
+		Change:   change,
+		Presence: currentPresenceList,
 	}
 	evt := Event{
 		Action:      presence,
