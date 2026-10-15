@@ -106,7 +106,7 @@ func (c *ConnectionContext) acceptSSE() error {
 		assigns:   c.assigns,
 		id:        c.userId,
 		options:   c.endpoint.options,
-		parentCtx: c.managerCtx,
+		parentCtx: c.connectionCxt,
 	}
 
 	sseConn, err := newSSEConn(opts)

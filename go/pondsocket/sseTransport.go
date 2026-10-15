@@ -115,6 +115,7 @@ func (s *SSEConn) keepAlive() {
 			s.flusher.Flush()
 			s.mutex.Unlock()
 		case <-s.ctx.Done():
+			s.Close()
 			return
 		case <-s.closeChan:
 			return
@@ -266,8 +267,15 @@ func (s *SSEConn) Wait() {
 
 func (s *SSEConn) OnClose(callback func(Transport) error) {
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	if s.isClosing {
+		s.mutex.Unlock()
+		if err := callback(s); err != nil {
+			s.reportError("sse_close_handlers", err)
+		}
+		return
+	}
 	s.closeHandlers.push(callback)
+	s.mutex.Unlock()
 }
 
 func (s *SSEConn) OnMessage(handler func(Event, Transport) error) {
@@ -349,6 +357,15 @@ func (s *SSEConn) HandleMessages() {
 
 func (s *SSEConn) Type() TransportType {
 	return TransportSSE
+}
+
+func (s *SSEConn) Context() context.Context {
+	if s.ctx == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	return s.ctx
 }
 
 func (s *SSEConn) PushMessage(data []byte) error {

@@ -350,64 +350,72 @@ func TestPresenceConcurrency(t *testing.T) {
 	}
 }
 
-func TestPresenceBroadcastOptimization(t *testing.T) {
-	channel := createTestChannel(t)
-
-	defer channel.Close()
-
-	conn := createTestConn("user1", nil)
-
-	channel.addUser(conn)
-
-	channel.presence.Track("user1", map[string]interface{}{"status": "online"})
-
+func TestPresenceBroadcastRoster(t *testing.T) {
 	t.Run("join event includes full presence list", func(t *testing.T) {
-		select {
-		case <-conn.send:
-		default:
+		channel := createTestChannel(t)
+		defer channel.Close()
+		conn := createTestConn("user1", nil)
+		if err := channel.addUser(conn); err != nil {
+			t.Fatal(err)
 		}
-		channel.presence.Track("user2", map[string]interface{}{"status": "online"})
-
-		time.Sleep(50 * time.Millisecond)
-
-		select {
-		case msg := <-conn.send:
-			msgStr := string(msg)
-
-			if !contains(msgStr, "presence") {
-				t.Error("expected presence array in join broadcast")
-			}
-		default:
-			t.Error("expected broadcast message")
+		if err := channel.presence.Track("user1", map[string]interface{}{"status": "online"}); err != nil {
+			t.Fatal(err)
+		}
+		waitForPresenceMessage(t, conn, `"userId":"user1"`)
+		if err := channel.presence.Track("user2", map[string]interface{}{"status": "online"}); err != nil {
+			t.Fatal(err)
+		}
+		msg := waitForPresenceMessage(t, conn, `"userId":"user2"`)
+		if !contains(string(msg), `"presence":[`) {
+			t.Error("expected presence array in join broadcast")
 		}
 	})
 
-	t.Run("update event does not include full list", func(t *testing.T) {
+	t.Run("update event includes full presence list", func(t *testing.T) {
+		channel := createTestChannel(t)
+		defer channel.Close()
+		conn := createTestConn("user1", nil)
+		if err := channel.addUser(conn); err != nil {
+			t.Fatal(err)
+		}
+		if err := channel.presence.Track("user1", map[string]interface{}{"status": "online"}); err != nil {
+			t.Fatal(err)
+		}
+		waitForPresenceMessage(t, conn, `"userId":"user1"`)
 		conn2 := createTestConn("user2", nil)
-
-		channel.addUser(conn2)
-
-		channel.presence.Track("user2", map[string]interface{}{"status": "online"})
-
-		select {
-		case <-conn.send:
-		default:
+		if err := channel.addUser(conn2); err != nil {
+			t.Fatal(err)
 		}
-		channel.presence.Update("user2", map[string]interface{}{"status": "away"})
-
-		time.Sleep(50 * time.Millisecond)
-
-		select {
-		case msg := <-conn.send:
-			msgStr := string(msg)
-
-			if contains(msgStr, `"presence":[`) {
-				t.Error("update event should not include full presence list")
-			}
-		default:
-			t.Error("expected broadcast message")
+		if err := channel.presence.Track("user2", map[string]interface{}{"status": "online"}); err != nil {
+			t.Fatal(err)
+		}
+		waitForPresenceMessage(t, conn, `"userId":"user2"`)
+		if err := channel.presence.Update("user2", map[string]interface{}{"status": "away"}); err != nil {
+			t.Fatal(err)
+		}
+		msg := waitForPresenceMessage(t, conn, `"event":"UPDATE"`)
+		if !contains(string(msg), `"presence":[`) {
+			t.Error("expected presence array in update broadcast")
 		}
 	})
+}
+
+func waitForPresenceMessage(t *testing.T, conn *Conn, match string) []byte {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	messages := make([]string, 0)
+	for {
+		select {
+		case msg := <-conn.send:
+			messages = append(messages, string(msg))
+			if contains(string(msg), match) {
+				return msg
+			}
+		case <-timer.C:
+			t.Fatalf("expected presence message containing %s, received %v", match, messages)
+		}
+	}
 }
 
 func contains(s, substr string) bool {

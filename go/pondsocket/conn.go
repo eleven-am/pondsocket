@@ -357,10 +357,15 @@ func (c *Conn) GetAssign(key string) interface{} {
 // they were added. Callbacks are executed synchronously during connection cleanup.
 func (c *Conn) OnClose(callback func(Transport) error) {
 	c.mutex.Lock()
-
-	defer c.mutex.Unlock()
-
+	if c.isClosing {
+		c.mutex.Unlock()
+		if err := callback(c); err != nil {
+			c.reportError("connection_close_handlers", err)
+		}
+		return
+	}
 	c.closeHandlers.push(callback)
+	c.mutex.Unlock()
 }
 
 // IsActive returns true if the connection is still active and can send/receive messages.
@@ -454,6 +459,15 @@ func (c *Conn) CloneAssigns() map[string]interface{} {
 
 func (c *Conn) GetID() string {
 	return c.ID
+}
+
+func (c *Conn) Context() context.Context {
+	if c.ctx == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	return c.ctx
 }
 
 func (c *Conn) GetAssigns() map[string]interface{} {

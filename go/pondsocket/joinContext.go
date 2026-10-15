@@ -285,7 +285,7 @@ func (c *JoinContext) Track(presence interface{}) *JoinContext {
 
 		return c
 	}
-	if err := c.Channel.Track(c.conn.GetID(), presence); err != nil {
+	if err := c.Channel.trackConnectedUser(c.conn.GetID(), presence); err != nil {
 		c.err = wrapF(err, "error tracking presence for user %s", c.conn.GetID())
 	}
 	return c

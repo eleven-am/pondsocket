@@ -23,6 +23,7 @@ type Channel struct {
 	store                   *store[map[string]interface{}]
 	channel                 chan internalEvent
 	connections             *store[Transport]
+	memberships             *store[*channelMembership]
 	middleware              *middleware[*messageEvent, *Channel]
 	outgoing                *middleware[*OutgoingContext, interface{}]
 	onDestroy               func() error
@@ -57,6 +58,7 @@ func newChannel(ctx context.Context, options options) *Channel {
 		store:                newStore[map[string]interface{}](),
 		outgoing:             options.Outgoing,
 		connections:          newStore[Transport](),
+		memberships:          newStore[*channelMembership](),
 		channel:              make(chan internalEvent, 128),
 		middleware:           options.Middleware,
 		leave:                options.Leave,
@@ -135,13 +137,15 @@ func (c *Channel) RemoveUser(userID string, reason string) error {
 }
 
 func (c *Channel) removeUserLocal(user *User, userID, reason string) error {
+	return c.removeUserLocalWithDestroy(user, userID, reason, true)
+}
+
+func (c *Channel) removeUserLocalWithDestroy(user *User, userID, reason string, destroyWhenEmpty bool) error {
+	membershipErr := c.releaseMembership(userID, reason)
 	storeErr := c.store.Delete(userID)
 	presenceErr := c.presence.UnTrack(userID)
 	connectionErr := c.connections.Delete(userID)
-	combinedErr := combine(storeErr, presenceErr, connectionErr)
-	if combinedErr != nil {
-		return wrapF(combinedErr, "failed to fully remove user %s resources", userID)
-	}
+	combinedErr := combine(membershipErr, storeErr, presenceErr, connectionErr)
 
 	c.publishUserLeft(userID)
 
@@ -157,7 +161,7 @@ func (c *Channel) removeUserLocal(user *User, userID, reason string) error {
 	}
 
 	remainingUsers := c.store.Len()
-	if c.onDestroy != nil && remainingUsers == 0 {
+	if destroyWhenEmpty && c.onDestroy != nil && remainingUsers == 0 {
 		go func() {
 			if err := c.Close(); err != nil {
 				c.reportError("channel_close", err)
@@ -170,7 +174,34 @@ func (c *Channel) removeUserLocal(user *User, userID, reason string) error {
 		}()
 	}
 
+	if combinedErr != nil {
+		return wrapF(combinedErr, "failed to fully remove user %s resources", userID)
+	}
 	return nil
+}
+
+func (c *Channel) releaseMembership(userID, reason string) error {
+	membership, err := c.memberships.Read(userID)
+	if err != nil {
+		return nil
+	}
+	membership.close(reason)
+	return c.memberships.Delete(userID)
+}
+
+func (c *Channel) removeExpiredMembership(userID string, membership *channelMembership) {
+	c.mutex.Lock()
+	current, err := c.memberships.Read(userID)
+	if err != nil || current != membership {
+		c.mutex.Unlock()
+		return
+	}
+	user, err := c.getUserUnsafe(userID)
+	err = combine(err, c.removeUserLocal(user, userID, membership.reason()))
+	c.mutex.Unlock()
+	if err != nil {
+		c.reportError("membership_cleanup", err)
+	}
 }
 
 // GetUser retrieves a user's information including their assigns and presence data.
@@ -334,6 +365,20 @@ func (c *Channel) Track(userID string, presenceData interface{}) error {
 	return c.presence.Track(userID, presenceData)
 }
 
+func (c *Channel) trackConnectedUser(userID string, presenceData interface{}) error {
+	if err := c.checkState(); err != nil {
+		return err
+	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	membership, err := c.memberships.Read(userID)
+	if err != nil || !membership.active() {
+		return notFound(c.name, "User does not exist in channel")
+	}
+	return c.presence.Track(userID, presenceData)
+}
+
 // UnTrack stops tracking presence for a user.
 // The user will no longer receive presence updates and their presence data
 // is removed and broadcast as a leave event to other tracked users.
@@ -482,25 +527,44 @@ func (c *Channel) Close() error {
 	default:
 	}
 	c.cancel()
-
-	c.mutex.Unlock()
-
-	userIds := c.connections.Keys()
+	userIDs := make(map[string]struct{})
+	for _, userID := range c.store.Keys().items {
+		userIDs[userID] = struct{}{}
+	}
+	for _, userID := range c.connections.Keys().items {
+		userIDs[userID] = struct{}{}
+	}
+	for _, userID := range c.memberships.Keys().items {
+		userIDs[userID] = struct{}{}
+	}
+	for _, userID := range c.presence.store.Keys().items {
+		userIDs[userID] = struct{}{}
+	}
+	connections := c.connections.Values()
 
 	var errs []error
-	for _, userId := range userIds.items {
-		if conn, _ := c.connections.Read(userId); conn != nil {
-			conn.Close()
-		}
-		if err := c.store.Delete(userId); err != nil {
+	for userID := range userIDs {
+		if err := c.releaseMembership(userID, "channel_closed"); err != nil {
 			errs = append(errs, err)
 		}
-		if err := c.presence.UnTrack(userId); err != nil {
+		if _, err := c.store.Read(userID); err == nil {
+			if err := c.store.Delete(userID); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if err := c.presence.UnTrack(userID); err != nil {
 			errs = append(errs, err)
 		}
-		if err := c.connections.Delete(userId); err != nil {
-			errs = append(errs, err)
+		if _, err := c.connections.Read(userID); err == nil {
+			if err := c.connections.Delete(userID); err != nil {
+				errs = append(errs, err)
+			}
 		}
+	}
+	c.mutex.Unlock()
+
+	for _, conn := range connections.items {
+		conn.Close()
 	}
 	if c.pubsub != nil && c.endpointPath != "" {
 		if err := c.pubsub.Unsubscribe(c.channelTopic()); err != nil {
@@ -520,26 +584,46 @@ func (c *Channel) addUser(user Transport) error {
 	if err := c.checkState(); err != nil {
 		return err
 	}
+	if existing, err := c.memberships.Read(user.GetID()); err == nil {
+		if existing.active() {
+			return wrapF(conflict(user.GetID(), "Key already exists"), "failed to add user %s, already exists or other error", user.GetID())
+		}
+		currentUser, userErr := c.getUserUnsafe(user.GetID())
+		cleanupErr := c.removeUserLocalWithDestroy(currentUser, user.GetID(), existing.reason(), false)
+		if err := combine(userErr, cleanupErr); err != nil {
+			c.reportError("expired_membership_cleanup", err)
+		}
+	}
+
+	membership := newChannelMembership(c.ctx, user)
+	if !membership.active() {
+		membership.close("join_failed")
+		return badRequest(c.name, "Cannot add an inactive connection")
+	}
 	assignsToAdd := user.CloneAssigns()
 
 	if assignsToAdd == nil {
 		assignsToAdd = make(map[string]interface{})
 	}
-	errAssigns := c.store.Create(user.GetID(), assignsToAdd)
-
-	errConn := c.connections.Create(user.GetID(), user)
-
-	combinedErr := combine(errAssigns, errConn)
-
-	if combinedErr != nil {
-		_ = c.store.Delete(user.GetID())
-
-		_ = c.connections.Delete(user.GetID())
-
-		return wrapF(combinedErr, "failed to add user %s, already exists or other error", user.GetID())
+	if err := c.store.Create(user.GetID(), assignsToAdd); err != nil {
+		membership.close("join_failed")
+		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
 	}
-	user.OnClose(c.onConnectionClose)
+	if err := c.connections.Create(user.GetID(), user); err != nil {
+		_ = c.store.Delete(user.GetID())
+		membership.close("join_failed")
+		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
+	}
 
+	if err := c.memberships.Create(user.GetID(), membership); err != nil {
+		_ = c.store.Delete(user.GetID())
+		_ = c.connections.Delete(user.GetID())
+		membership.close("join_failed")
+		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
+	}
+	membership.watch(func() {
+		c.removeExpiredMembership(user.GetID(), membership)
+	})
 	c.publishUserJoined(user.GetID(), assignsToAdd)
 
 	return nil
@@ -768,13 +852,6 @@ func (c *Channel) getUserUnsafe(userID string) (*User, error) {
 		Assigns:  assignsData,
 		Presence: presenceData,
 	}, nil
-}
-
-func (c *Channel) onConnectionClose(user Transport) error {
-	if err := c.checkState(); err != nil {
-		return err
-	}
-	return c.RemoveUser(user.GetID(), "connection_closed")
 }
 
 func (c *Channel) getUserAssigns(userID, key string) (interface{}, error) {
