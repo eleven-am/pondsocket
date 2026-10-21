@@ -73,12 +73,6 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 		return nil
 	})
 
-	c.conn.SetCloseHandler(func(code int, text string) error {
-		c.Close()
-
-		return nil
-	})
-
 	go c.readPump()
 
 	go c.writePump()
