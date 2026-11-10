@@ -247,8 +247,10 @@ func (s *SSEConn) IsActive() bool {
 
 func (s *SSEConn) Close() {
 	var handlersToRun []func(Transport) error
+	ownsClose := false
 
 	s.closeOnce.Do(func() {
+		ownsClose = true
 		s.mutex.Lock()
 		s.isClosing = true
 		handlersToRun = make([]func(Transport) error, len(s.closeHandlers.items))
@@ -259,13 +261,14 @@ func (s *SSEConn) Close() {
 		if s.cancel != nil {
 			s.cancel()
 		}
-
-		close(s.closeChan)
 	})
+	if !ownsClose {
+		return
+	}
 
 	var closeHandlerErrors error
 	for _, handler := range handlersToRun {
-		if err := handler(s); err != nil {
+		if err := invokeCloseHandler(handler, s); err != nil {
 			closeHandlerErrors = addError(closeHandlerErrors, err)
 		}
 	}
@@ -273,20 +276,18 @@ func (s *SSEConn) Close() {
 	if closeHandlerErrors != nil {
 		s.reportError("sse_close_handlers", closeHandlerErrors)
 	}
+	close(s.closeChan)
 }
 
 func (s *SSEConn) Wait() {
-	select {
-	case <-s.closeChan:
-	case <-s.ctx.Done():
-	}
+	<-s.closeChan
 }
 
 func (s *SSEConn) OnClose(callback func(Transport) error) {
 	s.mutex.Lock()
 	if s.handlersRan {
 		s.mutex.Unlock()
-		if err := callback(s); err != nil {
+		if err := invokeCloseHandler(callback, s); err != nil {
 			s.reportError("sse_close_handlers", err)
 		}
 		return

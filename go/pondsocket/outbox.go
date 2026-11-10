@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -32,16 +33,99 @@ func newOutboxes() *outboxes {
 	return &outboxes{byID: make(map[string]*outbox)}
 }
 
+func newOutbox(conn Transport) *outbox {
+	return &outbox{conn: conn, space: make(chan struct{})}
+}
+
+func sameTransport(left, right Transport) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftValue := reflect.ValueOf(left)
+	rightValue := reflect.ValueOf(right)
+	if leftValue.Type() != rightValue.Type() || !leftValue.Type().Comparable() {
+		if leftValue.Kind() != rightValue.Kind() {
+			return false
+		}
+		switch leftValue.Kind() {
+		case reflect.Chan, reflect.Map, reflect.Pointer, reflect.UnsafePointer:
+			return leftValue.Pointer() == rightValue.Pointer()
+		case reflect.Slice:
+			return leftValue.Pointer() == rightValue.Pointer() && leftValue.Len() == rightValue.Len() && leftValue.Cap() == rightValue.Cap()
+		default:
+			return false
+		}
+	}
+	return leftValue.Interface() == rightValue.Interface()
+}
+
 func (o *outboxes) get(conn Transport) *outbox {
 	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
 	box, ok := o.byID[conn.GetID()]
-	if !ok {
-		box = &outbox{conn: conn, space: make(chan struct{}, 1)}
-		o.byID[conn.GetID()] = box
+	if ok && !box.retired {
+		o.mutex.Unlock()
+		return box
 	}
+	box = newOutbox(conn)
+	o.byID[conn.GetID()] = box
+	o.mutex.Unlock()
 	return box
+}
+
+func (o *outboxes) register(conn Transport) {
+	o.mutex.Lock()
+	box, ok := o.byID[conn.GetID()]
+	if ok && sameTransport(box.conn, conn) && !box.retired {
+		o.mutex.Unlock()
+		return
+	}
+
+	var dropped []outboxItem
+	if ok {
+		box.mutex.Lock()
+		box.retired = true
+		dropped = box.items
+		box.items = nil
+		box.signalSpaceLocked()
+		box.mutex.Unlock()
+	}
+	box = newOutbox(conn)
+	o.byID[conn.GetID()] = box
+	o.mutex.Unlock()
+
+	completeDropped(dropped)
+}
+
+func (o *outboxes) unregister(conn Transport) {
+	o.mutex.Lock()
+	box, ok := o.byID[conn.GetID()]
+	if !ok || !sameTransport(box.conn, conn) {
+		o.mutex.Unlock()
+		return
+	}
+	box.mutex.Lock()
+	box.retired = true
+	dropped := box.items
+	box.items = nil
+	box.signalSpaceLocked()
+	box.mutex.Unlock()
+	delete(o.byID, conn.GetID())
+	o.mutex.Unlock()
+	completeDropped(dropped)
+}
+
+func (b *outbox) signalSpaceLocked() {
+	close(b.space)
+	b.space = make(chan struct{})
+}
+
+func completeDropped(items []outboxItem) {
+	for _, item := range items {
+		if item.done != nil {
+			item.done <- context.Canceled
+			close(item.done)
+		}
+	}
 }
 
 func (o *outboxes) find(id string) *outbox {
@@ -63,6 +147,7 @@ func (o *outboxes) retireIfIdle(box *outbox) bool {
 	}
 	box.draining = false
 	box.retired = true
+	box.signalSpaceLocked()
 	if o.byID[box.conn.GetID()] == box {
 		delete(o.byID, box.conn.GetID())
 	}
@@ -84,38 +169,22 @@ func (b *outbox) purge(channel *Channel) {
 		b.items[i] = outboxItem{}
 	}
 	b.items = kept
-	b.mutex.Unlock()
 	if len(dropped) > 0 {
-		select {
-		case b.space <- struct{}{}:
-		default:
-		}
+		b.signalSpaceLocked()
 	}
+	b.mutex.Unlock()
 
-	for _, item := range dropped {
-		if item.done != nil {
-			item.done <- context.Canceled
-			close(item.done)
-		}
-	}
+	completeDropped(dropped)
 }
 
 func (b *outbox) discardAll() {
 	b.mutex.Lock()
 	items := b.items
 	b.items = nil
+	b.signalSpaceLocked()
 	b.mutex.Unlock()
-	select {
-	case b.space <- struct{}{}:
-	default:
-	}
 
-	for _, item := range items {
-		if item.done != nil {
-			item.done <- context.Canceled
-			close(item.done)
-		}
-	}
+	completeDropped(items)
 }
 
 func (c *Channel) outboxLimit() int {
@@ -150,6 +219,15 @@ func (c *Channel) enqueue(conn Transport, event Event, done chan error) error {
 	for {
 		box = c.outboxes.get(conn)
 		box.mutex.Lock()
+		if !sameTransport(box.conn, conn) {
+			box.mutex.Unlock()
+			err := fmt.Errorf("connection %s was superseded by a replacement transport", conn.GetID())
+			if done != nil {
+				done <- err
+				close(done)
+			}
+			return err
+		}
 		if box.retired {
 			box.mutex.Unlock()
 			continue
@@ -165,6 +243,7 @@ func (c *Channel) enqueue(conn Transport, event Event, done chan error) error {
 			}
 			return nil
 		}
+		space := box.space
 		box.mutex.Unlock()
 		if timer == nil {
 			timer = time.NewTimer(timeout)
@@ -172,7 +251,7 @@ func (c *Channel) enqueue(conn Transport, event Event, done chan error) error {
 		}
 
 		select {
-		case <-box.space:
+		case <-space:
 			continue
 		case <-c.ctx.Done():
 			if done != nil {
@@ -230,11 +309,8 @@ func (o *outboxes) drain(box *outbox) {
 		item := box.items[0]
 		box.items[0] = outboxItem{}
 		box.items = box.items[1:]
+		box.signalSpaceLocked()
 		box.mutex.Unlock()
-		select {
-		case box.space <- struct{}{}:
-		default:
-		}
 
 		if !box.conn.IsActive() {
 			if item.done != nil {

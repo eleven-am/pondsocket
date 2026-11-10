@@ -359,7 +359,7 @@ func (c *Conn) OnClose(callback func(Transport) error) {
 	c.mutex.Lock()
 	if c.handlersRan {
 		c.mutex.Unlock()
-		if err := callback(c); err != nil {
+		if err := invokeCloseHandler(callback, c); err != nil {
 			c.reportError("connection_close_handlers", err)
 		}
 		return
@@ -392,8 +392,10 @@ func (c *Conn) IsActive() bool {
 // This method is idempotent and can be called multiple times safely.
 func (c *Conn) Close() {
 	var handlersToRun []func(Transport) error
+	ownsClose := false
 
 	c.closeOnce.Do(func() {
+		ownsClose = true
 		c.mutex.Lock()
 
 		c.isClosing = true
@@ -406,22 +408,25 @@ func (c *Conn) Close() {
 		if c.cancel != nil {
 			c.cancel()
 		}
-		close(c.closeChan)
 
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
 	})
+	if !ownsClose {
+		return
+	}
 
 	var closeHandlerErrors error
 	for _, handler := range handlersToRun {
-		if err := handler(c); err != nil {
+		if err := invokeCloseHandler(handler, c); err != nil {
 			closeHandlerErrors = addError(closeHandlerErrors, err)
 		}
 	}
 	if closeHandlerErrors != nil {
 		c.reportError("connection_close_handlers", closeHandlerErrors)
 	}
+	close(c.closeChan)
 }
 
 func (c *Conn) reportError(component string, err error) {

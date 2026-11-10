@@ -3,7 +3,17 @@ package pondsocket
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
+
+func invokeCloseHandler(handler func(Transport) error, transport Transport) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("close handler panic: %v", recovered)
+		}
+	}()
+	return handler(transport)
+}
 
 type mergedValuesContext struct {
 	context.Context

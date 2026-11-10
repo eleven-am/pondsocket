@@ -1,6 +1,6 @@
 {
   "name": "@eleven-am/pondsocket-client",
-  "version": "0.0.39",
+  "version": "0.0.40",
   "description": "Typed browser and Node.js client for PondSocket.",
   "keywords": [
     "pondsocket",

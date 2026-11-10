@@ -157,7 +157,6 @@ func (c *Channel) removeUserLocalWithDestroy(user *User, userID, reason string, 
 		return nil, wrapF(combinedErr, "failed to fully remove user %s resources", userID)
 	}
 
-	remainingUsers := c.store.Len()
 	postRemove := func() error {
 		presenceErr := c.presence.UnTrack(userID)
 		c.publishUserLeft(userID)
@@ -171,11 +170,12 @@ func (c *Channel) removeUserLocalWithDestroy(user *User, userID, reason string, 
 				c.reportError("leave_handler", err)
 			}
 		}
-		if destroyWhenEmpty && c.onDestroy != nil && remainingUsers == 0 {
-			if err := c.Close(); err != nil {
+		if destroyWhenEmpty && c.onDestroy != nil {
+			closed, err := c.closeChannel(true)
+			if err != nil {
 				c.reportError("channel_close", err)
 			}
-			if c.onDestroy != nil {
+			if closed {
 				if err := c.onDestroy(); err != nil {
 					c.reportError("channel_on_destroy", err)
 				}
@@ -533,14 +533,22 @@ func (c *Channel) BroadcastFrom(e string, payload interface{}, senderId string) 
 // cancels sync coordinators, unsubscribes from PubSub topics, and closes internal channels.
 // After calling Close, the channel should not be used.
 func (c *Channel) Close() error {
+	_, err := c.closeChannel(false)
+	return err
+}
+
+func (c *Channel) closeChannel(onlyIfEmpty bool) (bool, error) {
 	c.mutex.Lock()
 
 	select {
 	case <-c.ctx.Done():
 		c.mutex.Unlock()
-
-		return nil
+		return false, nil
 	default:
+	}
+	if onlyIfEmpty && c.store.Len() != 0 {
+		c.mutex.Unlock()
+		return false, nil
 	}
 	c.cancel()
 	userIDs := make(map[string]struct{})
@@ -594,7 +602,7 @@ func (c *Channel) Close() error {
 		}
 	}
 
-	return combine(errs...)
+	return true, combine(errs...)
 }
 
 func (c *Channel) addUser(user Transport) error {
@@ -649,26 +657,8 @@ func (c *Channel) addUserAcknowledged(user Transport, ack *Event) error {
 		c.mutex.Unlock()
 		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
 	}
-	if ack != nil {
-		if err := c.enqueue(user, *ack, nil); err != nil {
-			_ = c.store.Delete(user.GetID())
-			membership.close("join_failed")
-			c.mutex.Unlock()
-			return wrapF(err, "failed to queue join acknowledgement for user %s", user.GetID())
-		}
-	}
-	if err := c.connections.Create(user.GetID(), user); err != nil {
-		_ = c.store.Delete(user.GetID())
-		c.dropPending(user.GetID())
-		membership.close("join_failed")
-		c.mutex.Unlock()
-		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
-	}
-
 	if err := c.memberships.Create(user.GetID(), membership); err != nil {
 		_ = c.store.Delete(user.GetID())
-		_ = c.connections.Delete(user.GetID())
-		c.dropPending(user.GetID())
 		membership.close("join_failed")
 		c.mutex.Unlock()
 		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
@@ -676,10 +666,49 @@ func (c *Channel) addUserAcknowledged(user Transport, ack *Event) error {
 	membership.watch(func() {
 		c.removeExpiredMembership(user.GetID(), membership)
 	})
+	c.mutex.Unlock()
+
+	if ack != nil {
+		if err := c.enqueue(user, *ack, nil); err != nil {
+			cleanupErr := c.rollbackJoin(user.GetID(), membership, "join_failed")
+			return wrapF(combine(err, cleanupErr), "failed to queue join acknowledgement for user %s", user.GetID())
+		}
+	}
+
+	c.mutex.Lock()
+	current, membershipErr := c.memberships.Read(user.GetID())
+	if membershipErr != nil || current != membership || !membership.active() {
+		c.mutex.Unlock()
+		return badRequest(c.name, "Connection closed before the channel join completed")
+	}
+	if err := c.connections.Create(user.GetID(), user); err != nil {
+		c.mutex.Unlock()
+		cleanupErr := c.rollbackJoin(user.GetID(), membership, "join_failed")
+		return wrapF(combine(err, cleanupErr), "failed to add user %s, already exists or other error", user.GetID())
+	}
 	c.publishUserJoined(user.GetID(), assignsToAdd)
 	c.mutex.Unlock()
 
 	return nil
+}
+
+func (c *Channel) rollbackJoin(userID string, membership *channelMembership, reason string) error {
+	c.mutex.Lock()
+	current, err := c.memberships.Read(userID)
+	if err != nil || current != membership {
+		c.mutex.Unlock()
+		return nil
+	}
+	membership.close(reason)
+	membershipErr := c.memberships.Delete(userID)
+	storeErr := c.store.Delete(userID)
+	if _, connectionErr := c.connections.Read(userID); connectionErr == nil {
+		connectionErr = c.connections.Delete(userID)
+		err = combine(err, connectionErr)
+	}
+	c.dropPending(userID)
+	c.mutex.Unlock()
+	return combine(err, membershipErr, storeErr)
 }
 
 func (c *Channel) publishUserJoined(userID string, assigns map[string]interface{}) {

@@ -80,6 +80,7 @@ func (c *JoinContext) Accept() *JoinContext {
 	}
 
 	if err := c.Channel.addUserAcknowledged(c.conn, &ackEvent); err != nil {
+		c.accepted = false
 		c.err = wrapF(err, "failed to add user %s to Channel %s", c.conn.GetID(), c.Channel.name)
 	}
 

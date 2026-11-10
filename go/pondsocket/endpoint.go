@@ -323,6 +323,7 @@ func (e *Endpoint) handleMessage() transportEventHandler {
 }
 
 func (e *Endpoint) handleClose(c Transport) error {
+	e.outboxes.unregister(c)
 	if e.options.Hooks != nil && e.options.Hooks.OnDisconnect != nil {
 		e.options.Hooks.OnDisconnect(c)
 	}
@@ -371,6 +372,7 @@ func (e *Endpoint) addConnection(conn Transport) error {
 		e.mutex.Unlock()
 		return unavailable(string(gatewayEntity), "Connection closed during OnConnect")
 	}
+	e.outboxes.register(conn)
 	if e.options.Hooks != nil && e.options.Hooks.Metrics != nil {
 		e.options.Hooks.Metrics.ConnectionOpened(conn.GetID(), "endpoint")
 	}
