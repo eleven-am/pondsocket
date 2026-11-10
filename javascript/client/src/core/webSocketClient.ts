@@ -3,6 +3,9 @@ import { ClientMessage } from '@eleven-am/pondsocket-common';
 import { BaseClient } from './baseClient';
 import { ConnectionState } from '../types';
 
+const SOCKET_CONNECTING = 0;
+const SOCKET_OPEN = 1;
+
 export abstract class WebSocketClient extends BaseClient {
     protected _socket: WebSocket | undefined;
 
@@ -14,7 +17,7 @@ export abstract class WebSocketClient extends BaseClient {
 
     public connect () {
         if (!this._disconnecting && this._socket &&
-            (this._socket.readyState === WebSocket.CONNECTING || this._socket.readyState === WebSocket.OPEN)) {
+            (this._socket.readyState === SOCKET_CONNECTING || this._socket.readyState === SOCKET_OPEN)) {
             return;
         }
 
@@ -32,7 +35,7 @@ export abstract class WebSocketClient extends BaseClient {
         }
 
         this._connectionTimeoutId = setTimeout(() => {
-            if (this._socket === socket && socket.readyState === WebSocket.CONNECTING) {
+            if (this._socket === socket && socket.readyState === SOCKET_CONNECTING) {
                 const error = new Error('Connection timeout');
 
                 this._errorSubject.publish(error);
@@ -118,7 +121,7 @@ export abstract class WebSocketClient extends BaseClient {
         return (message: ClientMessage) => {
             const socket = this._socket;
 
-            if (this._connectionState.value !== ConnectionState.CONNECTED || !socket || socket.readyState !== WebSocket.OPEN) {
+            if (this._connectionState.value !== ConnectionState.CONNECTED || !socket || socket.readyState !== SOCKET_OPEN) {
                 throw new Error('Cannot send message while the WebSocket is not connected');
             }
 
