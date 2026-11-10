@@ -39,7 +39,11 @@ type connectionOptions struct {
 }
 
 func newConnectionContext(options connectionOptions) *ConnectionContext {
-	ctxInternal, cancelInternal := context.WithCancel(options.connCtx)
+	ctxInternal, cancelInternal := context.WithCancel(options.endpoint.ctx)
+	connectionCtx := context.Context(&mergedValuesContext{
+		Context:      ctxInternal,
+		valueSources: []context.Context{options.request.Context(), options.connCtx},
+	})
 
 	return &ConnectionContext{
 		request:          options.request,
@@ -50,7 +54,7 @@ func newConnectionContext(options connectionOptions) *ConnectionContext {
 		Route:            options.route,
 		upgrader:         options.upgrader,
 		managerCtx:       options.endpoint.ctx,
-		connectionCxt:    ctxInternal,
+		connectionCxt:    connectionCtx,
 		connectionCancel: cancelInternal,
 	}
 }
@@ -96,30 +100,42 @@ func (c *ConnectionContext) acceptWebSocket() error {
 		c.connectionCancel()
 		return wrapF(err, "failed to add connection %s to endpoint", c.userId)
 	}
+	connInstance.OnClose(func(Transport) error {
+		c.connectionCancel()
+		return nil
+	})
 
 	return nil
 }
 
 func (c *ConnectionContext) acceptSSE() error {
+	sseParent, sseParentCancel := mergeContexts(c.connectionCxt, c.request.Context())
 	opts := sseOptions{
 		writer:    *c.response,
 		assigns:   c.assigns,
 		id:        c.userId,
 		options:   c.endpoint.options,
-		parentCtx: c.connectionCxt,
+		parentCtx: sseParent,
 	}
 
 	sseConn, err := newSSEConn(opts)
 	if err != nil {
+		sseParentCancel()
 		c.connectionCancel()
 		return wrapF(err, "failed to create SSE connection for %s", c.userId)
 	}
 
 	if err = c.endpoint.addConnection(sseConn); err != nil {
+		sseParentCancel()
 		c.connectionCancel()
 		sseConn.Close()
 		return wrapF(err, "failed to add SSE connection %s to endpoint", c.userId)
 	}
+	sseConn.OnClose(func(Transport) error {
+		sseParentCancel()
+		c.connectionCancel()
+		return nil
+	})
 
 	c.sseConn = sseConn
 	return nil
@@ -216,7 +232,7 @@ func (c *ConnectionContext) Cookies() []*http.Cookie {
 // Headers returns the HTTP headers from the connection request.
 // This includes all headers sent by the client during the WebSocket upgrade request.
 func (c *ConnectionContext) Headers() http.Header {
-	return c.request.Header
+	return c.request.Header.Clone()
 }
 
 // ParseAssigns unmarshals the connection's assigns into the provided struct.

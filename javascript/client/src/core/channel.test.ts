@@ -137,6 +137,22 @@ describe('Channel', () => {
         expect(stateListener).toHaveBeenCalledWith(ChannelState.CLOSED);
     });
 
+    it('retries a join when the transport disconnects before acknowledgement', () => {
+        const { channel, publisher, receiver, state } = createChannel();
+
+        channel.join();
+        expect(publisher).toHaveBeenCalledTimes(1);
+        expect(channel.channelState).toBe(ChannelState.JOINING);
+
+        state.publish(ConnectionState.DISCONNECTED);
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+        state.publish(ConnectionState.CONNECTED);
+        expect(publisher).toHaveBeenCalledTimes(2);
+
+        channel.acknowledge(receiver);
+        expect(channel.channelState).toBe(ChannelState.JOINED);
+    });
+
     it('should correctly send a message', () => {
         const { channel, publisher, receiver, state } = createChannel();
 
@@ -212,6 +228,114 @@ describe('Channel', () => {
         );
 
         expect(publisher).toHaveBeenCalledTimes(1);
+    });
+
+    it('flushes queued messages in FIFO order', () => {
+        const { channel, publisher, receiver } = createChannel();
+
+        channel.sendMessage('first', { order: 1 });
+        channel.sendMessage('second', { order: 2 });
+        channel.sendMessage('third', { order: 3 });
+        channel.join();
+        publisher.mockClear();
+        channel.acknowledge(receiver);
+
+        expect(publisher.mock.calls.map(([message]) => message.event)).toEqual(['first', 'second', 'third']);
+    });
+
+    it('reports queue backpressure without evicting older fire-and-forget messages', () => {
+        const publisher = jest.fn();
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
+        const receiver = new Subject<ChannelEvent>();
+        const channel = new Channel(publisher, state, 'test', {}, 1);
+        const errorListener = jest.fn();
+
+        channel.onError(errorListener);
+        channel.sendMessage('first', { order: 1 });
+        expect(() => channel.sendMessage('second', { order: 2 })).toThrow(/message queue capacity was exceeded/);
+
+        expect(errorListener).toHaveBeenCalledWith(expect.objectContaining({
+            status: 429,
+        }));
+        channel.join();
+        publisher.mockClear();
+        channel.acknowledge(receiver);
+        expect(publisher.mock.calls.map(([message]) => message.event)).toEqual(['first']);
+    });
+
+    it('retains a failed ACK flush and retries the whole FIFO after rejoin', () => {
+        const { channel, publisher, receiver, state } = createChannel();
+        let failFirstBroadcast = true;
+
+        publisher.mockImplementation((message: ClientMessage) => {
+            if (message.action === ClientActions.BROADCAST && failFirstBroadcast) {
+                failFirstBroadcast = false;
+                throw new Error('transport write failed');
+            }
+        });
+        channel.sendMessage('first', { order: 1 });
+        channel.sendMessage('second', { order: 2 });
+        channel.join();
+        publisher.mockClear();
+
+        channel.acknowledge(receiver);
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+        expect(publisher.mock.calls.map(([message]) => message.event)).toEqual(['first']);
+
+        state.publish(ConnectionState.DISCONNECTED);
+        state.publish(ConnectionState.CONNECTED);
+        channel.acknowledge(receiver);
+
+        expect(channel.channelState).toBe(ChannelState.JOINED);
+        expect(publisher.mock.calls
+            .filter(([message]) => message.action === ClientActions.BROADCAST)
+            .map(([message]) => message.event)).toEqual(['first', 'first', 'second']);
+    });
+
+    it('returns a live send failure while retaining the message for reconnect', () => {
+        const { channel, publisher, receiver, state } = createChannel();
+
+        channel.join();
+        channel.acknowledge(receiver);
+        publisher.mockImplementationOnce(() => {
+            throw new Error('socket closed');
+        });
+
+        expect(() => channel.sendMessage('retained', { order: 1 })).toThrow('socket closed');
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+
+        publisher.mockClear();
+        state.publish(ConnectionState.DISCONNECTED);
+        state.publish(ConnectionState.CONNECTED);
+        channel.acknowledge(receiver);
+
+        expect(publisher.mock.calls
+            .filter(([message]) => message.action === ClientActions.BROADCAST)
+            .map(([message]) => message.event)).toEqual(['retained']);
+    });
+
+    it('cleans a failed join attempt and retries only after a disconnect transition', () => {
+        const { channel, publisher, receiver, state } = createChannel();
+        const errors = jest.fn();
+
+        channel.onError(errors);
+        publisher.mockImplementationOnce(() => {
+            throw new Error('join write failed');
+        });
+        channel.join();
+
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+        expect(errors).toHaveBeenCalledWith(expect.objectContaining({ message: 'join write failed' }));
+        expect(publisher).toHaveBeenCalledTimes(1);
+
+        state.publish(ConnectionState.CONNECTED);
+        expect(publisher).toHaveBeenCalledTimes(1);
+        state.publish(ConnectionState.DISCONNECTED);
+        state.publish(ConnectionState.CONNECTED);
+        expect(publisher).toHaveBeenCalledTimes(2);
+
+        channel.acknowledge(receiver);
+        expect(channel.channelState).toBe(ChannelState.JOINED);
     });
 
     // The presence system tests
@@ -452,7 +576,8 @@ describe('Channel', () => {
             },
         ]);
 
-        expect(channel.presence).toBe(presenceListener.mock.calls[0][0]);
+        expect(channel.presence).toEqual(presenceListener.mock.calls[0][0]);
+        expect(channel.presence).not.toBe(presenceListener.mock.calls[0][0]);
 
         presenceListener.mockClear();
 
@@ -484,7 +609,8 @@ describe('Channel', () => {
             },
         ]);
 
-        expect(channel.presence).toBe(presenceListener.mock.calls[0][0]);
+        expect(channel.presence).toEqual(presenceListener.mock.calls[0][0]);
+        expect(channel.presence).not.toBe(presenceListener.mock.calls[0][0]);
 
         presenceListener.mockClear();
 
@@ -549,7 +675,42 @@ describe('Channel', () => {
             },
         ]);
 
-        expect(channel.presence).toBe(presenceListener.mock.calls[0][0]);
+        expect(channel.presence).toEqual(presenceListener.mock.calls[0][0]);
+        expect(channel.presence).not.toBe(presenceListener.mock.calls[0][0]);
+    });
+
+    it('does not expose mutable presence state', () => {
+        const { channel, receiver } = createChannel();
+        const presenceListener = jest.fn((presence: Array<Record<string, any>>) => {
+            presence[0].profile.name = 'changed by listener';
+        });
+
+        channel.onUsersChange(presenceListener);
+        channel.join();
+        channel.acknowledge(receiver);
+        receiver.publish({
+            requestId: 'test',
+            action: ServerActions.PRESENCE,
+            event: PresenceEventTypes.UPDATE,
+            channelName: 'test',
+            payload: {
+                changed: {
+                    id: 'test',
+                },
+                presence: [{
+                    id: 'test',
+                    profile: {
+                        name: 'original',
+                    },
+                }],
+            },
+        });
+
+        const snapshot = channel.presence as Array<Record<string, any>>;
+
+        expect(snapshot[0].profile.name).toBe('original');
+        snapshot[0].profile.name = 'changed by getter';
+        expect((channel.presence as Array<Record<string, any>>)[0].profile.name).toBe('original');
     });
 
     it('should notify subscribers when any presence event occurs', () => {
@@ -923,6 +1084,57 @@ describe('Channel', () => {
         const promise = channel.sendForResponse('timeout-event', { data: 'test' }, 100);
 
         await expect(promise).rejects.toThrow(/sendForResponse timed out after 100ms/);
+    });
+
+    it('removes a queued sendForResponse request when it times out', async () => {
+        jest.useFakeTimers();
+        const publisher = jest.fn();
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.DISCONNECTED);
+        const receiver = new Subject<ChannelEvent>();
+        const channel = new Channel(publisher, state, 'test', {});
+
+        channel.join();
+        // @ts-expect-error - testing timeout behavior
+        const promise = channel.sendForResponse('timeout-event', { data: 'test' }, 100);
+
+        jest.advanceTimersByTime(100);
+        await expect(promise).rejects.toThrow(/sendForResponse timed out after 100ms/);
+        state.publish(ConnectionState.CONNECTED);
+        publisher.mockClear();
+        channel.acknowledge(receiver);
+        expect(publisher).not.toHaveBeenCalledWith(expect.objectContaining({
+            event: 'timeout-event',
+        }));
+        jest.useRealTimers();
+    });
+
+    it('rejects pending response requests when the channel closes', async () => {
+        const { channel, receiver } = createChannel();
+
+        channel.join();
+        channel.acknowledge(receiver);
+        // @ts-expect-error - testing lifecycle cleanup
+        const promise = channel.sendForResponse('WAITING', { data: 'test' });
+
+        channel.leave();
+
+        await expect(promise).rejects.toThrow(/Channel "test" was closed/);
+    });
+
+    it('rejects new response requests when the bounded queue is full without reordering queued work', async () => {
+        const publisher = jest.fn();
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
+        const channel = new Channel(publisher, state, 'test', {}, 1);
+
+        // @ts-expect-error - testing bounded queue behavior
+        const first = channel.sendForResponse('FIRST', { data: 'first' });
+        // @ts-expect-error - testing bounded queue behavior
+        const second = channel.sendForResponse('SECOND', { data: 'second' });
+
+        await expect(second).rejects.toThrow(/message queue capacity was exceeded/);
+        channel.leave();
+        await expect(first).rejects.toThrow(/Channel "test" was closed/);
+        expect(publisher).not.toHaveBeenCalled();
     });
 
     it('should be able to wait for a message', async () => {

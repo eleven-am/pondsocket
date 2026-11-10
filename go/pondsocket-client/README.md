@@ -291,6 +291,7 @@ type ChannelStateHandler func(state ChannelState)
 type ClientConfig struct {
     ReconnectInterval time.Duration // Time between reconnection attempts
     MaxReconnectTries int           // Max reconnection attempts (-1 for infinite)
+    JoinTimeout       time.Duration // Maximum time to wait for a channel join acknowledgement
     PingInterval      time.Duration // WebSocket ping interval
     PongTimeout       time.Duration // WebSocket pong timeout
     WriteTimeout      time.Duration // WebSocket write timeout
@@ -301,6 +302,7 @@ type ClientConfig struct {
 config := pondsocket.DefaultClientConfig()
 // ReconnectInterval: 1 second
 // MaxReconnectTries: -1 (infinite)
+// JoinTimeout: 10 seconds
 // PingInterval: 30 seconds
 // PongTimeout: 10 seconds
 // WriteTimeout: 10 seconds
@@ -316,8 +318,11 @@ if err != nil {
     log.Printf("Connection failed: %v", err)
 }
 
-// Message sending errors (handled internally)
-// The client automatically handles connection drops and reconnection
+// Use the checked API when the caller needs explicit backpressure or transport errors.
+if err := channel.SendMessageChecked("chat", pondsocket.PondMessage{"text": "hello"}); err != nil {
+    log.Printf("Message queued/rejected with error: %v", err)
+}
+// A failed transport write is retained in FIFO order for the next successful rejoin.
 
 // Channel errors
 if channel.State() == pondsocket.Closed {

@@ -1128,6 +1128,10 @@ func TestConnectionContextIntegration(t *testing.T) {
 			if headers == nil {
 				t.Error("Expected headers to be non-nil")
 			}
+			headers.Set("X-Test-Mutation", "changed")
+			if r.Header.Get("X-Test-Mutation") != "" {
+				t.Error("Headers returned mutable request-owned state")
+			}
 
 			innerCtx := connCtx.Context()
 			if innerCtx == nil {
@@ -1235,6 +1239,42 @@ func TestConnectionContextIntegration(t *testing.T) {
 			t.Error("Timeout")
 		}
 	})
+}
+
+func TestConnectionContextLifetimeIsIndependentFromHandshakeRequest(t *testing.T) {
+	type keyType string
+	const key keyType = "request-value"
+
+	requestCtx, cancelRequest := context.WithCancel(context.WithValue(context.Background(), key, "kept"))
+	req := httptest.NewRequest(http.MethodGet, "/socket", nil).WithContext(requestCtx)
+	w := httptest.NewRecorder()
+	var response http.ResponseWriter = w
+	endpointCtx, cancelEndpoint := context.WithCancel(context.Background())
+	defer cancelEndpoint()
+	endpoint := newEndpoint(endpointCtx, "/socket", DefaultOptions())
+	connCtx := newConnectionContext(connectionOptions{
+		request:  req,
+		response: &response,
+		endpoint: endpoint,
+		userId:   "lifetime",
+		connCtx:  requestCtx,
+	})
+
+	cancelRequest()
+	select {
+	case <-connCtx.Context().Done():
+		t.Fatal("connection context was cancelled with the completed handshake request")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if got := connCtx.Context().Value(key); got != "kept" {
+		t.Fatalf("request context value = %v, want kept", got)
+	}
+	connCtx.connectionCancel()
+	select {
+	case <-connCtx.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("connection context did not cancel with connection lifetime")
+	}
 }
 
 func TestContextConcurrency(t *testing.T) {

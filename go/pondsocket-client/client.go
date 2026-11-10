@@ -1,6 +1,7 @@
 package pondsocket
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -184,14 +185,26 @@ func (c *PondClient) Disconnect() error {
 
 	c.setConnectionState(false)
 
-	c.cancel()
-
-	// Clear all channels
 	c.channelsMu.Lock()
-	for name := range c.channels {
+	channels := make([]*Channel, 0, len(c.channels))
+	for name, channel := range c.channels {
+		channels = append(channels, channel)
 		delete(c.channels, name)
 	}
 	c.channelsMu.Unlock()
+	for _, channel := range channels {
+		channel.close()
+	}
+
+	c.cancel()
+
+	c.connectionSubsMu.Lock()
+	clear(c.connectionSubs)
+	c.connectionSubsMu.Unlock()
+
+	c.eventSubsMu.Lock()
+	clear(c.eventSubs)
+	c.eventSubsMu.Unlock()
 
 	return nil
 }
@@ -213,7 +226,7 @@ func (c *PondClient) CreateChannel(name string, params JoinParams) *Channel {
 	}
 
 	connectionChan, unsubscribeConnection := c.subscribeToConnection()
-	channel := NewChannelWithCleanup(c.createPublisher(), connectionChan, unsubscribeConnection, name, params)
+	channel := newChannelWithPublisher(c.createPublisher(), connectionChan, unsubscribeConnection, name, params, c.config.JoinTimeout, c.GetState())
 	c.channels[name] = channel
 
 	return channel
@@ -227,11 +240,6 @@ func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 	c.nextConnSubID++
 	c.connectionSubs[id] = sub
 	c.connectionSubsMu.Unlock()
-
-	// Send current state immediately
-	go func() {
-		callback(c.GetState())
-	}()
 
 	// Start listener goroutine
 	go func() {
@@ -257,6 +265,8 @@ func (c *PondClient) OnConnectionChange(callback ConnectionHandler) func() {
 		}
 	}()
 
+	c.safeSendBool(sub, c.GetState())
+
 	// Return unsubscribe function
 	return func() {
 		c.connectionSubsMu.Lock()
@@ -277,10 +287,9 @@ func (c *PondClient) subscribeToConnection() (<-chan bool, func()) {
 	c.connectionSubs[id] = sub
 	c.connectionSubsMu.Unlock()
 
-	// Send current state immediately
-	go func() {
-		c.safeSendBool(sub, c.GetState())
-	}()
+	// Publish the initial state before returning so it cannot be reordered
+	// behind a later connection transition.
+	c.safeSendBool(sub, c.GetState())
 
 	unsubscribe := func() {
 		c.connectionSubsMu.Lock()
@@ -321,10 +330,10 @@ func (c *PondClient) subscribeToEventsWithUnsubscribe() (<-chan ChannelEvent, fu
 }
 
 // createPublisher returns a function that publishes messages to the WebSocket
-func (c *PondClient) createPublisher() func(ClientMessage) {
-	return func(message ClientMessage) {
+func (c *PondClient) createPublisher() func(ClientMessage) error {
+	return func(message ClientMessage) error {
 		if !c.GetState() {
-			return
+			return fmt.Errorf("client is not connected")
 		}
 
 		c.connMu.RLock()
@@ -332,22 +341,32 @@ func (c *PondClient) createPublisher() func(ClientMessage) {
 		c.connMu.RUnlock()
 
 		if conn == nil {
-			return
+			return fmt.Errorf("client is not connected")
 		}
 
 		data, err := json.Marshal(message)
 		if err != nil {
-			return
+			return fmt.Errorf("failed to marshal outbound message: %w", err)
 		}
 
 		c.writeMu.Lock()
-		conn.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
+		if c.config.WriteTimeout > 0 {
+			if err := conn.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout)); err != nil {
+				c.writeMu.Unlock()
+				_ = conn.Close()
+				return fmt.Errorf("failed to set WebSocket write deadline: %w", err)
+			}
+		}
 		err = conn.WriteMessage(websocket.TextMessage, data)
 		c.writeMu.Unlock()
 		if err != nil {
-			// Connection error, will be handled by readMessages
-			return
+			// Force the reader to observe the failed transport and begin the
+			// normal stalled/reconnect lifecycle. The channel retains this
+			// message until a later acknowledgement flush can retry it.
+			_ = conn.Close()
+			return fmt.Errorf("failed to write outbound message: %w", err)
 		}
+		return nil
 	}
 }
 
@@ -444,15 +463,22 @@ func (c *PondClient) readMessages(conn *websocket.Conn, done chan struct{}) {
 				return
 			}
 
-			var event ChannelEvent
-			if err := json.Unmarshal(data, &event); err != nil {
-				continue
-			}
+			for _, line := range bytes.Split(data, []byte{'\n'}) {
+				line = bytes.TrimSpace(line)
+				if len(line) == 0 {
+					continue
+				}
 
-			select {
-			case c.eventBroadcast <- event:
-			default:
-				// Channel is full, skip
+				var event ChannelEvent
+				if err := json.Unmarshal(line, &event); err != nil {
+					continue
+				}
+
+				select {
+				case c.eventBroadcast <- event:
+				case <-c.ctx.Done():
+					return
+				}
 			}
 		}
 	}
@@ -556,22 +582,27 @@ func (c *PondClient) init() {
 
 	go func() {
 		defer unsubscribe()
-		for event := range eventChan {
-			switch event.Event {
-			case string(EventAcknowledge):
-				c.handleAcknowledge(event)
-			case string(EventConnection):
-				if event.Action == Connect {
-					c.setConnectionState(true)
+		for {
+			select {
+			case event := <-eventChan:
+				switch event.Event {
+				case string(EventAcknowledge):
+					c.handleAcknowledge(event)
+				case string(EventConnection):
+					if event.Action == Connect {
+						c.setConnectionState(true)
+					}
+				case string(EventUnauthorized), string(EventNotFound):
+					if event.Action == System {
+						c.handleDecline(event)
+					}
+				case string(EventInternalError):
+					if event.Action == System {
+						c.handleError(event)
+					}
 				}
-			case string(EventUnauthorized), string(EventNotFound):
-				if event.Action == System {
-					c.handleDecline(event)
-				}
-			case string(EventInternalError):
-				if event.Action == System {
-					c.handleError(event)
-				}
+			case <-c.ctx.Done():
+				return
 			}
 		}
 	}()
@@ -579,16 +610,15 @@ func (c *PondClient) init() {
 
 // handleAcknowledge handles channel acknowledgment events
 func (c *PondClient) handleAcknowledge(event ChannelEvent) {
-	c.channelsMu.Lock()
-	defer c.channelsMu.Unlock()
-
+	c.channelsMu.RLock()
 	channel, exists := c.channels[event.ChannelName]
+	c.channelsMu.RUnlock()
 	if !exists {
 		return
 	}
 
 	eventChan, unsubscribe := c.subscribeToEventsWithUnsubscribe()
-	channel.Acknowledge(eventChan, unsubscribe)
+	channel.acknowledge(event.RequestID, eventChan, unsubscribe)
 }
 
 func (c *PondClient) handleDecline(event ChannelEvent) {
@@ -614,24 +644,15 @@ func (c *PondClient) handleError(event ChannelEvent) {
 func (c *PondClient) safeSendBool(sub *boolSubscriber, value bool) {
 	select {
 	case <-sub.done:
+	case <-c.ctx.Done():
 	case sub.ch <- value:
-	default:
-		select {
-		case <-sub.ch:
-		default:
-		}
-		select {
-		case <-sub.done:
-		case sub.ch <- value:
-		default:
-		}
 	}
 }
 
 func (c *PondClient) safeSendEvent(sub *clientEventSubscriber, event ChannelEvent) {
 	select {
 	case <-sub.done:
+	case <-c.ctx.Done():
 	case sub.ch <- event:
-	default:
 	}
 }

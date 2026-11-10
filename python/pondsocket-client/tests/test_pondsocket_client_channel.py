@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 import pytest
-from pondsocket_client import Channel, ConnectionState, ResponseTimeoutError, typed_channel
+from pondsocket_client import (
+    Channel,
+    ChannelQueueFullError,
+    ConnectionState,
+    ResponseTimeoutError,
+    typed_channel,
+)
 
 from pondsocket_common import (
     BehaviorSubject,
@@ -491,12 +497,228 @@ async def test_reconnect_after_stalled_resends_join() -> None:
     assert any(m.action == ClientActions.JOIN_CHANNEL for m in sent)
 
 
+async def test_disconnect_while_joining_retries_join_before_messages() -> None:
+    channel, sent, state = _make_channel()
+    channel.join()
+    await asyncio.sleep(0)
+    assert [msg.action for msg in sent] == [ClientActions.JOIN_CHANNEL]
+
+    state.publish(ConnectionState.DISCONNECTED)
+    channel.send_message("queued", {"i": 1})
+    sent.clear()
+    state.publish(ConnectionState.CONNECTED)
+    await asyncio.sleep(0)
+
+    assert channel.channel_state == ChannelState.STALLED
+    assert [msg.action for msg in sent] == [ClientActions.JOIN_CHANNEL]
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+            request_id=sent[0].request_id,
+        )
+    )
+    await asyncio.sleep(0)
+    assert [msg.event for msg in sent] == [
+        ClientActions.JOIN_CHANNEL.value,
+        "queued",
+    ]
+
+
 async def test_outbound_queue_is_bounded() -> None:
     channel, _sent, _ = _make_channel(initial_state=ConnectionState.DISCONNECTED, queue_size=3)
     channel.join()
-    for i in range(10):
+    for i in range(3):
         channel.send_message(f"e{i}", {"i": i})
+    with pytest.raises(ChannelQueueFullError):
+        channel.send_message("overflow", {"i": 3})
     assert len(channel._queue) == 3  # type: ignore[attr-defined]
+    assert [msg.event for msg in channel._queue] == ["e0", "e1", "e2"]  # type: ignore[attr-defined]
+
+
+async def test_outbound_messages_are_published_one_at_a_time_in_fifo_order() -> None:
+    state: BehaviorSubject[ConnectionState] = BehaviorSubject(ConnectionState.CONNECTED)
+    sent: list[int] = []
+    active = 0
+    peak_active = 0
+
+    async def publisher(msg: ClientMessage) -> None:
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            if msg.action == ClientActions.BROADCAST:
+                value = int(msg.payload["i"])
+                await asyncio.sleep((20 - value) / 10_000)
+                sent.append(value)
+        finally:
+            active -= 1
+
+    channel = Channel(
+        name="/chat/ordered",
+        params={},
+        publisher=publisher,
+        connection_state=state,
+        max_queue_size=32,
+    )
+    channel.join()
+    channel.handle_event(
+        _server_msg(
+            "/chat/ordered",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+        )
+    )
+    for i in range(20):
+        channel.send_message("ordered", {"i": i})
+
+    for _ in range(100):
+        if len(sent) == 20:
+            break
+        await asyncio.sleep(0.005)
+
+    assert sent == list(range(20))
+    assert peak_active == 1
+
+
+async def test_reconnect_rejoins_before_flushing_messages_in_fifo_order() -> None:
+    channel, sent, state = _make_channel()
+    channel.join()
+    await asyncio.sleep(0)
+    channel.handle_event(
+        _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
+    )
+    state.publish(ConnectionState.DISCONNECTED)
+    channel.send_message("first", {"i": 1})
+    channel.send_message("second", {"i": 2})
+    sent.clear()
+
+    state.publish(ConnectionState.CONNECTED)
+    await asyncio.sleep(0)
+    assert [msg.action for msg in sent] == [ClientActions.JOIN_CHANNEL]
+
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+            request_id=sent[0].request_id,
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert [msg.event for msg in sent] == [
+        ClientActions.JOIN_CHANNEL.value,
+        "first",
+        "second",
+    ]
+
+
+@pytest.mark.parametrize(
+    "stale_event",
+    [Events.ACKNOWLEDGE.value, Events.UNAUTHORIZED.value, Events.NOT_FOUND.value],
+)
+async def test_stale_join_response_cannot_complete_or_decline_rejoin(
+    stale_event: str,
+) -> None:
+    channel, sent, state = _make_channel()
+    channel.join()
+    await asyncio.sleep(0)
+    first_join_id = sent[-1].request_id
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+            request_id=first_join_id,
+        )
+    )
+    state.publish(ConnectionState.DISCONNECTED)
+    channel.send_message("queued", {})
+    sent.clear()
+    state.publish(ConnectionState.CONNECTED)
+    await asyncio.sleep(0)
+    current_join_id = sent[-1].request_id
+    assert current_join_id != first_join_id
+
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            stale_event,
+            action=ServerActions.SYSTEM,
+            request_id=first_join_id,
+        )
+    )
+    await asyncio.sleep(0)
+    assert channel.channel_state == ChannelState.STALLED
+    assert all(msg.event != "queued" for msg in sent)
+
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+            request_id=current_join_id,
+        )
+    )
+    await asyncio.sleep(0)
+    assert channel.channel_state == ChannelState.JOINED
+    assert sent[-1].event == "queued"
+
+
+async def test_failed_publish_is_retained_and_retried_before_later_messages() -> None:
+    state: BehaviorSubject[ConnectionState] = BehaviorSubject(ConnectionState.CONNECTED)
+    attempts: list[str] = []
+    delivered: list[str] = []
+    fail_first = True
+
+    async def publisher(msg: ClientMessage) -> None:
+        nonlocal fail_first
+        if msg.action == ClientActions.JOIN_CHANNEL:
+            return
+        attempts.append(msg.event)
+        if fail_first:
+            fail_first = False
+            raise ConnectionError("simulated send failure")
+        delivered.append(msg.event)
+
+    channel = Channel(
+        name="/chat/retry",
+        params={},
+        publisher=publisher,
+        connection_state=state,
+        max_queue_size=3,
+    )
+    channel.join()
+    channel.handle_event(
+        _server_msg("/chat/retry", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
+    )
+    channel.send_message("first", {})
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    channel.send_message("second", {})
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert attempts == ["first", "first", "second"]
+    assert delivered == ["first", "second"]
+
+
+async def test_timed_out_queued_request_is_not_sent_after_reconnect() -> None:
+    channel, sent, state = _make_channel(initial_state=ConnectionState.DISCONNECTED)
+    channel.join()
+    with pytest.raises(ResponseTimeoutError):
+        await channel.send_for_response("expires", {}, wait=0.01)
+    assert len(channel._queue) == 0  # type: ignore[attr-defined]
+
+    state.publish(ConnectionState.CONNECTED)
+    await asyncio.sleep(0)
+    channel.handle_event(
+        _server_msg("/chat/1", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
+    )
+    await asyncio.sleep(0)
+    assert all(msg.event != "expires" for msg in sent)
 
 
 async def test_leave_transitions_to_closed_and_sends() -> None:

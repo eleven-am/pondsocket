@@ -84,10 +84,10 @@ func (s *store[T]) Keys() *array[string] {
 
 	defer s.mutex.RUnlock()
 
-	keys := newArray[string]()
+	keys := &array[string]{items: make([]string, 0, len(s.store))}
 
 	for key := range s.store {
-		keys.push(key)
+		keys.items = append(keys.items, key)
 	}
 	return keys
 }
@@ -97,10 +97,10 @@ func (s *store[T]) Values() *array[T] {
 
 	defer s.mutex.RUnlock()
 
-	values := newArray[T]()
+	values := &array[T]{items: make([]T, 0, len(s.store))}
 
 	for _, value := range s.store {
-		values.push(value)
+		values.items = append(values.items, value)
 	}
 	return values
 }
@@ -110,11 +110,11 @@ func (s *store[T]) GetByKeys(keys ...string) *array[T] {
 
 	defer s.mutex.RUnlock()
 
-	values := newArray[T]()
+	values := &array[T]{items: make([]T, 0, len(keys))}
 
 	for _, key := range keys {
 		if value, exists := s.store[key]; exists {
-			values.push(value)
+			values.items = append(values.items, value)
 		}
 	}
 	return values

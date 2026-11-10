@@ -17,14 +17,16 @@ type Lobby struct {
 	channels         *store[*Channel]
 	endpoint         *Endpoint
 	channelMutex     sync.RWMutex
+	pendingJoins     map[string]int
 }
 
 func newLobby(endpoint *Endpoint) *Lobby {
 	return &Lobby{
-		endpoint:   endpoint,
-		middleware: newMiddleWare[*messageEvent, *Channel](),
-		outgoing:   newMiddleWare[*OutgoingContext, interface{}](),
-		channels:   newStore[*Channel](),
+		endpoint:     endpoint,
+		middleware:   newMiddleWare[*messageEvent, *Channel](),
+		outgoing:     newMiddleWare[*OutgoingContext, interface{}](),
+		channels:     newStore[*Channel](),
+		pendingJoins: make(map[string]int),
 	}
 }
 
@@ -153,6 +155,8 @@ func (l *Lobby) createChannelUnsafe(name string) (*Channel, error) {
 		PubSub:               l.endpoint.options.PubSub,
 		Hooks:                l.endpoint.options.Hooks,
 		Namespace:            l.endpoint.options.Namespace,
+		Outboxes:             l.endpoint.outboxes,
+		SendBuffer:           l.endpoint.options.SendChannelBuffer,
 	}
 	c := newChannel(l.endpoint.ctx, opts)
 
@@ -196,6 +200,47 @@ func (l *Lobby) getOrCreateChannel(name string) (*Channel, error) {
 		return existingCh, nil
 	}
 	return l.createChannelUnsafe(name)
+}
+
+func (l *Lobby) beginJoin(name string) (*Channel, error) {
+	l.channelMutex.Lock()
+	defer l.channelMutex.Unlock()
+
+	if channel, _ := l.channels.Read(name); channel != nil {
+		l.pendingJoins[name]++
+		return channel, nil
+	}
+
+	channel, err := l.createChannelUnsafe(name)
+	if err != nil {
+		return nil, err
+	}
+	l.pendingJoins[name]++
+	return channel, nil
+}
+
+func (l *Lobby) endJoin(name string, channel *Channel, accepted bool) {
+	shouldClose := false
+
+	l.channelMutex.Lock()
+	remaining := l.pendingJoins[name] - 1
+	if remaining > 0 {
+		l.pendingJoins[name] = remaining
+	} else {
+		delete(l.pendingJoins, name)
+		current, _ := l.channels.Read(name)
+		if !accepted && current == channel && channel.connections.Len() == 0 {
+			_ = l.channels.Delete(name)
+			_ = l.endpoint.channels.Delete(name)
+			channel.onDestroy = nil
+			shouldClose = true
+		}
+	}
+	l.channelMutex.Unlock()
+
+	if shouldClose {
+		_ = channel.Close()
+	}
 }
 
 func (l *Lobby) onChannelDestroyed(name string) func() error {

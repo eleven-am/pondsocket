@@ -163,6 +163,95 @@ func TestEndpointChannelCreation(t *testing.T) {
 	})
 }
 
+func TestEndpointDeclinedJoinDoesNotRetainChannel(t *testing.T) {
+	ctx := context.Background()
+	endpoint := newEndpoint(ctx, "/test", DefaultOptions())
+	lobby := endpoint.CreateChannel("room:*", func(ctx *JoinContext) error {
+		return ctx.Decline(StatusUnauthorized, "denied")
+	})
+	conn := createTestConn("denied-user", nil)
+	event := &Event{
+		Action:      joinChannelEvent,
+		ChannelName: "room:untrusted",
+		RequestId:   "denied-request",
+		Payload:     map[string]interface{}{},
+	}
+
+	if err := endpoint.joinChannel(event, conn); err != nil {
+		t.Fatalf("join failed: %v", err)
+	}
+	if lobby.HasChannel("room:untrusted") {
+		t.Fatal("declined join retained a channel")
+	}
+	if _, err := endpoint.GetChannelByName("room:untrusted"); err == nil {
+		t.Fatal("declined join retained an endpoint channel")
+	}
+}
+
+func TestEndpointAcceptedJoinRetainsChannel(t *testing.T) {
+	ctx := context.Background()
+	endpoint := newEndpoint(ctx, "/test", DefaultOptions())
+	lobby := endpoint.CreateChannel("room:*", func(ctx *JoinContext) error {
+		return ctx.Accept()
+	})
+	conn := createTestConn("accepted-user", nil)
+	event := &Event{
+		Action:      joinChannelEvent,
+		ChannelName: "room:trusted",
+		RequestId:   "accepted-request",
+		Payload:     map[string]interface{}{},
+	}
+
+	if err := endpoint.joinChannel(event, conn); err != nil {
+		t.Fatalf("join failed: %v", err)
+	}
+	if !lobby.HasChannel("room:trusted") {
+		t.Fatal("accepted join did not retain its channel")
+	}
+	channel, err := endpoint.GetChannelByName("room:trusted")
+	if err != nil {
+		t.Fatalf("accepted channel missing from endpoint: %v", err)
+	}
+	defer channel.Close()
+	if _, err := channel.GetUser("accepted-user"); err != nil {
+		t.Fatalf("accepted user missing from channel: %v", err)
+	}
+}
+
+func TestEndpointConcurrentDeclinedJoinsDoNotRetainChannel(t *testing.T) {
+	ctx := context.Background()
+	endpoint := newEndpoint(ctx, "/test", DefaultOptions())
+	lobby := endpoint.CreateChannel("room:*", func(ctx *JoinContext) error {
+		return ctx.Decline(StatusUnauthorized, "denied")
+	})
+	var wait sync.WaitGroup
+
+	for i := 0; i < 50; i++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			conn := createTestConn(fmt.Sprintf("denied-user-%d", index), nil)
+			event := &Event{
+				Action:      joinChannelEvent,
+				ChannelName: "room:shared",
+				RequestId:   fmt.Sprintf("denied-request-%d", index),
+				Payload:     map[string]interface{}{},
+			}
+			if err := endpoint.joinChannel(event, conn); err != nil {
+				t.Errorf("join failed: %v", err)
+			}
+		}(i)
+	}
+	wait.Wait()
+
+	if lobby.HasChannel("room:shared") {
+		t.Fatal("concurrent declined joins retained a channel")
+	}
+	if endpoint.channels.Len() != 0 {
+		t.Fatalf("concurrent declined joins retained %d endpoint channels", endpoint.channels.Len())
+	}
+}
+
 func TestEndpointShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 

@@ -166,9 +166,15 @@ func TestChannelQueueBounded(t *testing.T) {
 	channel := NewChannel(publisher, connectionChan, "lobby", JoinParams{})
 	defer channel.Leave()
 
-	total := maxQueueSize + 50
-	for i := 0; i < total; i++ {
-		channel.SendMessage("evt", PondMessage{"index": i})
+	for i := 0; i < maxQueueSize; i++ {
+		if err := channel.SendMessageChecked("evt", PondMessage{"index": i}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 50; i++ {
+		if err := channel.SendMessageChecked("evt", PondMessage{"index": maxQueueSize + i}); err == nil {
+			t.Fatalf("overflow %d did not return an error", i)
+		}
 	}
 
 	channel.mu.RLock()
@@ -182,7 +188,7 @@ func TestChannelQueueBounded(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected payload type %T", channel.queue[0].Payload)
 	}
-	if firstPayload["index"] != total-maxQueueSize {
-		t.Errorf("expected oldest retained message index %d, got %v", total-maxQueueSize, firstPayload["index"])
+	if firstPayload["index"] != 0 {
+		t.Errorf("expected oldest retained message index 0, got %v", firstPayload["index"])
 	}
 }

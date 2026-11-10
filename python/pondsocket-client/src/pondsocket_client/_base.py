@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 from collections.abc import Callable
 from typing import TypeAlias, TypeVar
 
@@ -33,13 +34,16 @@ class BaseClient(abc.ABC):
     __slots__ = (
         "_broadcaster",
         "_channels",
+        "_connect_generation",
+        "_connect_task",
         "_connection_state",
         "_disconnecting",
         "_errors",
+        "_lifecycle_generation",
         "_options",
         "_reconnect_attempts",
         "_reconnect_task",
-        "_tasks",
+        "_send_lock",
     )
 
     def __init__(self, options: ClientOptions | None = None) -> None:
@@ -50,10 +54,13 @@ class BaseClient(abc.ABC):
             ConnectionState.DISCONNECTED
         )
         self._errors: Subject[BaseException] = Subject()
+        self._lifecycle_generation = 0
+        self._connect_generation = 0
+        self._connect_task: asyncio.Task[None] | None = None
         self._reconnect_attempts: int = 0
         self._reconnect_task: asyncio.Task[None] | None = None
         self._disconnecting: bool = False
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._send_lock = asyncio.Lock()
         self._broadcaster.subscribe(self._route_event)
 
     @property
@@ -67,7 +74,7 @@ class BaseClient(abc.ABC):
         self, name: str, params: JoinParams | None = None
     ) -> Channel:
         existing = self._channels.get(name)
-        if existing is not None and existing.channel_state.value not in ("CLOSED", "DECLINED"):
+        if existing is not None and not existing._is_replaceable():
             return existing
         channel = Channel(
             name=name,
@@ -99,26 +106,68 @@ class BaseClient(abc.ABC):
         self._disconnecting = False
         if self.get_state() != ConnectionState.DISCONNECTED:
             return
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("connect() must run in an asyncio task")
+        self._lifecycle_generation += 1
+        generation = self._lifecycle_generation
+        self._connect_generation = generation
+        self._connect_task = current_task
         self._connection_state.publish(ConnectionState.CONNECTING)
         try:
             await self._open_transport()
+        except asyncio.CancelledError:
+            if generation == self._lifecycle_generation:
+                await self._close_transport()
+                self._connection_state.publish(ConnectionState.DISCONNECTED)
+            raise
         except Exception as exc:
-            self._errors.publish(exc)
-            self._connection_state.publish(ConnectionState.DISCONNECTED)
-            self._schedule_reconnect()
+            if generation == self._lifecycle_generation and not self._disconnecting:
+                self._errors.publish(exc)
+                self._connection_state.publish(ConnectionState.DISCONNECTED)
+                self._schedule_reconnect()
+        else:
+            if generation != self._lifecycle_generation or self._disconnecting:
+                await self._close_transport()
+                self._connection_state.publish(ConnectionState.DISCONNECTED)
+        finally:
+            if self._connect_task is current_task:
+                self._connect_task = None
 
     async def disconnect(self) -> None:
         self._disconnecting = True
-        if self._reconnect_task is not None and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
+        self._lifecycle_generation += 1
+        connect_task = self._connect_task
+        if (
+            connect_task is not None
+            and connect_task is not asyncio.current_task()
+            and not connect_task.done()
+        ):
+            connect_task.cancel()
+            await asyncio.gather(connect_task, return_exceptions=True)
+        reconnect_task = self._reconnect_task
+        self._reconnect_task = None
+        if reconnect_task is not None and not reconnect_task.done():
+            reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reconnect_task
+        channel_tasks: list[asyncio.Task[None]] = []
+        for channel in list(self._channels.values()):
+            task = channel._force_close()
+            if task is not None and task is not asyncio.current_task():
+                channel_tasks.append(task)
+        if channel_tasks:
+            await asyncio.gather(*channel_tasks, return_exceptions=True)
+        self._channels.clear()
         await self._close_transport()
         self._connection_state.publish(ConnectionState.DISCONNECTED)
-        for channel in list(self._channels.values()):
-            channel._force_close()
-        self._channels.clear()
 
     def _mark_connected(self) -> None:
+        if (
+            self._disconnecting
+            or self._connect_generation != self._lifecycle_generation
+        ):
+            return
         self._reconnect_attempts = 0
         self._connection_state.publish(ConnectionState.CONNECTED)
 
@@ -128,6 +177,13 @@ class BaseClient(abc.ABC):
             self._schedule_reconnect()
 
     def _handle_inbound_text(self, text: str) -> None:
+        messages = [line for line in text.splitlines() if line.strip()]
+        if not messages:
+            messages = [text]
+        for message in messages:
+            self._handle_inbound_message(message)
+
+    def _handle_inbound_message(self, text: str) -> None:
         try:
             import json
 
@@ -164,8 +220,13 @@ class BaseClient(abc.ABC):
         self._reconnect_task = asyncio.create_task(self._reconnect_after(delay))
         self._reconnect_task.add_done_callback(self._on_reconnect_task_done)
 
-    def _on_reconnect_task_done(self, _task: asyncio.Task[None]) -> None:
-        self._reconnect_task = None
+    def _on_reconnect_task_done(self, task: asyncio.Task[None]) -> None:
+        if self._reconnect_task is task:
+            self._reconnect_task = None
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self._errors.publish(error)
 
     async def _reconnect_after(self, delay: float) -> None:
         try:
@@ -177,7 +238,14 @@ class BaseClient(abc.ABC):
         await self.connect()
 
     async def _publish_outbound(self, message: ClientMessage) -> None:
-        await self._send_outbound(message)
+        async with self._send_lock:
+            if self.get_state() != ConnectionState.CONNECTED:
+                raise ConnectionError("transport is not connected")
+            try:
+                await self._send_outbound(message)
+            except Exception as exc:
+                self._errors.publish(exc)
+                raise
 
     @abc.abstractmethod
     async def _open_transport(self) -> None: ...

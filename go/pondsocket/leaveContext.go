@@ -17,6 +17,7 @@ type LeaveContext struct {
 	mutex        sync.RWMutex
 	hasResponded bool
 	leaveReason  string
+	connectionID string
 }
 
 func newLeaveContext(ctx context.Context, channel *Channel, user *User, reason string) *LeaveContext {
@@ -97,6 +98,10 @@ func (c *LeaveContext) BroadcastTo(e string, payload interface{}, userIDs ...str
 		c.err = wrapF(err, "error broadcasting leave event %s to users %v", e, userIDs)
 	}
 	return c
+}
+
+func (c *LeaveContext) ConnectionID() string {
+	return c.connectionID
 }
 
 // GetReason returns the reason why the user is leaving the channel.

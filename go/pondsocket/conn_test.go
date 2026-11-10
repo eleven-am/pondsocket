@@ -329,6 +329,31 @@ func TestConnOnClose(t *testing.T) {
 	}
 }
 
+func TestConnCloseHandlerCanCloseConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &Conn{
+		ID:            "recursive-close",
+		ctx:           ctx,
+		cancel:        cancel,
+		closeChan:     make(chan struct{}),
+		closeHandlers: newArray[func(Transport) error](),
+	}
+	done := make(chan struct{})
+	conn.OnClose(func(transport Transport) error {
+		transport.Close()
+		close(done)
+		return nil
+	})
+
+	go conn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("close handler deadlocked while closing its connection")
+	}
+}
+
 func TestConnConcurrentAccess(t *testing.T) {
 	server := mockWebSocketServer(t, func(serverConn *websocket.Conn) {
 		time.Sleep(200 * time.Millisecond)
@@ -602,7 +627,7 @@ func TestConnSendTimeoutOption(t *testing.T) {
 }
 
 func TestConnConcurrentHandleMessages(t *testing.T) {
-	t.Run("handles multiple messages concurrently", func(t *testing.T) {
+	t.Run("handles multiple messages serially", func(t *testing.T) {
 		messagesReceived := make(chan string, 20)
 		var handlerWg sync.WaitGroup
 
@@ -627,7 +652,6 @@ func TestConnConcurrentHandleMessages(t *testing.T) {
 
 		ctx := context.Background()
 		opts := DefaultOptions()
-		opts.MaxConcurrentHandlers = 5
 
 		conn, _ := newConn(ctx, wsConn, nil, "test-id", opts)
 		defer conn.Close()
@@ -635,7 +659,7 @@ func TestConnConcurrentHandleMessages(t *testing.T) {
 		handlerWg.Add(10)
 		conn.OnMessage(func(event Event, c Transport) error {
 			defer handlerWg.Done()
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			messagesReceived <- event.RequestId
 			return nil
 		})
@@ -658,7 +682,7 @@ func TestConnConcurrentHandleMessages(t *testing.T) {
 		}
 	})
 
-	t.Run("respects MaxConcurrentHandlers limit", func(t *testing.T) {
+	t.Run("never runs two handlers at once", func(t *testing.T) {
 		var concurrentCount int32
 		var maxConcurrent int32
 		var mu sync.Mutex
@@ -683,7 +707,6 @@ func TestConnConcurrentHandleMessages(t *testing.T) {
 
 		ctx := context.Background()
 		opts := DefaultOptions()
-		opts.MaxConcurrentHandlers = 3
 
 		conn, _ := newConn(ctx, wsConn, nil, "test-id", opts)
 		defer conn.Close()
@@ -700,7 +723,7 @@ func TestConnConcurrentHandleMessages(t *testing.T) {
 			}
 			mu.Unlock()
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 
 			mu.Lock()
 			concurrentCount--
@@ -718,8 +741,8 @@ func TestConnConcurrentHandleMessages(t *testing.T) {
 
 		select {
 		case <-done:
-			if maxConcurrent > 3 {
-				t.Errorf("exceeded MaxConcurrentHandlers: max was %d, expected <= 3", maxConcurrent)
+			if maxConcurrent != 1 {
+				t.Errorf("handlers for one connection must run serially: max concurrency was %d, expected 1", maxConcurrent)
 			}
 		case <-time.After(5 * time.Second):
 			t.Error("timeout waiting for messages")
@@ -779,27 +802,6 @@ func TestConnConcurrentHandleMessages(t *testing.T) {
 			}
 		case <-time.After(2 * time.Second):
 			t.Error("timeout")
-		}
-	})
-
-	t.Run("default MaxConcurrentHandlers when not set", func(t *testing.T) {
-		server := mockWebSocketServer(t, func(serverConn *websocket.Conn) {
-			time.Sleep(50 * time.Millisecond)
-		})
-		defer server.Close()
-
-		wsConn := createClientConn(t, server.URL)
-		defer wsConn.Close()
-
-		ctx := context.Background()
-		opts := DefaultOptions()
-		opts.MaxConcurrentHandlers = 0
-
-		conn, _ := newConn(ctx, wsConn, nil, "test-id", opts)
-		defer conn.Close()
-
-		if cap(conn.handlerSem) != 10 {
-			t.Errorf("expected default semaphore capacity 10, got %d", cap(conn.handlerSem))
 		}
 	})
 }
@@ -985,8 +987,8 @@ func (m *connTestMetricsCollector) Error(component string, err error) {
 	}
 }
 
-func TestConnSendJSONTimeout(t *testing.T) {
-	t.Run("returns timeout error when send channel is full", func(t *testing.T) {
+func TestConnSendJSONFullBuffer(t *testing.T) {
+	t.Run("applies bounded backpressure then disconnects when send buffer stays full", func(t *testing.T) {
 		server := mockWebSocketServer(t, func(serverConn *websocket.Conn) {
 			time.Sleep(500 * time.Millisecond)
 		})
@@ -997,7 +999,7 @@ func TestConnSendJSONTimeout(t *testing.T) {
 
 		ctx := context.Background()
 		opts := DefaultOptions()
-		opts.SendTimeout = 10 * time.Millisecond
+		opts.SendTimeout = 30 * time.Millisecond
 
 		c := &Conn{
 			ID:            "test-timeout",
@@ -1007,7 +1009,6 @@ func TestConnSendJSONTimeout(t *testing.T) {
 			ctx:           ctx,
 			cancel:        func() {},
 			closeChan:     make(chan struct{}),
-			readDone:      nil,
 			closeHandlers: newArray[func(Transport) error](),
 			options:       opts,
 			isClosing:     false,
@@ -1016,9 +1017,18 @@ func TestConnSendJSONTimeout(t *testing.T) {
 
 		c.send <- []byte(`{"first": "message"}`)
 
+		start := time.Now()
 		err := c.SendJSON(Event{RequestId: "second"})
 		if err == nil {
-			t.Error("expected timeout error when send channel is full")
+			t.Error("expected error when send buffer is full")
+		}
+		if elapsed := time.Since(start); elapsed < 20*time.Millisecond || elapsed > 500*time.Millisecond {
+			t.Errorf("SendJSON should wait for bounded backpressure, took %v", elapsed)
+		}
+		select {
+		case <-c.closeChan:
+		case <-time.After(time.Second):
+			t.Error("expected connection with a full send buffer to be closed")
 		}
 	})
 
@@ -1063,7 +1073,6 @@ func TestConnSendJSONTimeout(t *testing.T) {
 			ctx:           ctx,
 			cancel:        cancel,
 			closeChan:     make(chan struct{}),
-			readDone:      nil,
 			closeHandlers: newArray[func(Transport) error](),
 			options:       opts,
 			isClosing:     false,
@@ -1239,7 +1248,6 @@ func TestConnWritePumpNotActive(t *testing.T) {
 			ctx:           ctx,
 			cancel:        func() {},
 			closeChan:     make(chan struct{}),
-			readDone:      make(chan struct{}),
 			closeHandlers: newArray[func(Transport) error](),
 			options:       opts,
 			isClosing:     true,
@@ -1288,52 +1296,6 @@ func TestConnCloseHandlerErrors(t *testing.T) {
 			}
 		case <-time.After(100 * time.Millisecond):
 			t.Error("expected close handler error to be reported")
-		}
-	})
-}
-
-func TestConnGetSendTimeout(t *testing.T) {
-	t.Run("returns configured timeout", func(t *testing.T) {
-		server := mockWebSocketServer(t, func(serverConn *websocket.Conn) {
-			time.Sleep(50 * time.Millisecond)
-		})
-		defer server.Close()
-
-		wsConn := createClientConn(t, server.URL)
-		defer wsConn.Close()
-
-		ctx := context.Background()
-		opts := DefaultOptions()
-		opts.SendTimeout = 10 * time.Second
-
-		conn, _ := newConn(ctx, wsConn, nil, "test-get-timeout", opts)
-		defer conn.Close()
-
-		timeout := conn.getSendTimeout()
-		if timeout != 10*time.Second {
-			t.Errorf("expected 10s, got %v", timeout)
-		}
-	})
-
-	t.Run("returns default 5s when not configured", func(t *testing.T) {
-		server := mockWebSocketServer(t, func(serverConn *websocket.Conn) {
-			time.Sleep(50 * time.Millisecond)
-		})
-		defer server.Close()
-
-		wsConn := createClientConn(t, server.URL)
-		defer wsConn.Close()
-
-		ctx := context.Background()
-		opts := DefaultOptions()
-		opts.SendTimeout = 0
-
-		conn, _ := newConn(ctx, wsConn, nil, "test-get-timeout-default", opts)
-		defer conn.Close()
-
-		timeout := conn.getSendTimeout()
-		if timeout != 5*time.Second {
-			t.Errorf("expected 5s default, got %v", timeout)
 		}
 	})
 }

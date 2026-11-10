@@ -19,6 +19,8 @@ class MockWebSocket {
 
     static OPEN = 1;
 
+    static CLOSED = 3;
+
     send: (...args: unknown[]) => unknown = jest.fn();
 
     close: (...args: unknown[]) => unknown = jest.fn();
@@ -54,6 +56,9 @@ describe('PondClient', () => {
         pondClient.connect();
         const mockWebSocket = pondClient['_socket']! as any;
         const broadcasterSpy = jest.spyOn(pondClient['_broadcaster'], 'publish');
+        const errorCallback = jest.fn();
+
+        pondClient.onError(errorCallback);
 
         mockWebSocket.onmessage({
             data: JSON.stringify({
@@ -76,19 +81,68 @@ describe('PondClient', () => {
 
         broadcasterSpy.mockClear();
 
-        expect(() => {
-            mockWebSocket.onmessage({ data: 'invalid json' });
-        }).toThrow();
+        expect(() => mockWebSocket.onmessage({ data: 'invalid json' })).not.toThrow();
 
         expect(broadcasterSpy).not.toHaveBeenCalled();
+        expect(errorCallback).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Failed to parse server message at line 1'),
+        }));
 
         broadcasterSpy.mockClear();
 
-        expect(() => {
-            mockWebSocket.onmessage({ data: JSON.stringify({}) });
-        }).toThrow();
+        expect(() => mockWebSocket.onmessage({ data: JSON.stringify({}) })).not.toThrow();
 
         expect(broadcasterSpy).not.toHaveBeenCalled();
+    });
+
+    test('continues parsing newline-delimited batches after a malformed line', () => {
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket']! as any;
+        const broadcasterSpy = jest.spyOn(pondClient['_broadcaster'], 'publish');
+        const errorCallback = jest.fn();
+        const event = {
+            action: ServerActions.SYSTEM,
+            channelName: 'exampleChannel',
+            requestId: '123',
+            payload: {},
+            event: 'exampleEvent',
+        };
+
+        pondClient.onError(errorCallback);
+        mockWebSocket.onmessage({
+            data: `${JSON.stringify(event)}\r\nnot-json\n${JSON.stringify({ ...event, requestId: '456' })}\n`,
+        });
+
+        expect(broadcasterSpy).toHaveBeenCalledTimes(2);
+        expect(broadcasterSpy.mock.calls.map(([message]) => message.requestId)).toEqual(['123', '456']);
+        expect(errorCallback).toHaveBeenCalledTimes(1);
+    });
+
+    test('does not create overlapping sockets and ignores stale socket callbacks', () => {
+        pondClient.connect();
+        const firstSocket = pondClient['_socket']! as any;
+        const broadcasterSpy = jest.spyOn(pondClient['_broadcaster'], 'publish');
+
+        pondClient.connect();
+        expect(pondClient['_socket']).toBe(firstSocket);
+
+        firstSocket.readyState = MockWebSocket.CLOSED;
+        pondClient.connect();
+        const secondSocket = pondClient['_socket']! as any;
+        const event = JSON.stringify({
+            action: ServerActions.SYSTEM,
+            channelName: 'exampleChannel',
+            requestId: '123',
+            payload: {},
+            event: 'exampleEvent',
+        });
+
+        expect(secondSocket).not.toBe(firstSocket);
+        expect(firstSocket.close).toHaveBeenCalled();
+        firstSocket.onmessage({ data: event });
+        expect(broadcasterSpy).not.toHaveBeenCalled();
+        secondSocket.onmessage({ data: event });
+        expect(broadcasterSpy).toHaveBeenCalledTimes(1);
     });
 
     test('socket should only pass to publish state when acknowledged event is received', () => {
@@ -112,6 +166,46 @@ describe('PondClient', () => {
 
         mockWebSocket.onmessage({ data: JSON.stringify(acknowledgeEvent) });
         expect(mockCallback).toHaveBeenCalledWith(ConnectionState.CONNECTED);
+    });
+
+    test('only resets reconnect backoff after the protocol connection acknowledgement', () => {
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket']! as any;
+
+        pondClient['_reconnectAttempts'] = 4;
+        mockWebSocket.onopen();
+        expect(pondClient['_reconnectAttempts']).toBe(4);
+
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: Events.CONNECTION,
+                action: ServerActions.CONNECT,
+                channelName: 'ENDPOINT',
+                requestId: 'connection',
+                payload: {},
+            }),
+        });
+
+        expect(pondClient['_reconnectAttempts']).toBe(0);
+    });
+
+    test('adds jitter to reconnect delays', () => {
+        jest.useFakeTimers();
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0);
+        const connectSpy = jest.spyOn(pondClient, 'connect');
+
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket']! as any;
+
+        connectSpy.mockClear();
+        mockWebSocket.onclose();
+        jest.advanceTimersByTime(499);
+        expect(connectSpy).not.toHaveBeenCalled();
+        jest.advanceTimersByTime(1);
+        expect(connectSpy).toHaveBeenCalledTimes(1);
+
+        randomSpy.mockRestore();
+        jest.useRealTimers();
     });
 
     test('createChannel method should create a new channel or return an existing one', () => {
@@ -144,6 +238,7 @@ describe('PondClient', () => {
         const mockWebSocket = pondClient['_socket']! as any;
         const channel = pondClient.createChannel('missing');
 
+        mockWebSocket.readyState = MockWebSocket.OPEN;
         mockWebSocket.onmessage({
             data: JSON.stringify({
                 event: Events.CONNECTION,
@@ -216,6 +311,7 @@ describe('PondClient', () => {
             payload: {},
         };
 
+        mockWebSocket.readyState = MockWebSocket.OPEN;
         mockWebSocket.onmessage({ data: JSON.stringify(acknowledgeEvent) });
 
         channel.join();

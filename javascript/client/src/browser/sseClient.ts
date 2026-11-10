@@ -16,6 +16,8 @@ export class SSEClient extends BaseClient {
 
     protected _connectionId: string | undefined;
 
+    protected _publishChain: Promise<void> = Promise.resolve();
+
     constructor (endpoint: string, params: Record<string, any> = {}, options: SSEClientOptions = {}) {
         super(endpoint, params, options);
         this._postAddress = new URL(this._address.toString());
@@ -44,31 +46,53 @@ export class SSEClient extends BaseClient {
     }
 
     public connect () {
+        if (!this._disconnecting && this._eventSource &&
+            (this._eventSource.readyState === EventSource.CONNECTING || this._eventSource.readyState === EventSource.OPEN)) {
+            return;
+        }
+
         this._clearReconnectTimeout();
+        this._clearConnectionTimeout();
         this._disconnecting = false;
         this._connectionId = undefined;
         this._connectionState.publish(ConnectionState.CONNECTING);
 
+        const previousEventSource = this._eventSource;
         const eventSource = new EventSource(this._address.toString(), {
             withCredentials: this._withCredentials ?? false,
         });
 
+        this._eventSource = eventSource;
+        if (previousEventSource && previousEventSource !== eventSource) {
+            previousEventSource.close();
+        }
+
         this._connectionTimeoutId = setTimeout(() => {
-            if (eventSource.readyState === EventSource.CONNECTING) {
+            if (this._eventSource === eventSource && eventSource.readyState === EventSource.CONNECTING) {
                 const error = new Error('Connection timeout');
 
                 this._errorSubject.publish(error);
+                this._eventSource = undefined;
                 eventSource.close();
+                this._connectionState.publish(ConnectionState.DISCONNECTED);
+                this._scheduleReconnect();
             }
         }, this._options.connectionTimeout);
         this._unrefTimer(this._connectionTimeoutId);
 
         eventSource.onopen = () => {
+            if (this._eventSource !== eventSource) {
+                return;
+            }
+
             this._clearConnectionTimeout();
-            this._reconnectAttempts = 0;
         };
 
         eventSource.onmessage = (event) => {
+            if (this._eventSource !== eventSource) {
+                return;
+            }
+
             this.#handleMessage(event.data);
         };
 
@@ -87,8 +111,6 @@ export class SSEClient extends BaseClient {
             this._connectionState.publish(ConnectionState.DISCONNECTED);
             this._scheduleReconnect();
         };
-
-        this._eventSource = eventSource;
     }
 
     #handleMessage (data: string) {
@@ -120,37 +142,56 @@ export class SSEClient extends BaseClient {
         this._connectionState.publish(ConnectionState.DISCONNECTED);
 
         if (this._connectionId) {
-            fetch(this._postAddress.toString(), {
+            const connectionId = this._connectionId;
+
+            this.#enqueueRequest(() => fetch(this._postAddress.toString(), {
                 method: 'DELETE',
                 headers: {
-                    'X-Connection-ID': this._connectionId,
+                    'X-Connection-ID': connectionId,
                 },
                 credentials: this._withCredentials ? 'include' : 'same-origin',
-            }).catch(() => {
-            });
+            }), 'Failed to close SSE connection');
         }
 
-        this._eventSource?.close();
+        const eventSource = this._eventSource;
+
         this._eventSource = undefined;
+        eventSource?.close();
         this._connectionId = undefined;
         this._clearChannels();
     }
 
     protected _createPublisher () {
         return (message: ClientMessage) => {
-            if (this._connectionState.value === ConnectionState.CONNECTED && this._connectionId) {
-                fetch(this._postAddress.toString(), {
+            const connectionId = this._connectionId;
+
+            if (this._connectionState.value !== ConnectionState.CONNECTED || !connectionId) {
+                throw new Error('Cannot send message while the SSE client is not connected');
+            }
+
+            this.#enqueueRequest(() => fetch(this._postAddress.toString(), {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'X-Connection-ID': this._connectionId,
+                        'X-Connection-ID': connectionId,
                     },
                     body: JSON.stringify(message),
                     credentials: this._withCredentials ? 'include' : 'same-origin',
-                }).catch((err) => {
-                    this._errorSubject.publish(err instanceof Error ? err : new Error('Failed to send message'));
-                });
-            }
+                }), 'Failed to send SSE message');
         };
+    }
+
+    #enqueueRequest (request: () => Promise<Response>, failureMessage: string) {
+        this._publishChain = this._publishChain
+            .then(async () => {
+                const response = await request();
+
+                if (!response.ok) {
+                    throw new Error(`${failureMessage}: HTTP ${response.status}`);
+                }
+            })
+            .catch((error) => {
+                this._errorSubject.publish(error instanceof Error ? error : new Error(failureMessage));
+            });
     }
 }

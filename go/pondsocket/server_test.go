@@ -24,6 +24,9 @@ func TestServerCreation(t *testing.T) {
 		if server.server == nil {
 			t.Error("expected http server to be initialized")
 		}
+		if server.server.ReadHeaderTimeout != 5*time.Second {
+			t.Errorf("expected safe default ReadHeaderTimeout 5s, got %v", server.server.ReadHeaderTimeout)
+		}
 	})
 
 	t.Run("creates server with custom options", func(t *testing.T) {
@@ -34,11 +37,12 @@ func TestServerCreation(t *testing.T) {
 			PongWait:        60 * time.Second,
 		}
 		serverOpts := &ServerOptions{
-			Options:            customOpts,
-			ServerAddr:         ":8080",
-			ServerReadTimeout:  5 * time.Second,
-			ServerWriteTimeout: 10 * time.Second,
-			ServerIdleTimeout:  120 * time.Second,
+			Options:                 customOpts,
+			ServerAddr:              ":8080",
+			ServerReadHeaderTimeout: 2 * time.Second,
+			ServerReadTimeout:       5 * time.Second,
+			ServerWriteTimeout:      10 * time.Second,
+			ServerIdleTimeout:       120 * time.Second,
 		}
 		server := NewServer(serverOpts)
 
@@ -50,6 +54,9 @@ func TestServerCreation(t *testing.T) {
 		}
 		if server.server.WriteTimeout != 10*time.Second {
 			t.Errorf("expected WriteTimeout 10s, got %v", server.server.WriteTimeout)
+		}
+		if server.server.ReadHeaderTimeout != 2*time.Second {
+			t.Errorf("expected ReadHeaderTimeout 2s, got %v", server.server.ReadHeaderTimeout)
 		}
 	})
 }
@@ -151,6 +158,11 @@ func TestServerShutdown(t *testing.T) {
 		if err != nil {
 			t.Errorf("expected clean shutdown, got error: %v", err)
 		}
+		select {
+		case <-server.ctx.Done():
+		default:
+			t.Error("Stop did not cancel the server context")
+		}
 		if server.IsRunning() {
 			t.Error("expected server to stop running")
 		}
@@ -167,6 +179,32 @@ func TestServerShutdown(t *testing.T) {
 
 		if err != nil {
 			t.Errorf("expected clean shutdown, got error: %v", err)
+		}
+		select {
+		case <-server.ctx.Done():
+		default:
+			t.Error("Stop did not cancel a server that had not started")
+		}
+	})
+
+	t.Run("Start after Stop fails loudly instead of serving a dead context", func(t *testing.T) {
+		opts := &ServerOptions{
+			Options:    DefaultOptions(),
+			ServerAddr: ":0",
+		}
+		server := NewServer(opts)
+
+		if err := server.Start(); err != nil {
+			t.Fatalf("first Start failed: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+
+		if err := server.Stop(2 * time.Second); err != nil {
+			t.Fatalf("stop failed: %v", err)
+		}
+
+		if err := server.Start(); err == nil {
+			t.Error("expected restarting a stopped server to return an error")
 		}
 	})
 }

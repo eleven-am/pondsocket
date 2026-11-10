@@ -6,7 +6,6 @@ package pondsocket
 import (
 	"errors"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -164,6 +163,21 @@ func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userI
 		Event:       string(eventType),
 		NodeID:      p.channel.nodeID,
 	}
+	p.channel.presence.mutex.RLock()
+	trackedUsers := p.channel.presence.store.Keys()
+	p.channel.presence.mutex.RUnlock()
+
+	connectedUsers := p.channel.connections.Keys()
+	recipientIDs := trackedUsers.filter(func(userID string) bool {
+		return connectedUsers.some(func(connID string) bool {
+			return connID == userID
+		})
+	})
+	var deliveryErr error
+	if recipientIDs.length() > 0 {
+		deliveryErr = p.channel.deliver(evt, recipientIDs)
+	}
+
 	if p.channel.pubsub != nil && p.channel.endpointPath != "" {
 		cleanEndpoint := p.channel.endpointPath
 		if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
@@ -176,29 +190,7 @@ func (p *presenceClient) publishPresenceEvent(eventType presenceEventType, userI
 		if err != nil {
 			return err
 		}
-		if err := p.channel.pubsub.Publish(topic, data); err != nil {
-			return err
-		}
+		return combine(deliveryErr, p.channel.pubsub.Publish(topic, data))
 	}
-	p.channel.presence.mutex.RLock()
-	trackedUsers := p.channel.presence.store.Keys()
-	p.channel.presence.mutex.RUnlock()
-	connectedUsers := p.channel.connections.Keys()
-	recipientIDs := trackedUsers.filter(func(userID string) bool {
-		return connectedUsers.some(func(connID string) bool {
-			return connID == userID
-		})
-	})
-	if recipientIDs.length() == 0 {
-		return nil
-	}
-	internalEv := internalEvent{Event: evt, Recipients: recipientIDs}
-	select {
-	case p.channel.channel <- internalEv:
-		return nil
-	case <-p.channel.ctx.Done():
-		return p.channel.ctx.Err()
-	case <-time.After(p.channel.internalQueueTimeout):
-		return timeout(p.channel.name, "timeout queueing presence event")
-	}
+	return deliveryErr
 }

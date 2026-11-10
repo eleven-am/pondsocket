@@ -1,8 +1,10 @@
 package pondsocket
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestParsePayload(t *testing.T) {
@@ -130,6 +132,79 @@ func TestMapToError(t *testing.T) {
 
 		if err == nil {
 			t.Error("expected error")
+		}
+	})
+}
+
+func TestMergeContexts(t *testing.T) {
+	type ctxKey string
+	key := ctxKey("request-scoped-value")
+
+	t.Run("values from child contexts are visible on the merged context", func(t *testing.T) {
+		parent := context.Background()
+		child := context.WithValue(context.Background(), key, "from-child")
+
+		merged, cancel := mergeContexts(parent, child)
+		defer cancel()
+
+		if got := merged.Value(key); got != "from-child" {
+			t.Errorf("expected merged context to expose child value %q, got %v", "from-child", got)
+		}
+	})
+
+	t.Run("parent values remain visible when the child has no value", func(t *testing.T) {
+		parent := context.WithValue(context.Background(), key, "from-parent")
+		child := context.Background()
+
+		merged, cancel := mergeContexts(parent, child)
+		defer cancel()
+
+		if got := merged.Value(key); got != "from-parent" {
+			t.Errorf("expected merged context to expose parent value %q, got %v", "from-parent", got)
+		}
+	})
+
+	t.Run("cancelling the parent cancels the merged context", func(t *testing.T) {
+		parent, parentCancel := context.WithCancel(context.Background())
+		child := context.Background()
+
+		merged, cancel := mergeContexts(parent, child)
+		defer cancel()
+
+		parentCancel()
+
+		select {
+		case <-merged.Done():
+		case <-time.After(time.Second):
+			t.Error("expected merged context to be done after parent cancellation")
+		}
+	})
+
+	t.Run("cancelling a child context cancels the merged context", func(t *testing.T) {
+		parent := context.Background()
+		child, childCancel := context.WithCancel(context.Background())
+
+		merged, cancel := mergeContexts(parent, child)
+		defer cancel()
+
+		childCancel()
+
+		select {
+		case <-merged.Done():
+		case <-time.After(time.Second):
+			t.Error("expected merged context to be done after child cancellation")
+		}
+	})
+
+	t.Run("calling the returned cancel func cancels the merged context", func(t *testing.T) {
+		merged, cancel := mergeContexts(context.Background(), context.Background())
+
+		cancel()
+
+		select {
+		case <-merged.Done():
+		case <-time.After(time.Second):
+			t.Error("expected merged context to be done after calling cancel")
 		}
 	})
 }

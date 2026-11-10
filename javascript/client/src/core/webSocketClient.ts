@@ -13,14 +13,26 @@ export abstract class WebSocketClient extends BaseClient {
     protected _lastMessageTime: number = 0;
 
     public connect () {
+        if (!this._disconnecting && this._socket &&
+            (this._socket.readyState === WebSocket.CONNECTING || this._socket.readyState === WebSocket.OPEN)) {
+            return;
+        }
+
         this._clearReconnectTimeout();
+        this._clearConnectionTimeout();
         this._disconnecting = false;
         this._connectionState.publish(ConnectionState.CONNECTING);
 
+        const previousSocket = this._socket;
         const socket = this._createSocket(this._address.toString());
 
+        this._socket = socket;
+        if (previousSocket && previousSocket !== socket) {
+            previousSocket.close();
+        }
+
         this._connectionTimeoutId = setTimeout(() => {
-            if (socket.readyState === WebSocket.CONNECTING) {
+            if (this._socket === socket && socket.readyState === WebSocket.CONNECTING) {
                 const error = new Error('Connection timeout');
 
                 this._errorSubject.publish(error);
@@ -30,10 +42,13 @@ export abstract class WebSocketClient extends BaseClient {
         this._unrefTimer(this._connectionTimeoutId);
 
         socket.onopen = () => {
+            if (this._socket !== socket) {
+                return;
+            }
+
             this._clearConnectionTimeout();
             this._clearPingInterval();
             this._clearPongTimeout();
-            this._reconnectAttempts = 0;
             this._lastMessageTime = Date.now();
 
             if (this._options.pingInterval) {
@@ -42,8 +57,12 @@ export abstract class WebSocketClient extends BaseClient {
         };
 
         socket.onmessage = (message) => {
+            if (this._socket !== socket) {
+                return;
+            }
+
             this._lastMessageTime = Date.now();
-            const events = this._parseMessages(message.data as string);
+            const events = this._parseMessages(String(message.data));
 
             for (const event of events) {
                 this._broadcaster.publish(event);
@@ -51,6 +70,10 @@ export abstract class WebSocketClient extends BaseClient {
         };
 
         socket.onerror = () => {
+            if (this._socket !== socket) {
+                return;
+            }
+
             const error = new Error('WebSocket error');
 
             this._errorSubject.publish(error);
@@ -80,7 +103,10 @@ export abstract class WebSocketClient extends BaseClient {
         this._clearPongTimeout();
         this._disconnecting = true;
         this._connectionState.publish(ConnectionState.DISCONNECTED);
-        this._socket?.close();
+        const socket = this._socket;
+
+        this._socket = undefined;
+        socket?.close();
         this._clearChannels();
     }
 
@@ -90,9 +116,13 @@ export abstract class WebSocketClient extends BaseClient {
 
     protected _createPublisher () {
         return (message: ClientMessage) => {
-            if (this._connectionState.value === ConnectionState.CONNECTED) {
-                this._socket?.send(JSON.stringify(message));
+            const socket = this._socket;
+
+            if (this._connectionState.value !== ConnectionState.CONNECTED || !socket || socket.readyState !== WebSocket.OPEN) {
+                throw new Error('Cannot send message while the WebSocket is not connected');
             }
+
+            socket.send(JSON.stringify(message));
         };
     }
 
@@ -115,6 +145,10 @@ export abstract class WebSocketClient extends BaseClient {
         const timeout = this._options.pingInterval! * 2;
 
         this._pongTimeoutId = setTimeout(() => {
+            if (this._socket !== socket) {
+                return;
+            }
+
             if (Date.now() - this._lastMessageTime >= timeout) {
                 this._errorSubject.publish(new Error('Connection lost: no response from server'));
                 socket.close();

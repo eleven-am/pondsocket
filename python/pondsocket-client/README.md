@@ -56,7 +56,7 @@ PondClient(WebSocketClient)  (concrete)
   └── appends query-string params
 ```
 
-The `Channel` class holds the per-channel state machine (IDLE → JOINING → JOINED → STALLED → CLOSED/DECLINED), a bounded outbound queue (drops oldest on overflow), and a `send_for_response` that correlates inbound replies by `requestId`.
+The `Channel` class holds the per-channel state machine (IDLE → JOINING → JOINED → STALLED → CLOSED/DECLINED), a bounded FIFO outbound queue (raises `ChannelQueueFullError` on overflow), and a `send_for_response` that correlates inbound replies by `requestId`.
 
 ## Connection states
 
@@ -91,7 +91,7 @@ Compared to the Go client (`go/pondsocket-client/`):
 | Reconnect backoff | linear despite comment | true exponential, capped |
 | `UNAUTHORIZED` handling | not implemented | → `DECLINED` state |
 | Connection state | bool (no CONNECTING) | three-state enum |
-| Outbound queue | unbounded | bounded, drops oldest |
+| Outbound queue | unbounded | bounded FIFO, raises on overflow |
 | Join while disconnected | dropped silently | deferred until CONNECTED |
 
 The Python client follows the JS client design where the two diverge.
@@ -104,6 +104,7 @@ from pondsocket_client import (
     Channel,
     ConnectionState,
     ClientOptions,
+    ChannelQueueFullError,
     ResponseTimeoutError,
 )
 ```

@@ -441,6 +441,11 @@ func TestChannelEvictUser(t *testing.T) {
 		channel.connections.Update(conn.ID, conn)
 	}
 	t.Run("evicts user successfully", func(t *testing.T) {
+		conn1, connErr := channel.connections.Read("user1")
+		if connErr != nil || conn1 == nil {
+			t.Fatalf("expected user1 connection to exist before eviction, got %v", connErr)
+		}
+
 		err := channel.EvictUser("user1", "violation of terms")
 
 		if err != nil {
@@ -451,18 +456,14 @@ func TestChannelEvictUser(t *testing.T) {
 		if err == nil {
 			t.Error("expected evicted user to be removed")
 		}
-		time.Sleep(50 * time.Millisecond)
 
-		conn1, _ := channel.connections.Read("user1")
-
-		if conn1 != nil {
-			select {
-			case msg := <-conn1.(*Conn).send:
-				if !strings.Contains(string(msg), "evicted") {
-					t.Error("expected eviction message to evicted user")
-				}
-			default:
+		select {
+		case msg := <-conn1.(*Conn).send:
+			if !strings.Contains(string(msg), "evicted") {
+				t.Errorf("expected eviction message to evicted user, got %s", msg)
 			}
+		case <-time.After(time.Second):
+			t.Error("expected evicted user to receive an eviction message before being removed")
 		}
 	})
 }
@@ -493,6 +494,37 @@ func TestChannelClose(t *testing.T) {
 	}
 	if channel.store.Len() != 0 {
 		t.Errorf("expected 0 users after close, got %d", channel.store.Len())
+	}
+}
+
+func TestChannelCloseDoesNotDisconnectSharedTransport(t *testing.T) {
+	ctx := context.Background()
+	opts := options{
+		Name:                 "first",
+		Middleware:           newMiddleWare[*messageEvent, *Channel](),
+		Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
+		InternalQueueTimeout: time.Second,
+	}
+	first := newChannel(ctx, opts)
+	opts.Name = "second"
+	second := newChannel(ctx, opts)
+	defer second.Close()
+
+	conn := createTestConn("shared-user", nil)
+	if err := first.addUser(conn); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.addUser(conn); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.IsActive() {
+		t.Fatal("closing one channel disconnected a transport shared with another channel")
+	}
+	if _, err := second.GetUser(conn.GetID()); err != nil {
+		t.Fatalf("shared transport lost membership in second channel: %v", err)
 	}
 }
 

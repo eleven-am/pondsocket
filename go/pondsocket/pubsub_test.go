@@ -242,6 +242,107 @@ func TestPubSubClosedError(t *testing.T) {
 	})
 }
 
+func TestLocalPubSubPreservesPublishOrder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pubsub := NewLocalPubSub(ctx, 128)
+	defer pubsub.Close()
+
+	const count = 100
+	received := make(chan int, count)
+	if err := pubsub.Subscribe("ordered", func(_ string, data []byte) {
+		received <- int(data[0])
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < count; i++ {
+		if err := pubsub.Publish("ordered", []byte{byte(i)}); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+	for i := 0; i < count; i++ {
+		select {
+		case got := <-received:
+			if got != i {
+				t.Fatalf("message %d arrived as %d", i, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for message %d", i)
+		}
+	}
+}
+
+func TestLocalPubSubManagedUnsubscribeIsExact(t *testing.T) {
+	pubsub := NewLocalPubSub(context.Background(), 10)
+	defer pubsub.Close()
+
+	first := make(chan string, 1)
+	second := make(chan string, 1)
+	unsubscribeFirst, err := pubsub.SubscribeWithCancel("shared", func(_ string, data []byte) {
+		first <- string(data)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = pubsub.SubscribeWithCancel("shared", func(_ string, data []byte) {
+		second <- string(data)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unsubscribeFirst(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pubsub.Publish("shared", []byte("kept")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-second:
+		if got != "kept" {
+			t.Fatalf("second subscriber got %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remaining subscriber did not receive message")
+	}
+	select {
+	case got := <-first:
+		t.Fatalf("removed subscriber received %q", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func TestLocalPubSubReturnsBackpressureErrorWithoutPartialDelivery(t *testing.T) {
+	pubsub := NewLocalPubSub(context.Background(), 1)
+	defer pubsub.Close()
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+	if err := pubsub.Subscribe("slow", func(_ string, _ []byte) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-block
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pubsub.Publish("slow", []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := pubsub.Publish("slow", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pubsub.Publish("slow", []byte("three")); err == nil {
+		t.Fatal("expected an explicit backpressure error")
+	}
+	close(block)
+}
+
 func TestTopicFormatting(t *testing.T) {
 	tests := []struct {
 		name     string

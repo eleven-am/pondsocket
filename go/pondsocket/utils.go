@@ -5,6 +5,20 @@ import (
 	"encoding/json"
 )
 
+type mergedValuesContext struct {
+	context.Context
+	valueSources []context.Context
+}
+
+func (m *mergedValuesContext) Value(key interface{}) interface{} {
+	for _, source := range m.valueSources {
+		if value := source.Value(key); value != nil {
+			return value
+		}
+	}
+	return m.Context.Value(key)
+}
+
 func mergeContexts(parent context.Context, contexts ...context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancelCause := context.WithCancelCause(parent)
 
@@ -23,7 +37,11 @@ func mergeContexts(parent context.Context, contexts ...context.Context) (context
 	simpleCancel := func() {
 		cancelCause(context.Canceled)
 	}
-	return ctx, simpleCancel
+	merged := &mergedValuesContext{
+		Context:      ctx,
+		valueSources: contexts,
+	}
+	return merged, simpleCancel
 }
 
 func mapToError[T any](arr *array[T], fn func(T) error) error {

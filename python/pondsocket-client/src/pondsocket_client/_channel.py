@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 from collections import deque
 from collections.abc import Callable
-from typing import Any, TypeAlias
+from typing import TypeAlias
 
 from pondsocket_common import (
     BehaviorSubject,
@@ -39,20 +39,29 @@ class ResponseTimeoutError(Exception):
     pass
 
 
+class ChannelQueueFullError(Exception):
+    pass
+
+
 class Channel:
     __slots__ = (
         "_closed",
+        "_closing",
         "_connection_state",
         "_connection_unsub",
+        "_drain_task",
         "_events",
+        "_join_generation",
+        "_join_request_id",
+        "_max_queue_size",
         "_params",
+        "_pending_join",
         "_pending_responses",
         "_presence",
         "_publisher",
         "_queue",
         "_response_timeout",
         "_state",
-        "_tasks",
         "name",
     )
 
@@ -73,19 +82,21 @@ class Channel:
         self._state: BehaviorSubject[ChannelState] = BehaviorSubject(ChannelState.IDLE)
         self._events: Subject[ChannelEvent] = Subject()
         self._presence: list[PondPresence] = []
-        self._queue: deque[ClientMessage] = deque(maxlen=max_queue_size)
+        self._join_generation = 0
+        self._join_request_id: str | None = None
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be greater than zero")
+        self._max_queue_size = max_queue_size
+        self._queue: deque[ClientMessage] = deque()
+        self._pending_join: ClientMessage | None = None
         self._pending_responses: dict[str, asyncio.Future[PondMessage]] = {}
         self._response_timeout = response_timeout
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._drain_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._closing = False
         self._connection_unsub: Unsubscribe = self._connection_state.subscribe(
             self.handle_connection_state
         )
-
-    def _spawn(self, coro: Any) -> None:
-        task = asyncio.create_task(coro)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
 
     @property
     def channel_state(self) -> ChannelState:
@@ -97,17 +108,17 @@ class Channel:
         return list(self._presence)
 
     def join(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             return
         state = self.channel_state
         if state in (ChannelState.JOINING, ChannelState.JOINED, ChannelState.DECLINED):
             return
         self._state.publish(ChannelState.JOINING)
-        msg = self._build_join_message()
-        self._enqueue_or_send(msg)
+        self._prepare_join()
+        self._ensure_drain()
 
     def leave(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             return
         msg = ClientMessage(
             action=ClientActions.LEAVE_CHANNEL,
@@ -116,14 +127,18 @@ class Channel:
             requestId=uuid(),
             payload={},
         )
-        if self._connection_state.value == ConnectionState.CONNECTED:
-            self._spawn(self._publish(msg))
+        self._closing = True
         self._state.publish(ChannelState.CLOSED)
-        self._closed = True
-        self._teardown()
+        self._pending_join = None
+        if self._connection_state.value != ConnectionState.CONNECTED:
+            self._queue.clear()
+            self._finish_close()
+            return
+        self._queue.append(msg)
+        self._ensure_drain()
 
     def send_message(self, event: str, payload: PondMessage | None = None) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             return
         msg = ClientMessage(
             action=ClientActions.BROADCAST,
@@ -132,7 +147,7 @@ class Channel:
             requestId=uuid(),
             payload=dict(payload or {}),
         )
-        self._enqueue_or_send(msg)
+        self._enqueue(msg)
 
     async def send_for_response(
         self,
@@ -141,7 +156,7 @@ class Channel:
         *,
         wait: float | None = None,
     ) -> PondMessage:
-        if self._closed:
+        if self._closed or self._closing:
             raise ResponseTimeoutError("channel is closed")
         request_id = uuid()
         loop = asyncio.get_running_loop()
@@ -154,7 +169,11 @@ class Channel:
             requestId=request_id,
             payload=dict(payload or {}),
         )
-        self._enqueue_or_send(msg)
+        try:
+            self._enqueue(msg)
+        except Exception:
+            self._pending_responses.pop(request_id, None)
+            raise
         wait_seconds = wait if wait is not None else self._response_timeout
         try:
             return await asyncio.wait_for(fut, timeout=wait_seconds)
@@ -164,9 +183,10 @@ class Channel:
             ) from e
         finally:
             self._pending_responses.pop(request_id, None)
+            self._remove_queued_request(request_id)
 
     def handle_event(self, event: ChannelEvent) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             return
         if isinstance(event, PresenceMessage):
             self._presence = [dict(p) for p in event.payload.presence]
@@ -181,10 +201,14 @@ class Channel:
             return
         if event.action == ServerActions.SYSTEM:
             if event.event == Events.ACKNOWLEDGE.value:
+                if not self._is_current_join_response(event.request_id):
+                    return
                 self._acknowledge()
                 return
             if event.event in (Events.UNAUTHORIZED.value, Events.NOT_FOUND.value):
                 if self.channel_state in (ChannelState.JOINING, ChannelState.STALLED):
+                    if not self._is_current_join_response(event.request_id):
+                        return
                     self._decline()
                 return
         if self.channel_state == ChannelState.JOINED:
@@ -194,24 +218,19 @@ class Channel:
         if self._closed:
             return
         if state == ConnectionState.CONNECTED:
-            if self.channel_state == ChannelState.STALLED:
-                msg = self._build_join_message()
-                self._spawn(self._publish(msg))
-                return
-            if self.channel_state == ChannelState.JOINING:
-                self._drain_queued_joins()
+            if (
+                self.channel_state in (ChannelState.JOINING, ChannelState.STALLED)
+                and self._pending_join is None
+            ):
+                self._prepare_join()
+            if self._closing or self.channel_state in (
+                ChannelState.JOINING,
+                ChannelState.STALLED,
+            ):
+                self._ensure_drain()
         elif state == ConnectionState.DISCONNECTED:
-            if self.channel_state == ChannelState.JOINED:
+            if self.channel_state in (ChannelState.JOINING, ChannelState.JOINED):
                 self._state.publish(ChannelState.STALLED)
-
-    def _drain_queued_joins(self) -> None:
-        remaining: deque[ClientMessage] = deque(maxlen=self._queue.maxlen)
-        for msg in self._queue:
-            if msg.action == ClientActions.JOIN_CHANNEL:
-                self._spawn(self._publish(msg))
-            else:
-                remaining.append(msg)
-        self._queue = remaining
 
     def on_channel_state_change(self, callback: ChannelStateHandler) -> Unsubscribe:
         return self._state.subscribe(callback)
@@ -266,46 +285,90 @@ class Channel:
             payload=dict(self._params),
         )
 
-    def _enqueue_or_send(self, msg: ClientMessage) -> None:
-        if (
-            self._connection_state.value == ConnectionState.CONNECTED
-            and self.channel_state == ChannelState.JOINED
-        ):
-            self._spawn(self._publish(msg))
-            return
-        is_join = msg.action == ClientActions.JOIN_CHANNEL
-        if self._connection_state.value == ConnectionState.CONNECTED and is_join:
-            self._spawn(self._publish(msg))
-            return
-        self._queue.append(msg)
+    def _prepare_join(self) -> None:
+        msg = self._build_join_message()
+        self._join_generation += 1
+        self._join_request_id = msg.request_id
+        self._pending_join = msg
 
-    def _flush_queue(self) -> None:
-        if not self._queue:
+    def _is_current_join_response(self, request_id: str) -> bool:
+        if self._join_generation <= 1:
+            return True
+        return request_id == self._join_request_id
+
+    def _enqueue(self, msg: ClientMessage) -> None:
+        if len(self._queue) >= self._max_queue_size:
+            raise ChannelQueueFullError(
+                f"channel {self.name!r} outbound queue is full "
+                f"(max {self._max_queue_size})"
+            )
+        self._queue.append(msg)
+        self._ensure_drain()
+
+    def _remove_queued_request(self, request_id: str) -> None:
+        self._queue = deque(
+            msg for msg in self._queue if msg.request_id != request_id
+        )
+
+    def _ensure_drain(self) -> None:
+        if self._closed:
             return
-        pending = list(self._queue)
-        self._queue.clear()
-        for msg in pending:
-            self._spawn(self._publish(msg))
+        if self._drain_task is not None and not self._drain_task.done():
+            return
+        self._drain_task = asyncio.create_task(self._drain())
+        self._drain_task.add_done_callback(self._on_drain_done)
+
+    def _on_drain_done(self, task: asyncio.Task[None]) -> None:
+        if self._drain_task is task:
+            self._drain_task = None
+        if not task.cancelled():
+            task.exception()
+
+    async def _drain(self) -> None:
+        while not self._closed:
+            if self._connection_state.value != ConnectionState.CONNECTED:
+                return
+            if self._pending_join is not None:
+                msg = self._pending_join
+                try:
+                    await self._publisher(msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return
+                if self._pending_join is msg:
+                    self._pending_join = None
+                continue
+            if not self._queue:
+                return
+            if not self._closing and self.channel_state != ChannelState.JOINED:
+                return
+            msg = self._queue[0]
+            try:
+                await self._publisher(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+            if self._queue and self._queue[0] is msg:
+                self._queue.popleft()
+            if msg.action == ClientActions.LEAVE_CHANNEL:
+                self._finish_close()
+                return
 
     def _acknowledge(self) -> None:
         if self.channel_state not in (ChannelState.JOINING, ChannelState.STALLED):
             return
+        self._join_request_id = None
         self._state.publish(ChannelState.JOINED)
-        self._flush_queue()
+        self._ensure_drain()
 
     def _decline(self) -> None:
         self._state.publish(ChannelState.DECLINED)
-        self._queue.clear()
-        for fut in self._pending_responses.values():
-            if not fut.done():
-                fut.cancel()
-        self._pending_responses.clear()
-
-    async def _publish(self, msg: ClientMessage) -> None:
-        try:
-            await self._publisher(msg)
-        except Exception:
-            return
+        self._join_request_id = None
+        self._pending_join = None
+        self._closed = True
+        self._teardown()
 
     def _teardown(self) -> None:
         with contextlib.suppress(Exception):
@@ -317,21 +380,32 @@ class Channel:
         self._queue.clear()
         self._events.close()
 
-    def _force_close(self) -> None:
+    def _finish_close(self) -> None:
+        self._closed = True
+        self._closing = False
+        self._teardown()
+
+    def _force_close(self) -> asyncio.Task[None] | None:
         if self._closed:
-            return
+            return self._drain_task
         self._state.publish(ChannelState.CLOSED)
         self._closed = True
+        self._closing = False
+        task = self._drain_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
         self._teardown()
+        return task
 
     def _close_state_subject(self) -> None:
         self._state.close()
 
-
-_publisher_alias: Any = Publisher
+    def _is_replaceable(self) -> bool:
+        return self._closed or self.channel_state == ChannelState.DECLINED
 
 __all__ = [
     "Channel",
+    "ChannelQueueFullError",
     "ChannelStateHandler",
     "MessageHandler",
     "PresenceHandler",

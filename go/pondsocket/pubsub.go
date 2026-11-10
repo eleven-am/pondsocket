@@ -29,6 +29,14 @@ type PubSub interface {
 	Close() error
 }
 
+// ManagedPubSub is an optional extension that lets a subscriber release only
+// the handler it registered. PondSocket uses it when available so one channel
+// cannot accidentally unsubscribe another channel sharing the same topic.
+// Existing PubSub implementations remain source compatible.
+type ManagedPubSub interface {
+	SubscribeWithCancel(pattern string, handler func(topic string, data []byte)) (func() error, error)
+}
+
 type PubSubMessage struct {
 	Topic string
 	Data  []byte

@@ -125,11 +125,11 @@ func TestManagerCreateEndpoint(t *testing.T) {
 }
 
 func TestManagerOriginChecking(t *testing.T) {
-	t.Run("allows all origins when CheckOrigin is false", func(t *testing.T) {
+	t.Run("allows all origins only with explicit opt out", func(t *testing.T) {
 		ctx := context.Background()
 
 		opts := Options{
-			CheckOrigin: false,
+			AllowAnyOrigin: true,
 		}
 		mgr := NewManager(ctx, opts)
 
@@ -138,7 +138,25 @@ func TestManagerOriginChecking(t *testing.T) {
 		req.Header.Set("Origin", "http://localhost:3000")
 
 		if !mgr.upgrader.CheckOrigin(req) {
-			t.Error("expected origin check to pass when CheckOrigin is false")
+			t.Error("expected origin check to pass when AllowAnyOrigin is true")
+		}
+	})
+
+	t.Run("defaults to same-origin and permits non-browser clients", func(t *testing.T) {
+		mgr := NewManager(context.Background())
+		req := httptest.NewRequest("GET", "https://socket.example/ws", nil)
+		req.Host = "socket.example"
+		req.Header.Set("Origin", "https://socket.example")
+		if !mgr.upgrader.CheckOrigin(req) {
+			t.Error("expected same-origin browser request to pass")
+		}
+		req.Header.Set("Origin", "https://evil.example")
+		if mgr.upgrader.CheckOrigin(req) {
+			t.Error("expected cross-origin browser request to fail")
+		}
+		req.Header.Del("Origin")
+		if !mgr.upgrader.CheckOrigin(req) {
+			t.Error("expected client without Origin header to pass")
 		}
 	})
 
@@ -189,6 +207,75 @@ func TestManagerOriginChecking(t *testing.T) {
 			t.Error("expected non-matching origin to fail check")
 		}
 	})
+
+	t.Run("CheckOriginFunc receives the request and can compare against its host", func(t *testing.T) {
+		ctx := context.Background()
+
+		opts := Options{
+			CheckOrigin: true,
+			CheckOriginFunc: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				return origin == "https://"+r.Host
+			},
+		}
+		mgr := NewManager(ctx, opts)
+
+		req := httptest.NewRequest("GET", "/ws", nil)
+		req.Host = "tenant-a.example.com"
+		req.Header.Set("Origin", "https://tenant-a.example.com")
+
+		if !mgr.upgrader.CheckOrigin(req) {
+			t.Error("expected origin matching the request host to pass check")
+		}
+
+		req.Header.Set("Origin", "https://tenant-b.example.com")
+
+		if mgr.upgrader.CheckOrigin(req) {
+			t.Error("expected origin not matching the request host to fail check")
+		}
+	})
+
+	t.Run("CheckOriginFunc takes precedence over AllowedOrigins", func(t *testing.T) {
+		ctx := context.Background()
+
+		opts := Options{
+			CheckOrigin:    true,
+			AllowedOrigins: []string{"http://localhost:3000"},
+			CheckOriginFunc: func(r *http.Request) bool {
+				return false
+			},
+		}
+		mgr := NewManager(ctx, opts)
+
+		req := httptest.NewRequest("GET", "/ws", nil)
+		req.Header.Set("Origin", "http://localhost:3000")
+
+		if mgr.upgrader.CheckOrigin(req) {
+			t.Error("expected CheckOriginFunc to override the AllowedOrigins list")
+		}
+	})
+}
+
+func TestManagerSSECORSPreflight(t *testing.T) {
+	opts := *DefaultOptions()
+	opts.CORSAllowOrigin = "https://app.example"
+	opts.CORSAllowCredentials = true
+	mgr := NewManager(context.Background(), opts)
+	mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error { return ctx.Accept() })
+
+	req := httptest.NewRequest(http.MethodOptions, "/events", nil)
+	response := httptest.NewRecorder()
+	mgr.HTTPHandler().ServeHTTP(response, req)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+		t.Fatalf("allow origin = %q", got)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "X-Connection-ID") {
+		t.Fatalf("allow headers = %q", got)
+	}
 }
 
 func TestManagerHTTPHandler(t *testing.T) {
@@ -449,6 +536,69 @@ func TestManagerSSEMessageHandler(t *testing.T) {
 			t.Errorf("expected status 404, got %d", resp.StatusCode)
 		}
 	})
+
+	t.Run("rejects request body larger than configured message size", func(t *testing.T) {
+		ctx := context.Background()
+		opts := *DefaultOptions()
+		opts.MaxMessageSize = 8
+		mgr := NewManager(ctx, opts)
+
+		mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error {
+			return ctx.Accept()
+		})
+
+		handler := mgr.HTTPHandler()
+		req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader("123456789"))
+		req.Header.Set("X-Connection-ID", "any-id")
+		recorder := httptest.NewRecorder()
+
+		handler.ServeHTTP(recorder, req)
+
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("expected status 413, got %d", recorder.Code)
+		}
+	})
+}
+
+func TestManagerSSERequestCancellationClosesConnection(t *testing.T) {
+	managerCtx, managerCancel := context.WithCancel(context.Background())
+	defer managerCancel()
+	opts := *DefaultOptions()
+	opts.PingInterval = 10 * time.Millisecond
+	mgr := NewManager(managerCtx, opts)
+	endpoint := mgr.CreateEndpoint("/events", func(ctx *ConnectionContext) error {
+		return ctx.Accept()
+	})
+	server := httptest.NewServer(mgr.HTTPHandler())
+	defer server.Close()
+
+	requestCtx, requestCancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, server.URL+"/events", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to establish SSE connection: %v", err)
+	}
+	if resp.Header.Get("X-Connection-ID") == "" {
+		t.Fatal("SSE response did not expose a connection ID")
+	}
+	if endpoint.connections.Len() != 1 {
+		t.Fatalf("expected one active SSE connection, got %d", endpoint.connections.Len())
+	}
+
+	requestCancel()
+	_ = resp.Body.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for endpoint.connections.Len() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if endpoint.connections.Len() != 0 {
+		t.Fatalf("cancelled SSE request retained %d connections", endpoint.connections.Len())
+	}
 }
 
 func TestManagerSSEDisconnectHandler(t *testing.T) {

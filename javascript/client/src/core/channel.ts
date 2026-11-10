@@ -29,10 +29,31 @@ import {
 
 import { ClientMessage, ConnectionState, Publisher } from '../types';
 
+type QueuedMessage = {
+    message: ClientMessage;
+    onPublished?: () => void;
+    onDropped?: (error: Error) => void;
+};
+
+const clonePresence = <T>(value: T): T => {
+    if (Array.isArray(value)) {
+        return value.map((item) => clonePresence(item)) as T;
+    }
+
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(
+            Object.entries(value as Record<string, unknown>)
+                .map(([key, item]) => [key, clonePresence(item)]),
+        ) as T;
+    }
+
+    return value;
+};
+
 export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     readonly #name: string;
 
-    #queue: ClientMessage[];
+    #queue: QueuedMessage[];
 
     #presence: PresenceOf<Schema>[];
 
@@ -62,7 +83,7 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
 
     #connectionWaitSub: Unsubscribe | null;
 
-    readonly #pendingResponseCleanups: Set<Unsubscribe>;
+    readonly #pendingResponseCleanups: Set<(error?: Error) => void>;
 
     constructor (
         publisher: Publisher,
@@ -104,7 +125,7 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
      * @desc Gets the current presence of the channel.
      */
     public get presence (): PresenceOf<Schema>[] {
-        return this.#presence;
+        return clonePresence(this.#presence);
     }
 
     public get joinError (): PondErrorPayload | null {
@@ -125,6 +146,8 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
         }
 
         this.#clearJoinTimeout();
+        this.#connectionWaitSub?.();
+        this.#connectionWaitSub = null;
         this.#pendingJoinRequestId = null;
         this.#lastError = null;
         this.#joinState.publish(ChannelState.JOINED);
@@ -148,10 +171,12 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
         }
 
         this.#clearJoinTimeout();
+        this.#connectionWaitSub?.();
+        this.#connectionWaitSub = null;
         this.#pendingJoinRequestId = null;
         this.#lastError = payload;
         this.#joinState.publish(ChannelState.DECLINED);
-        this.#queue = [];
+        this.#dropQueue(new Error(`Channel "${this.#name}" join was declined`));
         this.#errorSubject.publish(payload);
     }
 
@@ -168,19 +193,7 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
         if (this.#clientState.value === ConnectionState.CONNECTED) {
             this.#sendJoinRequest();
         } else {
-            this.#connectionWaitSub?.();
-            const unsubscribe = this.#clientState.subscribe((state) => {
-                if (state === ConnectionState.CONNECTED) {
-                    unsubscribe();
-                    this.#connectionWaitSub = null;
-
-                    if (this.#joinState.value === ChannelState.JOINING) {
-                        this.#sendJoinRequest();
-                    }
-                }
-            });
-
-            this.#connectionWaitSub = unsubscribe;
+            this.#waitForConnection(false);
         }
     }
 
@@ -203,10 +216,12 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
         this.#clearJoinTimeout();
         this.#connectionWaitSub?.();
         this.#connectionWaitSub = null;
-        this.#pendingResponseCleanups.forEach((cleanup) => cleanup());
+        const closedError = new Error(`Channel "${this.#name}" was closed`);
+
+        [...this.#pendingResponseCleanups].forEach((cleanup) => cleanup(closedError));
         this.#pendingResponseCleanups.clear();
         this.#pendingJoinRequestId = null;
-        this.#queue = [];
+        this.#dropQueue(closedError);
         this.#joinState.publish(ChannelState.CLOSED);
         this.#presenceSub();
         this.#receiver.close();
@@ -336,27 +351,40 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
         const requestId = uuid();
 
         return new Promise<ResponseForEvent<EventsOf<Schema>, Event>>((resolve, reject) => {
-            const cleanup = { timer: undefined as ReturnType<typeof setTimeout> | undefined,
-                unsub: () => {} };
-            const finish = () => {
-                clearTimeout(cleanup.timer);
-                cleanup.unsub();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            let settled = false;
+            let unsubscribe: Unsubscribe = () => {};
+            const finish = (error?: Error) => {
+                if (settled) {
+                    return false;
+                }
+
+                settled = true;
+                if (timer) {
+                    clearTimeout(timer);
+                    timer = undefined;
+                }
+                unsubscribe();
+                this.#removeQueuedMessage(requestId);
                 this.#pendingResponseCleanups.delete(finish);
+                if (error) {
+                    reject(error);
+                }
+
+                return true;
             };
 
-            cleanup.unsub = this.#onMessage((_, message, responseId) => {
-                if (requestId === responseId) {
-                    finish();
+            unsubscribe = this.#onMessage((_, message, responseId) => {
+                if (requestId === responseId && finish()) {
                     resolve(message as ResponseForEvent<EventsOf<Schema>, Event>);
                 }
             });
 
-            cleanup.timer = setTimeout(() => {
-                finish();
-                reject(new Error(`sendForResponse timed out after ${timeoutMs}ms for event "${String(sentEvent)}"`));
-            }, timeoutMs);
-            (cleanup.timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
             this.#pendingResponseCleanups.add(finish);
+            timer = setTimeout(() => {
+                finish(new Error(`sendForResponse timed out after ${timeoutMs}ms for event "${String(sentEvent)}"`));
+            }, timeoutMs);
+            (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
 
             const message: ClientMessage = {
                 action: ClientActions.BROADCAST,
@@ -366,7 +394,13 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
                 payload,
             };
 
-            this.#publish(message);
+            try {
+                this.#publish(message, {
+                    onDropped: (error) => finish(error),
+                });
+            } catch (error) {
+                finish(error instanceof Error ? error : new Error(String(error)));
+            }
         });
     }
 
@@ -375,10 +409,19 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
      * @private
      */
     #emptyQueue () {
-        this.#queue
-            .forEach((message) => this.#publisher(message));
+        while (this.#queue.length > 0) {
+            const entry = this.#queue[0];
 
-        this.#queue = [];
+            try {
+                this.#dispatch(entry);
+                this.#queue.shift();
+            } catch (error) {
+                this.#joinState.publish(ChannelState.STALLED);
+                return error instanceof Error ? error : new Error(String(error));
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -405,7 +448,7 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
         });
 
         const unsubPresence = this.#subscribeToPresence((_, payload) => {
-            this.#presence = payload.presence;
+            this.#presence = clonePresence(payload.presence);
         });
 
         this.#presenceSub = () => {
@@ -433,23 +476,72 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
      * @param data - The message to publish.
      * @private
      */
-    #publish (data: ClientMessage) {
-        if (this.#joinState.value === ChannelState.JOINED) {
-            return this.#publisher(data);
-        }
+    #publish (data: ClientMessage, hooks: Omit<QueuedMessage, 'message'> = {}) {
+        const entry: QueuedMessage = {
+            message: data,
+            ...hooks,
+        };
 
         if ([ChannelState.DECLINED, ChannelState.CLOSED].includes(this.#joinState.value as ChannelState)) {
             throw new Error(`Cannot send messages while channel "${this.#name}" is ${this.#joinState.value}`);
         }
 
         if (this.#queue.length >= this.#maxQueueSize) {
-            this.#queue.shift();
+            const error = new Error(`Channel "${this.#name}" message queue capacity was exceeded`);
+
+            entry.onDropped?.(error);
+            this.#errorSubject.publish({
+                code: ErrorTypes.CHANNEL_ERROR,
+                message: error.message,
+                status: 429,
+                statusCode: 429,
+            });
+
+            throw error;
         }
 
-        this.#queue.push(data);
+        this.#queue.push(entry);
+        if (this.#joinState.value === ChannelState.JOINED) {
+            const error = this.#emptyQueue();
+
+            if (error) {
+                throw error;
+            }
+        }
+    }
+
+    #dispatch (entry: QueuedMessage) {
+        try {
+            this.#publisher(entry.message);
+            entry.onPublished?.();
+        } catch (error) {
+            const failure = error instanceof Error ? error : new Error(String(error));
+
+            this.#errorSubject.publish({
+                code: ErrorTypes.CHANNEL_ERROR,
+                message: failure.message,
+                status: 503,
+                statusCode: 503,
+            });
+            throw failure;
+        }
+    }
+
+    #dropQueue (error: Error) {
+        const queue = this.#queue;
+
+        this.#queue = [];
+        queue.forEach((entry) => entry.onDropped?.(error));
+    }
+
+    #removeQueuedMessage (requestId: string) {
+        this.#queue = this.#queue.filter((entry) => entry.message.requestId !== requestId);
     }
 
     #sendJoinRequest () {
+        if (this.#pendingJoinRequestId) {
+            return;
+        }
         const requestId = uuid();
         const message: ClientMessage = {
             action: ClientActions.JOIN_CHANNEL,
@@ -461,7 +553,26 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
 
         this.#clearJoinTimeout();
         this.#pendingJoinRequestId = requestId;
-        this.#publisher(message);
+        try {
+            this.#publisher(message);
+        } catch (error) {
+            if (this.#pendingJoinRequestId === requestId) {
+                this.#pendingJoinRequestId = null;
+            }
+            this.#joinState.publish(ChannelState.STALLED);
+            const failure = error instanceof Error ? error : new Error(String(error));
+
+            this.#errorSubject.publish({
+                code: ErrorTypes.CHANNEL_ERROR,
+                message: failure.message,
+                status: 503,
+                statusCode: 503,
+            });
+            this.#waitForConnection(true);
+
+            return;
+        }
+        this.#watchJoinAttempt(requestId);
         this.#joinTimeoutId = setTimeout(() => {
             if (this.#pendingJoinRequestId !== requestId) {
                 return;
@@ -475,6 +586,51 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
             }, requestId);
         }, this.#joinTimeoutMs);
         (this.#joinTimeoutId as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+    }
+
+    #waitForConnection (requireDisconnect: boolean) {
+        this.#connectionWaitSub?.();
+        let observedDisconnect = !requireDisconnect && this.#clientState.value !== ConnectionState.CONNECTED;
+        let unsubscribe: Unsubscribe = () => {};
+
+        unsubscribe = this.#clientState.subscribe((state) => {
+            if (state !== ConnectionState.CONNECTED) {
+                observedDisconnect = true;
+
+                return;
+            }
+            if (!observedDisconnect) {
+                return;
+            }
+
+            unsubscribe();
+            this.#connectionWaitSub = null;
+            if ([ChannelState.JOINING, ChannelState.STALLED].includes(this.#joinState.value as ChannelState)) {
+                this.#sendJoinRequest();
+            }
+        });
+        this.#connectionWaitSub = unsubscribe;
+    }
+
+    #watchJoinAttempt (requestId: string) {
+        this.#connectionWaitSub?.();
+        let unsubscribe: Unsubscribe = () => {};
+
+        unsubscribe = this.#clientState.subscribe((state) => {
+            if (state === ConnectionState.CONNECTED || this.#pendingJoinRequestId !== requestId) {
+                return;
+            }
+
+            unsubscribe();
+            this.#connectionWaitSub = null;
+            this.#clearJoinTimeout();
+            this.#pendingJoinRequestId = null;
+            if ([ChannelState.JOINING, ChannelState.STALLED].includes(this.#joinState.value as ChannelState)) {
+                this.#joinState.publish(ChannelState.STALLED);
+                this.#waitForConnection(false);
+            }
+        });
+        this.#connectionWaitSub = unsubscribe;
     }
 
     #clearJoinTimeout () {
@@ -492,7 +648,7 @@ export class Channel<Schema extends AnyPondSchema = AnyPondSchema> {
     #subscribeToPresence (callback: (event: PresenceEventTypes, payload: PresencePayload) => void) {
         return this.#receiver.subscribe((data) => {
             if (data.action === ServerActions.PRESENCE) {
-                return callback(data.event, data.payload);
+                return callback(data.event, clonePresence(data.payload));
             }
         });
     }

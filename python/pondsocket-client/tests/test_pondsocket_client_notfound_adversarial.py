@@ -65,6 +65,7 @@ async def test_ack_then_not_found_is_ignored_and_stays_joined() -> None:
     channel.join()
     channel.handle_event(_system(Events.ACKNOWLEDGE.value))
     channel.send_message("queued", {"n": 1})
+    await asyncio.sleep(0)
     channel.handle_event(_system(Events.NOT_FOUND.value))
     assert channel.channel_state == ChannelState.JOINED
     assert len(channel._queue) == 0  # type: ignore[attr-defined]

@@ -9,7 +9,7 @@ use pondsocket_common::{
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -58,8 +58,12 @@ pub enum ClientError {
     NotConnected,
     #[error("channel is closed")]
     ChannelClosed,
+    #[error("channel join was declined")]
+    ChannelDeclined,
     #[error("response timed out")]
     ResponseTimeout,
+    #[error("max_queue_size must be greater than zero")]
+    InvalidQueueCapacity,
 }
 
 type Result<T> = std::result::Result<T, ClientError>;
@@ -78,6 +82,7 @@ struct ClientInner {
     outbound: Mutex<Option<mpsc::Sender<ClientMessage>>>,
     read_task: Mutex<Option<JoinHandle<()>>>,
     write_task: Mutex<Option<JoinHandle<()>>>,
+    lifecycle_lock: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -93,7 +98,10 @@ struct ChannelInner {
     events: broadcast::Sender<ChannelEvent>,
     presence: Mutex<Vec<PondPresence>>,
     queue: Mutex<VecDeque<ClientMessage>>,
-    pending: Mutex<HashMap<String, oneshot::Sender<PondMessage>>>,
+    queue_space: Notify,
+    send_lock: Mutex<()>,
+    pending: Mutex<HashMap<String, oneshot::Sender<Result<PondMessage>>>>,
+    pending_join: Mutex<Option<String>>,
     decline_reason: Mutex<Option<PondMessage>>,
     conn_task: Mutex<Option<JoinHandle<()>>>,
     closed: Mutex<bool>,
@@ -109,6 +117,9 @@ impl PondClient {
         params: Option<JoinParams>,
         options: ClientOptions,
     ) -> Result<Self> {
+        if options.max_queue_size == 0 {
+            return Err(ClientError::InvalidQueueCapacity);
+        }
         let url = resolve_url(endpoint.as_ref(), params.as_ref())?;
         let (state, _) = watch::channel(ConnectionState::Disconnected);
         let (conn_events, _) = broadcast::channel(16);
@@ -123,6 +134,7 @@ impl PondClient {
                 outbound: Mutex::new(None),
                 read_task: Mutex::new(None),
                 write_task: Mutex::new(None),
+                lifecycle_lock: Mutex::new(()),
             }),
         })
     }
@@ -160,7 +172,10 @@ impl PondClient {
                 events,
                 presence: Mutex::new(Vec::new()),
                 queue: Mutex::new(VecDeque::new()),
+                queue_space: Notify::new(),
+                send_lock: Mutex::new(()),
                 pending: Mutex::new(HashMap::new()),
+                pending_join: Mutex::new(None),
                 decline_reason: Mutex::new(None),
                 conn_task: Mutex::new(None),
                 closed: Mutex::new(false),
@@ -173,7 +188,10 @@ impl PondClient {
             loop {
                 match conn_rx.recv().await {
                     Ok(state) => watcher.on_connection_change(state).await,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let state = *watcher.inner.client.state.borrow();
+                        watcher.on_connection_change(state).await;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
                 if *watcher.inner.closed.lock().await {
@@ -188,14 +206,26 @@ impl PondClient {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        let _lifecycle = self.inner.lifecycle_lock.lock().await;
         if self.state() != ConnectionState::Disconnected {
             return Ok(());
         }
         self.inner.set_connection_state(ConnectionState::Connecting);
         let connect = connect_async(&self.inner.url);
-        let (socket, _) = tokio::time::timeout(self.inner.options.connection_timeout, connect)
-            .await
-            .map_err(|_| ClientError::ConnectionTimeout)??;
+        let (socket, _) =
+            match tokio::time::timeout(self.inner.options.connection_timeout, connect).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    self.inner
+                        .set_connection_state(ConnectionState::Disconnected);
+                    return Err(ClientError::WebSocket(error));
+                }
+                Err(_) => {
+                    self.inner
+                        .set_connection_state(ConnectionState::Disconnected);
+                    return Err(ClientError::ConnectionTimeout);
+                }
+            };
         let (mut writer, mut reader) = socket.split();
         let (tx, mut rx) = mpsc::channel::<ClientMessage>(self.inner.options.max_queue_size);
         *self.inner.outbound.lock().await = Some(tx);
@@ -213,6 +243,10 @@ impl PondClient {
         });
 
         let inner = Arc::clone(&self.inner);
+        // Publish Connected before the reader can observe an immediate peer
+        // close. Otherwise a fast reader exit can set Disconnected and then be
+        // overwritten by this connect call after the socket is already gone.
+        self.inner.set_connection_state(ConnectionState::Connected);
         let read_task = tokio::spawn(async move {
             while let Some(frame) = reader.next().await {
                 let text = match frame {
@@ -225,28 +259,24 @@ impl PondClient {
                     Ok(_) => continue,
                     Err(_) => break,
                 };
-                let Ok(event) = pondsocket_common::parse_channel_event(&text) else {
-                    continue;
-                };
-                inner.route_event(event).await;
+                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                    let Ok(event) = pondsocket_common::parse_channel_event(line) else {
+                        continue;
+                    };
+                    inner.route_event(event).await;
+                }
             }
-            inner.set_connection_state(ConnectionState::Disconnected);
             *inner.outbound.lock().await = None;
+            inner.set_connection_state(ConnectionState::Disconnected);
         });
 
         *self.inner.read_task.lock().await = Some(read_task);
         *self.inner.write_task.lock().await = Some(write_task);
-        self.inner.set_connection_state(ConnectionState::Connected);
         Ok(())
     }
 
     pub async fn disconnect(&self) {
-        if let Some(task) = self.inner.read_task.lock().await.take() {
-            task.abort();
-        }
-        if let Some(task) = self.inner.write_task.lock().await.take() {
-            task.abort();
-        }
+        let _lifecycle = self.inner.lifecycle_lock.lock().await;
         *self.inner.outbound.lock().await = None;
         self.inner
             .set_connection_state(ConnectionState::Disconnected);
@@ -255,6 +285,19 @@ impl PondClient {
             channel.force_close().await;
         }
         self.inner.channels.lock().await.clear();
+
+        if let Some(mut task) = self.inner.write_task.lock().await.take()
+            && tokio::time::timeout(self.inner.options.connection_timeout, &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.inner.read_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -326,8 +369,10 @@ impl Channel {
         ) {
             return;
         }
+        let message = self.join_message();
+        *self.inner.pending_join.lock().await = Some(message.request_id.clone());
         self.inner.state.send_replace(ChannelState::Joining);
-        self.enqueue_or_send(self.join_message()).await;
+        let _ = self.enqueue_or_send(message).await;
     }
 
     pub async fn leave(&self) {
@@ -346,8 +391,16 @@ impl Channel {
     }
 
     pub async fn send_message(&self, event: impl Into<String>, payload: Option<PondMessage>) {
+        let _ = self.send_message_checked(event, payload).await;
+    }
+
+    pub async fn send_message_checked(
+        &self,
+        event: impl Into<String>,
+        payload: Option<PondMessage>,
+    ) -> Result<()> {
         if *self.inner.closed.lock().await {
-            return;
+            return Err(ClientError::ChannelClosed);
         }
         let message = ClientMessage {
             action: ClientAction::Broadcast,
@@ -356,7 +409,7 @@ impl Channel {
             channel_name: self.inner.name.clone(),
             request_id: uuid(),
         };
-        self.enqueue_or_send(message).await;
+        self.enqueue_or_send(message).await
     }
 
     pub async fn send_for_response(
@@ -382,31 +435,65 @@ impl Channel {
             channel_name: self.inner.name.clone(),
             request_id: request_id.clone(),
         };
-        self.enqueue_or_send(message).await;
         let timeout = timeout.unwrap_or(self.inner.client.options.response_timeout);
-        let result = tokio::time::timeout(timeout, rx).await;
+        let started = tokio::time::Instant::now();
+        let queued = tokio::time::timeout(timeout, self.enqueue_or_send(message)).await;
+        match queued {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.inner.pending.lock().await.remove(&request_id);
+                return Err(error);
+            }
+            Err(_) => {
+                self.inner.pending.lock().await.remove(&request_id);
+                return Err(ClientError::ResponseTimeout);
+            }
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let result = tokio::time::timeout(remaining, rx).await;
         self.inner.pending.lock().await.remove(&request_id);
         match result {
-            Ok(Ok(payload)) => Ok(payload),
-            _ => Err(ClientError::ResponseTimeout),
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ClientError::ChannelClosed),
+            Err(_) => Err(ClientError::ResponseTimeout),
         }
     }
 
-    async fn enqueue_or_send(&self, message: ClientMessage) {
-        let connected = *self.inner.client.state.borrow() == ConnectionState::Connected;
-        let joined = self.state() == ChannelState::Joined;
-        let is_join = message.action == ClientAction::JoinChannel;
-        if connected
-            && (joined || is_join)
-            && self.inner.client.publish(message.clone()).await.is_ok()
-        {
-            return;
+    async fn enqueue_or_send(&self, message: ClientMessage) -> Result<()> {
+        loop {
+            if *self.inner.closed.lock().await {
+                return Err(ClientError::ChannelClosed);
+            }
+
+            let send_guard = self.inner.send_lock.lock().await;
+            let connected = *self.inner.client.state.borrow() == ConnectionState::Connected;
+            let joined = self.state() == ChannelState::Joined;
+            let is_join = message.action == ClientAction::JoinChannel;
+            if connected && (joined || is_join) {
+                match self.inner.client.publish(message.clone()).await {
+                    Ok(()) => return Ok(()),
+                    Err(ClientError::NotConnected) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let mut queue = self.inner.queue.lock().await;
+            if is_join {
+                queue.retain(|queued| queued.action != ClientAction::JoinChannel);
+                queue.push_front(message);
+                return Ok(());
+            }
+            if queue.len() < self.inner.client.options.max_queue_size {
+                queue.push_back(message);
+                return Ok(());
+            }
+            let notified = self.inner.queue_space.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(queue);
+            drop(send_guard);
+            notified.await;
         }
-        let mut queue = self.inner.queue.lock().await;
-        if queue.len() == self.inner.client.options.max_queue_size {
-            queue.pop_front();
-        }
-        queue.push_back(message);
     }
 
     async fn on_connection_change(&self, state: ConnectionState) {
@@ -415,17 +502,21 @@ impl Channel {
         }
         match state {
             ConnectionState::Disconnected => {
+                *self.inner.pending_join.lock().await = None;
                 if matches!(self.state(), ChannelState::Joined | ChannelState::Joining) {
                     self.inner.state.send_replace(ChannelState::Stalled);
                 }
             }
             ConnectionState::Connected => {
                 if matches!(self.state(), ChannelState::Stalled | ChannelState::Joining) {
+                    let _send_guard = self.inner.send_lock.lock().await;
                     self.inner
                         .queue
                         .lock()
                         .await
                         .retain(|message| message.action != ClientAction::JoinChannel);
+                    self.inner.queue_space.notify_waiters();
+                    drop(_send_guard);
                     self.inner.state.send_replace(ChannelState::Stalled);
                     self.join().await;
                 }
@@ -460,6 +551,12 @@ impl Channel {
             && message.event == event_name(EventName::Acknowledge)
         {
             if matches!(self.state(), ChannelState::Joining | ChannelState::Stalled) {
+                let mut pending_join = self.inner.pending_join.lock().await;
+                if pending_join.as_deref() != Some(message.request_id.as_str()) {
+                    return;
+                }
+                *pending_join = None;
+                drop(pending_join);
                 self.acknowledge().await;
             }
             return;
@@ -468,18 +565,22 @@ impl Channel {
             && message.event == event_name(EventName::Unauthorized)
             && matches!(self.state(), ChannelState::Joining | ChannelState::Stalled)
         {
-            self.decline(message.payload).await;
+            if self.take_matching_join(&message.request_id).await {
+                self.decline(message.payload).await;
+            }
             return;
         }
         if message.action == ServerAction::System
             && message.event == event_name(EventName::NotFound)
             && matches!(self.state(), ChannelState::Joining | ChannelState::Stalled)
         {
-            self.decline(message.payload).await;
+            if self.take_matching_join(&message.request_id).await {
+                self.decline(message.payload).await;
+            }
             return;
         }
         if let Some(tx) = self.inner.pending.lock().await.remove(&message.request_id) {
-            let _ = tx.send(message.payload);
+            let _ = tx.send(Ok(message.payload));
             return;
         }
         if self.state() == ChannelState::Joined {
@@ -488,31 +589,47 @@ impl Channel {
     }
 
     async fn acknowledge(&self) {
-        if self.state() != ChannelState::Joined {
-            self.inner.state.send_replace(ChannelState::Joined);
-        }
+        let _send_guard = self.inner.send_lock.lock().await;
         let mut queue = self.inner.queue.lock().await;
-        let pending: Vec<ClientMessage> = queue.drain(..).collect();
-        drop(queue);
-        for message in pending {
-            let _ = self.inner.client.publish(message).await;
+        queue.retain(|message| message.action != ClientAction::JoinChannel);
+        let mut pending: VecDeque<ClientMessage> = queue.drain(..).collect();
+        self.inner.state.send_replace(ChannelState::Joined);
+        while let Some(message) = pending.pop_front() {
+            if self.inner.client.publish(message.clone()).await.is_err() {
+                queue.push_back(message);
+                queue.append(&mut pending);
+                self.inner.state.send_replace(ChannelState::Stalled);
+                break;
+            }
         }
+        drop(queue);
+        self.inner.queue_space.notify_waiters();
     }
 
     async fn decline(&self, reason: PondMessage) {
         *self.inner.decline_reason.lock().await = Some(reason);
         self.inner.state.send_replace(ChannelState::Declined);
         self.inner.queue.lock().await.clear();
-        self.inner.pending.lock().await.clear();
+        self.inner.queue_space.notify_waiters();
+        let pending = std::mem::take(&mut *self.inner.pending.lock().await);
+        for (_, response) in pending {
+            let _ = response.send(Err(ClientError::ChannelDeclined));
+        }
     }
 
     async fn force_close(&self) {
         *self.inner.closed.lock().await = true;
         self.inner.state.send_replace(ChannelState::Closed);
         self.inner.queue.lock().await.clear();
-        self.inner.pending.lock().await.clear();
+        self.inner.queue_space.notify_waiters();
+        let pending = std::mem::take(&mut *self.inner.pending.lock().await);
+        for (_, response) in pending {
+            let _ = response.send(Err(ClientError::ChannelClosed));
+        }
+        *self.inner.pending_join.lock().await = None;
         if let Some(handle) = self.inner.conn_task.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
     }
 
@@ -524,6 +641,15 @@ impl Channel {
             channel_name: self.inner.name.clone(),
             request_id: uuid(),
         }
+    }
+
+    async fn take_matching_join(&self, request_id: &str) -> bool {
+        let mut pending = self.inner.pending_join.lock().await;
+        if pending.as_deref() != Some(request_id) {
+            return false;
+        }
+        *pending = None;
+        true
     }
 }
 
@@ -579,6 +705,53 @@ mod tests {
         params.insert("token".to_owned(), Value::String("abc".to_owned()));
         let url = resolve_url("https://example.com/socket?room=one", Some(&params)).unwrap();
         assert_eq!(url, "wss://example.com/socket?room=one&token=abc");
+    }
+
+    #[tokio::test]
+    async fn failed_connect_restores_disconnected_state_and_can_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = PondClient::with_options(
+            format!("ws://{addr}/socket"),
+            None,
+            ClientOptions {
+                connection_timeout: Duration::from_millis(100),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(client.connect().await.is_err());
+        assert_eq!(client.state(), ConnectionState::Disconnected);
+        assert!(client.connect().await.is_err());
+        assert_eq!(client.state(), ConnectionState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn immediate_peer_close_cannot_be_overwritten_by_connected_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let client = PondClient::new(format!("ws://{addr}/socket"), None).unwrap();
+        let mut state = client.subscribe_state();
+
+        client.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if *state.borrow() == ConnectionState::Disconnected {
+                    break;
+                }
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("client stayed connected after the peer closed immediately");
+        assert!(client.inner.outbound.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -1050,7 +1223,7 @@ mod tests {
             .await
             .expect("send_for_response hung after decline instead of returning")
             .unwrap();
-        assert!(joined.is_err());
+        assert!(matches!(joined, Err(ClientError::ChannelDeclined)));
         assert!(channel.inner.pending.lock().await.is_empty());
         assert!(channel.inner.queue.lock().await.is_empty());
     }
@@ -1313,7 +1486,7 @@ mod tests {
             .await
             .expect("request hung after leave")
             .unwrap();
-        assert!(result.is_err());
+        assert!(matches!(result, Err(ClientError::ChannelClosed)));
         assert_eq!(channel.state(), ChannelState::Closed);
     }
 
@@ -1412,7 +1585,7 @@ mod tests {
             .await
             .expect("request hung after eviction")
             .unwrap();
-        assert!(result.is_err());
+        assert!(matches!(result, Err(ClientError::ChannelClosed)));
         assert_eq!(channel.state(), ChannelState::Closed);
     }
 
@@ -1439,5 +1612,262 @@ mod tests {
             client.create_channel("ghost", None).await.state(),
             ChannelState::Idle
         );
+    }
+
+    #[test]
+    fn rejects_zero_queue_capacity() {
+        let options = ClientOptions {
+            max_queue_size: 0,
+            ..ClientOptions::default()
+        };
+        assert!(matches!(
+            PondClient::with_options("ws://example.com/socket", None, options),
+            Err(ClientError::InvalidQueueCapacity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_saturation_backpressures_without_dropping_oldest() {
+        let options = ClientOptions {
+            max_queue_size: 2,
+            ..ClientOptions::default()
+        };
+        let client = PondClient::with_options("ws://example.com/socket", None, options).unwrap();
+        let channel = client.create_channel("room", None).await;
+
+        channel
+            .send_message_checked(
+                "ordered",
+                Some(Map::from_iter([(String::from("n"), Value::from(1))])),
+            )
+            .await
+            .unwrap();
+        channel
+            .send_message_checked(
+                "ordered",
+                Some(Map::from_iter([(String::from("n"), Value::from(2))])),
+            )
+            .await
+            .unwrap();
+
+        let blocked = channel.clone();
+        let third = tokio::spawn(async move {
+            blocked
+                .send_message_checked(
+                    "ordered",
+                    Some(Map::from_iter([(String::from("n"), Value::from(3))])),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!third.is_finished());
+
+        let first = channel.inner.queue.lock().await.pop_front().unwrap();
+        assert_eq!(first.payload.get("n").and_then(Value::as_i64), Some(1));
+        channel.inner.queue_space.notify_waiters();
+        third.await.unwrap().unwrap();
+
+        let queue = channel.inner.queue.lock().await;
+        let order: Vec<i64> = queue
+            .iter()
+            .map(|message| message.payload.get("n").and_then(Value::as_i64).unwrap())
+            .collect();
+        assert_eq!(order, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn response_timeout_includes_time_waiting_for_queue_capacity() {
+        let options = ClientOptions {
+            max_queue_size: 1,
+            response_timeout: Duration::from_millis(30),
+            ..ClientOptions::default()
+        };
+        let client = PondClient::with_options("ws://example.com/socket", None, options).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.send_message("full", None).await;
+
+        let started = tokio::time::Instant::now();
+        let result = channel.send_for_response("ask", None, None).await;
+        assert!(matches!(result, Err(ClientError::ResponseTimeout)));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(channel.inner.pending.lock().await.is_empty());
+        assert_eq!(channel.inner.queue.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_join_ack_and_decline_do_not_complete_new_attempt() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joining);
+        *channel.inner.pending_join.lock().await = Some("new-attempt".to_owned());
+
+        let stale_ack = ServerMessage {
+            action: ServerAction::System,
+            event: event_name(EventName::Acknowledge),
+            channel_name: "room".to_owned(),
+            request_id: "old-attempt".to_owned(),
+            payload: Map::new(),
+        };
+        channel.handle_message(stale_ack).await;
+        assert_eq!(channel.state(), ChannelState::Joining);
+
+        let stale_decline = ServerMessage {
+            action: ServerAction::System,
+            event: event_name(EventName::Unauthorized),
+            channel_name: "room".to_owned(),
+            request_id: "old-attempt".to_owned(),
+            payload: Map::new(),
+        };
+        channel.handle_message(stale_decline).await;
+        assert_eq!(channel.state(), ChannelState::Joining);
+        assert!(channel.decline_reason().await.is_none());
+
+        let current_ack = ServerMessage {
+            action: ServerAction::System,
+            event: event_name(EventName::Acknowledge),
+            channel_name: "room".to_owned(),
+            request_id: "new-attempt".to_owned(),
+            payload: Map::new(),
+        };
+        channel.handle_message(current_ack).await;
+        assert_eq!(channel.state(), ChannelState::Joined);
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_flushes_queued_messages_before_new_sends() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let (tx, mut rx) = mpsc::channel(256);
+        *client.inner.outbound.lock().await = Some(tx);
+        client
+            .inner
+            .set_connection_state(ConnectionState::Connected);
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joining);
+        *channel.inner.pending_join.lock().await = Some("join".to_owned());
+
+        for n in 0..50 {
+            channel
+                .send_message_checked(
+                    "ordered",
+                    Some(Map::from_iter([(String::from("n"), Value::from(n))])),
+                )
+                .await
+                .unwrap();
+        }
+
+        let guard = channel.inner.send_lock.lock().await;
+        let acknowledging = channel.clone();
+        let ack = tokio::spawn(async move {
+            acknowledging
+                .handle_message(ServerMessage {
+                    action: ServerAction::System,
+                    event: event_name(EventName::Acknowledge),
+                    channel_name: "room".to_owned(),
+                    request_id: "join".to_owned(),
+                    payload: Map::new(),
+                })
+                .await;
+        });
+        tokio::task::yield_now().await;
+        let sender = channel.clone();
+        let after = tokio::spawn(async move {
+            for n in 50..100 {
+                sender
+                    .send_message_checked(
+                        "ordered",
+                        Some(Map::from_iter([(String::from("n"), Value::from(n))])),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        drop(guard);
+        ack.await.unwrap();
+        after.await.unwrap();
+
+        for expected in 0..100 {
+            let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                message.payload.get("n").and_then(Value::as_i64),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn newline_frame_preserves_valid_event_order_and_skips_bad_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut lines = Vec::new();
+            for n in 0..250 {
+                let message = ServerMessage {
+                    action: ServerAction::Broadcast,
+                    event: "ordered".to_owned(),
+                    channel_name: "room".to_owned(),
+                    request_id: n.to_string(),
+                    payload: Map::from_iter([(String::from("n"), Value::from(n))]),
+                };
+                lines.push(serde_json::to_string(&message).unwrap());
+                if n == 124 {
+                    lines.push("{bad-json}".to_owned());
+                }
+            }
+            socket
+                .send(Message::Text(lines.join("\n").into()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let client = PondClient::new(format!("ws://{addr}/socket"), None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        let mut events = channel.subscribe_events();
+        client.connect().await.unwrap();
+
+        for expected in 0..250 {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ChannelEvent::Message(message) = event else {
+                panic!("expected message event")
+            };
+            assert_eq!(message.request_id, expected.to_string());
+        }
+        client.disconnect().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broadcast_receiver_reports_lag_instead_of_silently_skipping() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        let mut events = channel.subscribe_events();
+
+        for n in 0..150 {
+            channel
+                .handle_message(ServerMessage {
+                    action: ServerAction::Broadcast,
+                    event: "ordered".to_owned(),
+                    channel_name: "room".to_owned(),
+                    request_id: n.to_string(),
+                    payload: Map::new(),
+                })
+                .await;
+        }
+
+        assert!(matches!(
+            events.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
     }
 }

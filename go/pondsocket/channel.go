@@ -21,13 +21,13 @@ type Channel struct {
 	leave                   *LeaveEventHandler
 	leaveMiddlewares        []LeaveMiddleware
 	store                   *store[map[string]interface{}]
-	channel                 chan internalEvent
 	connections             *store[Transport]
 	memberships             *store[*channelMembership]
 	middleware              *middleware[*messageEvent, *Channel]
 	outgoing                *middleware[*OutgoingContext, interface{}]
 	onDestroy               func() error
 	pubsub                  PubSub
+	unsubscribe             []func() error
 	nodeID                  string
 	ctx                     context.Context
 	cancel                  context.CancelFunc
@@ -42,6 +42,8 @@ type Channel struct {
 	heartbeatTimeout        time.Duration
 	internalQueueTimeout    time.Duration
 	hooks                   *Hooks
+	outboxes                *outboxes
+	sendBuffer              int
 }
 
 func newChannel(ctx context.Context, options options) *Channel {
@@ -59,7 +61,6 @@ func newChannel(ctx context.Context, options options) *Channel {
 		outgoing:             options.Outgoing,
 		connections:          newStore[Transport](),
 		memberships:          newStore[*channelMembership](),
-		channel:              make(chan internalEvent, 128),
 		middleware:           options.Middleware,
 		leave:                options.Leave,
 		leaveMiddlewares:     options.LeaveMiddlewares,
@@ -76,10 +77,13 @@ func newChannel(ctx context.Context, options options) *Channel {
 		heartbeatInterval:    30 * time.Second,
 		heartbeatTimeout:     90 * time.Second,
 		internalQueueTimeout: options.InternalQueueTimeout,
+		outboxes:             options.Outboxes,
+		sendBuffer:           options.SendBuffer,
+	}
+	if c.outboxes == nil {
+		c.outboxes = newOutboxes()
 	}
 	c.presence = newPresence(&c)
-
-	c.handleMessageEvents()
 
 	return &c
 }
@@ -107,7 +111,7 @@ func (c *Channel) Name() string {
 // RemoveUser removes a user from the channel, cleaning up their presence and assigns data.
 // This method is automatically called when a user disconnects or leaves the channel.
 // The reason parameter describes why the user is leaving (e.g., "disconnect", "evicted", "explicit_leave").
-// If a leave handler is configured, it will be called asynchronously after removal.
+// If a leave handler is configured, it is called in order after membership removal.
 // If this was the last user in the channel and an onDestroy handler is set, the channel will be destroyed.
 // In distributed setups, if the user is not on this node, the remove command
 // is published via PubSub for the node hosting the user to handle.
@@ -131,38 +135,43 @@ func (c *Channel) RemoveUser(userID string, reason string) error {
 		return userErr
 	}
 
-	err := c.removeUserLocal(user, userID, reason)
+	postRemove, err := c.removeUserLocal(user, userID, reason)
 	c.mutex.Unlock()
+	if err == nil && postRemove != nil {
+		err = postRemove()
+	}
 	return err
 }
 
-func (c *Channel) removeUserLocal(user *User, userID, reason string) error {
+func (c *Channel) removeUserLocal(user *User, userID, reason string) (func() error, error) {
 	return c.removeUserLocalWithDestroy(user, userID, reason, true)
 }
 
-func (c *Channel) removeUserLocalWithDestroy(user *User, userID, reason string, destroyWhenEmpty bool) error {
+func (c *Channel) removeUserLocalWithDestroy(user *User, userID, reason string, destroyWhenEmpty bool) (func() error, error) {
 	membershipErr := c.releaseMembership(userID, reason)
 	storeErr := c.store.Delete(userID)
-	presenceErr := c.presence.UnTrack(userID)
 	connectionErr := c.connections.Delete(userID)
-	combinedErr := combine(membershipErr, storeErr, presenceErr, connectionErr)
+	c.dropPending(userID)
+	combinedErr := combine(membershipErr, storeErr, connectionErr)
+	if combinedErr != nil {
+		return nil, wrapF(combinedErr, "failed to fully remove user %s resources", userID)
+	}
 
-	c.publishUserLeft(userID)
-
-	if c.leave != nil && user != nil {
-		go func(u User, channelName string, leaveReason string) {
-			leaveCtx := newLeaveContext(c.ctx, c, &u, leaveReason)
+	remainingUsers := c.store.Len()
+	postRemove := func() error {
+		presenceErr := c.presence.UnTrack(userID)
+		c.publishUserLeft(userID)
+		if c.leave != nil && user != nil {
+			u := *user
+			leaveCtx := newLeaveContext(c.ctx, c, &u, reason)
+			leaveCtx.connectionID = userID
 			if err := executeWithMiddleware(leaveCtx, func(ctx *LeaveContext) error {
 				return (*c.leave)(ctx)
 			}, c.leaveMiddlewares); err != nil {
 				c.reportError("leave_handler", err)
 			}
-		}(*user, c.name, reason)
-	}
-
-	remainingUsers := c.store.Len()
-	if destroyWhenEmpty && c.onDestroy != nil && remainingUsers == 0 {
-		go func() {
+		}
+		if destroyWhenEmpty && c.onDestroy != nil && remainingUsers == 0 {
 			if err := c.Close(); err != nil {
 				c.reportError("channel_close", err)
 			}
@@ -171,13 +180,11 @@ func (c *Channel) removeUserLocalWithDestroy(user *User, userID, reason string, 
 					c.reportError("channel_on_destroy", err)
 				}
 			}
-		}()
+		}
+		return presenceErr
 	}
 
-	if combinedErr != nil {
-		return wrapF(combinedErr, "failed to fully remove user %s resources", userID)
-	}
-	return nil
+	return postRemove, nil
 }
 
 func (c *Channel) releaseMembership(userID, reason string) error {
@@ -196,9 +203,13 @@ func (c *Channel) removeExpiredMembership(userID string, membership *channelMemb
 		c.mutex.Unlock()
 		return
 	}
-	user, err := c.getUserUnsafe(userID)
-	err = combine(err, c.removeUserLocal(user, userID, membership.reason()))
+	user, userErr := c.getUserUnsafe(userID)
+	postRemove, removeErr := c.removeUserLocal(user, userID, membership.reason())
 	c.mutex.Unlock()
+	if postRemove != nil {
+		removeErr = combine(removeErr, postRemove())
+	}
+	err = combine(userErr, removeErr)
 	if err != nil {
 		c.reportError("membership_cleanup", err)
 	}
@@ -273,20 +284,21 @@ func (c *Channel) evictUserLocal(userID, reason string) error {
 		Payload:     evictionPayload,
 	}
 
-	if err := c.sendMessage(string(channelEntity), recipients{userIds: []string{userID}}, systemEvent); err != nil {
-		return wrapF(err, "failed to send eviction system message to user %s", userID)
+	var deliveryErr error
+	if conn, err := c.connections.Read(userID); err == nil && conn != nil {
+		deliveryErr = c.deliverAndWait(conn, systemEvent)
 	}
 
 	if err := c.RemoveUser(userID, "evicted:"+reason); err != nil {
-		return wrapF(err, "failed to remove user %s during eviction", userID)
+		return combine(deliveryErr, wrapF(err, "failed to remove user %s during eviction", userID))
 	}
 
 	if err := c.checkState(); err != nil {
-		return nil
+		return deliveryErr
 	}
 
 	recp := all
-	return c.sendMessage(string(channelEntity), recipients{recipient: &recp}, broadcastEvent)
+	return combine(deliveryErr, c.sendMessage(string(channelEntity), recipients{recipient: &recp}, broadcastEvent))
 }
 
 // GetAssigns returns a map of all users' assigns data in the channel.
@@ -411,16 +423,17 @@ func (c *Channel) UpdateAssigns(userID string, key string, value interface{}) er
 	}
 
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
 
 	if err := c.checkState(); err != nil {
+		c.mutex.Unlock()
 		return err
 	}
 	assigns, err := c.store.Read(userID)
 
 	if err != nil {
+		c.mutex.Unlock()
 		if c.pubsub != nil && c.endpointPath != "" {
-			go c.broadcastAssignsUpdate(userID, key, value)
+			c.broadcastAssignsUpdate(userID, key, value)
 			return nil
 		}
 		return notFound(c.name, "User does not exist in channel to update assigns")
@@ -437,10 +450,12 @@ func (c *Channel) UpdateAssigns(userID string, key string, value interface{}) er
 	err = c.store.Update(userID, assignsCopy)
 
 	if err != nil {
+		c.mutex.Unlock()
 		return wrapF(err, "failed to update assigns store for user %s", userID)
 	}
+	c.mutex.Unlock()
 	if c.pubsub != nil && c.endpointPath != "" {
-		go c.broadcastAssignsUpdate(userID, key, value)
+		c.broadcastAssignsUpdate(userID, key, value)
 	}
 
 	return nil
@@ -513,7 +528,8 @@ func (c *Channel) BroadcastFrom(e string, payload interface{}, senderId string) 
 }
 
 // Close gracefully shuts down the channel, removing all users and cleaning up resources.
-// This method closes all connections, clears presence and assigns data,
+// It removes channel membership without closing the underlying transports, since
+// one transport may belong to other channels. It clears presence and assigns data,
 // cancels sync coordinators, unsubscribes from PubSub topics, and closes internal channels.
 // After calling Close, the channel should not be used.
 func (c *Channel) Close() error {
@@ -540,13 +556,12 @@ func (c *Channel) Close() error {
 	for _, userID := range c.presence.store.Keys().items {
 		userIDs[userID] = struct{}{}
 	}
-	connections := c.connections.Values()
-
 	var errs []error
 	for userID := range userIDs {
 		if err := c.releaseMembership(userID, "channel_closed"); err != nil {
 			errs = append(errs, err)
 		}
+		c.publishUserLeft(userID)
 		if _, err := c.store.Read(userID); err == nil {
 			if err := c.store.Delete(userID); err != nil {
 				errs = append(errs, err)
@@ -560,44 +575,68 @@ func (c *Channel) Close() error {
 				errs = append(errs, err)
 			}
 		}
+		c.dropPending(userID)
 	}
 	c.mutex.Unlock()
-
-	for _, conn := range connections.items {
-		conn.Close()
-	}
 	if c.pubsub != nil && c.endpointPath != "" {
-		if err := c.pubsub.Unsubscribe(c.channelTopic()); err != nil {
-			errs = append(errs, err)
+		if len(c.unsubscribe) > 0 {
+			for _, unsubscribe := range c.unsubscribe {
+				if err := unsubscribe(); err != nil && !isPubSubClosed(err) {
+					errs = append(errs, err)
+				}
+			}
+			c.unsubscribe = nil
+		} else {
+			if err := c.pubsub.Unsubscribe(c.channelTopic()); err != nil && !isPubSubClosed(err) {
+				errs = append(errs, err)
+			}
+			_ = c.pubsub.Unsubscribe(c.heartbeatTopic())
 		}
-		_ = c.pubsub.Unsubscribe(c.heartbeatTopic())
 	}
 
 	return combine(errs...)
 }
 
 func (c *Channel) addUser(user Transport) error {
+	return c.addUserAcknowledged(user, nil)
+}
+
+func (c *Channel) addUserAcknowledged(user Transport, ack *Event) error {
 	c.mutex.Lock()
-
-	defer c.mutex.Unlock()
-
 	if err := c.checkState(); err != nil {
+		c.mutex.Unlock()
 		return err
 	}
 	if existing, err := c.memberships.Read(user.GetID()); err == nil {
 		if existing.active() {
+			c.mutex.Unlock()
 			return wrapF(conflict(user.GetID(), "Key already exists"), "failed to add user %s, already exists or other error", user.GetID())
 		}
 		currentUser, userErr := c.getUserUnsafe(user.GetID())
-		cleanupErr := c.removeUserLocalWithDestroy(currentUser, user.GetID(), existing.reason(), false)
+		postRemove, cleanupErr := c.removeUserLocalWithDestroy(currentUser, user.GetID(), existing.reason(), false)
+		c.mutex.Unlock()
+		if postRemove != nil {
+			cleanupErr = combine(cleanupErr, postRemove())
+		}
 		if err := combine(userErr, cleanupErr); err != nil {
 			c.reportError("expired_membership_cleanup", err)
+		}
+
+		c.mutex.Lock()
+		if err := c.checkState(); err != nil {
+			c.mutex.Unlock()
+			return err
+		}
+		if _, err := c.memberships.Read(user.GetID()); err == nil {
+			c.mutex.Unlock()
+			return wrapF(conflict(user.GetID(), "Key already exists"), "failed to add user %s, already exists or other error", user.GetID())
 		}
 	}
 
 	membership := newChannelMembership(c.ctx, user)
 	if !membership.active() {
 		membership.close("join_failed")
+		c.mutex.Unlock()
 		return badRequest(c.name, "Cannot add an inactive connection")
 	}
 	assignsToAdd := user.CloneAssigns()
@@ -607,24 +646,38 @@ func (c *Channel) addUser(user Transport) error {
 	}
 	if err := c.store.Create(user.GetID(), assignsToAdd); err != nil {
 		membership.close("join_failed")
+		c.mutex.Unlock()
 		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
+	}
+	if ack != nil {
+		if err := c.enqueue(user, *ack, nil); err != nil {
+			_ = c.store.Delete(user.GetID())
+			membership.close("join_failed")
+			c.mutex.Unlock()
+			return wrapF(err, "failed to queue join acknowledgement for user %s", user.GetID())
+		}
 	}
 	if err := c.connections.Create(user.GetID(), user); err != nil {
 		_ = c.store.Delete(user.GetID())
+		c.dropPending(user.GetID())
 		membership.close("join_failed")
+		c.mutex.Unlock()
 		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
 	}
 
 	if err := c.memberships.Create(user.GetID(), membership); err != nil {
 		_ = c.store.Delete(user.GetID())
 		_ = c.connections.Delete(user.GetID())
+		c.dropPending(user.GetID())
 		membership.close("join_failed")
+		c.mutex.Unlock()
 		return wrapF(err, "failed to add user %s, already exists or other error", user.GetID())
 	}
 	membership.watch(func() {
 		c.removeExpiredMembership(user.GetID(), membership)
 	})
 	c.publishUserJoined(user.GetID(), assignsToAdd)
+	c.mutex.Unlock()
 
 	return nil
 }
@@ -713,6 +766,7 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 		return nil
 	}
 
+	var publishErr error
 	if c.pubsub != nil && c.endpointPath != "" {
 		cleanEndpoint := c.endpointPath
 		if len(cleanEndpoint) > 0 && cleanEndpoint[0] == '/' {
@@ -735,33 +789,21 @@ func (c *Channel) sendMessage(sender string, recipients recipients, event Event)
 		}
 		data, err := distributedBytesFromEvent(cleanEndpoint, eventForPubSub, sender, descriptor)
 
-		if err == nil {
-			go func() {
-				if err := c.pubsub.Publish(topic, data); err != nil {
-					c.reportError("pubsub_publish", err)
-				}
-			}()
+		if err != nil {
+			publishErr = err
+		} else if err := c.pubsub.Publish(topic, data); err != nil {
+			publishErr = err
+			c.reportError("pubsub_publish", err)
 		}
 	}
 
 	if targetUserIDs == nil || targetUserIDs.length() == 0 {
-		return nil
+		return publishErr
 	}
 
-	internalEv := internalEvent{
-		Event:      event,
-		Recipients: targetUserIDs,
-	}
+	deliveryErr := c.deliver(event, targetUserIDs)
 
-	select {
-	case c.channel <- internalEv:
-		return nil
-	case <-c.ctx.Done():
-		return wrapF(c.ctx.Err(), "channel %s context cancelled while queueing message", c.name)
-
-	case <-time.After(c.internalQueueTimeout):
-		return timeout(c.name, "timeout queueing internal message; channel processor might be stuck or overloaded")
-	}
+	return combine(publishErr, deliveryErr)
 }
 
 func (c *Channel) notFoundHandler(ctx context.Context, sender string, e *Event) FinalHandlerFunc[*messageEvent, *Channel] {
@@ -784,45 +826,6 @@ func (c *Channel) notFoundHandler(ctx context.Context, sender string, e *Event) 
 		}
 		return c.sendMessage(string(channelEntity), recipients{userIds: []string{sender}}, message)
 	}
-}
-
-func (c *Channel) onMessage(event *internalEvent) error {
-	if err := c.checkState(); err != nil {
-		return err
-	}
-	newEvent := event.Event
-	recps := event.Recipients
-	connectionsToSend := c.connections.GetByKeys(recps.items...)
-
-	if connectionsToSend.length() == 0 {
-		return nil
-	}
-
-	var wg sync.WaitGroup
-	var errMutex sync.Mutex
-	var deliveryErrors error
-
-	for _, conn := range connectionsToSend.items {
-		select {
-		case <-c.ctx.Done():
-			return c.ctx.Err()
-		default:
-		}
-
-		wg.Add(1)
-		go func(transport Transport, ev Event) {
-			defer wg.Done()
-			eventCopy := ev
-			if err := c.processOutgoing(&eventCopy, transport); err != nil {
-				errMutex.Lock()
-				deliveryErrors = addError(deliveryErrors, err)
-				errMutex.Unlock()
-			}
-		}(conn, newEvent)
-	}
-
-	wg.Wait()
-	return deliveryErrors
 }
 
 func (c *Channel) getUserUnsafe(userID string) (*User, error) {
@@ -880,32 +883,6 @@ func (c *Channel) getUserAssigns(userID, key string) (interface{}, error) {
 	return value, nil
 }
 
-func (c *Channel) handleMessageEvents() {
-	go func() {
-		for {
-			select {
-			case ev, ok := <-c.channel:
-				if !ok {
-					return
-				}
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							c.reportError("channel_dispatch_panic", fmt.Errorf("panic recovered: %v", r))
-						}
-					}()
-					if err := c.onMessage(&ev); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-						c.reportError("channel_dispatch", err)
-					}
-				}()
-
-			case <-c.ctx.Done():
-				return
-			}
-		}
-	}()
-}
-
 func (c *Channel) checkState() error {
 	select {
 	case <-c.ctx.Done():
@@ -957,17 +934,18 @@ func (c *Channel) subscribeToPubSub() {
 		return
 	}
 
-	err := c.pubsub.Subscribe(c.channelTopic(), func(topic string, data []byte) {
+	channelHandler := func(topic string, data []byte) {
 		if err := c.checkState(); err != nil {
 			return
 		}
 		c.handleDistributedMessage(data)
-	})
+	}
+	err := c.subscribe(c.channelTopic(), channelHandler)
 	if err != nil {
 		c.reportError("pubsub_subscribe", err)
 	}
 
-	hbErr := c.pubsub.Subscribe(c.heartbeatTopic(), func(topic string, data []byte) {
+	heartbeatHandler := func(topic string, data []byte) {
 		if err := c.checkState(); err != nil {
 			return
 		}
@@ -983,13 +961,26 @@ func (c *Channel) subscribeToPubSub() {
 			return
 		}
 		c.recordHeartbeat(nodeID)
-	})
+	}
+	hbErr := c.subscribe(c.heartbeatTopic(), heartbeatHandler)
 	if hbErr != nil {
 		c.reportError("pubsub_subscribe", hbErr)
 	}
 
 	c.startHeartbeat()
 	c.requestChannelState()
+}
+
+func (c *Channel) subscribe(pattern string, handler func(topic string, data []byte)) error {
+	if managed, ok := c.pubsub.(ManagedPubSub); ok {
+		unsubscribe, err := managed.SubscribeWithCancel(pattern, handler)
+		if err != nil {
+			return err
+		}
+		c.unsubscribe = append(c.unsubscribe, unsubscribe)
+		return nil
+	}
+	return c.pubsub.Subscribe(pattern, handler)
 }
 
 func (c *Channel) handleDistributedMessage(data []byte) {
@@ -1003,7 +994,7 @@ func (c *Channel) handleDistributedMessage(data []byte) {
 
 	switch env.Type {
 	case msgStateRequest:
-		go c.handleStateRequest(env)
+		c.handleStateRequest(env)
 		return
 	case msgStateResponse:
 		c.handleStateResponse(env)
@@ -1066,14 +1057,8 @@ func (c *Channel) handleDistributedMessage(data []byte) {
 	if recipientIDs == nil || recipientIDs.length() == 0 {
 		return
 	}
-	internalEv := internalEvent{
-		Event:      *event,
-		Recipients: recipientIDs,
-	}
-	select {
-	case c.channel <- internalEv:
-	case <-c.ctx.Done():
-	default:
+	if err := c.deliver(*event, recipientIDs); err != nil {
+		c.reportError("channel_dispatch", err)
 	}
 }
 
@@ -1116,11 +1101,9 @@ func (c *Channel) requestChannelState() {
 	if err != nil {
 		return
 	}
-	go func() {
-		if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
-			c.reportError("pubsub_publish", err)
-		}
-	}()
+	if err := c.pubsub.Publish(c.channelTopic(), data); err != nil {
+		c.reportError("pubsub_publish", err)
+	}
 }
 
 func (c *Channel) localUsersSnapshot() []distributedUser {
@@ -1425,7 +1408,7 @@ func (c *Channel) handleRemoteUserCommand(event *Event) {
 
 	switch userCommandType(event.Event) {
 	case userGetRequest:
-		go c.handleUserGetRequest(event, userID)
+		c.handleUserGetRequest(event, userID)
 		return
 	case userGetResponse:
 		c.handleUserGetResponse(event)
@@ -1455,10 +1438,17 @@ func (c *Channel) handleRemoteUserCommand(event *Event) {
 			c.mutex.Unlock()
 			return
 		}
-		if err := c.removeUserLocal(user, userID, reason); err != nil {
-			c.reportError("remote_remove_user", err)
-		}
+		postRemove, err := c.removeUserLocal(user, userID, reason)
 		c.mutex.Unlock()
+		if err != nil {
+			c.reportError("remote_remove_user", err)
+			return
+		}
+		if postRemove != nil {
+			if err := postRemove(); err != nil {
+				c.reportError("remote_remove_user", err)
+			}
+		}
 	}
 }
 
@@ -1565,13 +1555,19 @@ func (c *Channel) requestRemoteUser(userID string) (*User, error) {
 		return nil, wrapF(err, "failed to publish user get request")
 	}
 
+	timeoutDuration := c.internalQueueTimeout
+	if timeoutDuration <= 0 {
+		timeoutDuration = DefaultOptions().InternalQueueTimeout
+	}
+	timer := time.NewTimer(timeoutDuration)
+	defer timer.Stop()
 	select {
 	case user := <-responseChan:
 		if user == nil {
 			return nil, notFound(c.name, "User not found in channel")
 		}
 		return user, nil
-	case <-time.After(500 * time.Millisecond):
+	case <-timer.C:
 		return nil, notFound(c.name, "User not found in channel")
 	case <-c.ctx.Done():
 		return nil, wrapF(c.ctx.Err(), "channel closed while waiting for user")

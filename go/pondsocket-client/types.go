@@ -121,6 +121,7 @@ type ChannelStateHandler func(state ChannelState)
 type ClientConfig struct {
 	ReconnectInterval time.Duration
 	MaxReconnectTries int
+	JoinTimeout       time.Duration
 	PingInterval      time.Duration
 	PongTimeout       time.Duration
 	WriteTimeout      time.Duration
@@ -132,6 +133,7 @@ func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
 		ReconnectInterval: 1 * time.Second,
 		MaxReconnectTries: -1, // infinite retries
+		JoinTimeout:       10 * time.Second,
 		PingInterval:      30 * time.Second,
 		PongTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

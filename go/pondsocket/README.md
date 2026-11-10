@@ -967,12 +967,13 @@ func main() {
 
 ```go
 serverOptions := &pondsocket.ServerOptions{
-    ServerAddr:         ":8080",
-    ServerReadTimeout:  30 * time.Second,
-    ServerWriteTimeout: 30 * time.Second,
-    ServerIdleTimeout:  120 * time.Second,
-    ServerTLSConfig:    tlsConfig, // Optional TLS configuration
-    Options:           customOptions,
+    ServerAddr:              ":8080",
+    ServerReadHeaderTimeout: 5 * time.Second,
+    ServerReadTimeout:       30 * time.Second,
+    ServerWriteTimeout:      30 * time.Second,
+    ServerIdleTimeout:       120 * time.Second,
+    ServerTLSConfig:         tlsConfig, // Optional TLS configuration
+    Options:                 customOptions,
 }
 ```
 
@@ -995,6 +996,12 @@ options := &pondsocket.Options{
     InternalQueueTimeout: 5 * time.Second,
 }
 ```
+
+Browser WebSocket connections are same-origin by default. Use `AllowedOrigins`
+for known cross-origin frontends. `AllowAnyOrigin: true` is an explicit opt-out
+and should be reserved for endpoints whose own authentication and deployment
+model intentionally permit every origin. PubSub is also opt-in; single-node
+servers deliver locally without broker loopback overhead.
 
 ## Client Integration
 

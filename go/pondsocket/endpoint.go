@@ -17,6 +17,7 @@ type Endpoint struct {
 	middleware  *middleware[joinEvent, interface{}]
 	channels    *store[*Channel]
 	options     *Options
+	outboxes    *outboxes
 	ctx         context.Context
 	mutex       sync.RWMutex
 }
@@ -32,6 +33,7 @@ func newEndpoint(ctx context.Context, path string, options *Options) *Endpoint {
 	return &Endpoint{
 		path:        path,
 		options:     options,
+		outboxes:    newOutboxes(),
 		connections: newStore[Transport](),
 		channels:    newStore[*Channel](),
 		middleware:  newMiddleWare[joinEvent, interface{}](),
@@ -65,7 +67,7 @@ func (e *Endpoint) CreateChannel(path string, handlerFunc JoinEventHandler, midd
 		if err != nil {
 			return next()
 		}
-		ch, err := lobby.getOrCreateChannel(request.channel)
+		ch, err := lobby.beginJoin(request.channel)
 
 		if err != nil {
 			return wrapF(err, "failed to get or create channel instance for %s", request.channel)
@@ -82,6 +84,9 @@ func (e *Endpoint) CreateChannel(path string, handlerFunc JoinEventHandler, midd
 			Payload:     request.payload,
 		}
 		joinCtx := newJoinContext(ctx, ch, route, request.user, ev)
+		defer func() {
+			lobby.endJoin(request.channel, ch, joinCtx.accepted)
+		}()
 
 		if err := executeWithMiddleware(joinCtx, func(ctx *JoinContext) error {
 			return handlerFunc(ctx)
@@ -324,7 +329,10 @@ func (e *Endpoint) handleClose(c Transport) error {
 	if e.options.Hooks != nil && e.options.Hooks.Metrics != nil {
 		e.options.Hooks.Metrics.ConnectionClosed(c.GetID(), 0)
 	}
-	return e.connections.Delete(c.GetID())
+	e.mutex.Lock()
+	err := e.connections.Delete(c.GetID())
+	e.mutex.Unlock()
+	return err
 }
 
 func (e *Endpoint) addConnection(conn Transport) error {
@@ -333,30 +341,35 @@ func (e *Endpoint) addConnection(conn Transport) error {
 
 		return err
 	}
+	e.mutex.Lock()
+	if e.options.MaxConnections > 0 && e.connections.Len() >= e.options.MaxConnections {
+		e.mutex.Unlock()
+		conn.Close()
+
+		return unavailable(string(gatewayEntity), "Maximum connections reached")
+	}
+	err := e.connections.Create(conn.GetID(), conn)
+	e.mutex.Unlock()
+	if err != nil {
+		conn.Close()
+
+		return wrapF(err, "failed to store connection %s", conn.GetID())
+	}
 	if e.options.Hooks != nil && e.options.Hooks.OnConnect != nil {
 		if err := e.options.Hooks.OnConnect(conn); err != nil {
+			e.mutex.Lock()
+			_ = e.connections.Delete(conn.GetID())
+			e.mutex.Unlock()
 			conn.Close()
 
 			return wrapF(err, "OnConnect hook failed")
 		}
 	}
-	if e.options.MaxConnections > 0 {
-		e.mutex.RLock()
-
-		currentCount := e.connections.Len()
-
-		e.mutex.RUnlock()
-
-		if currentCount >= e.options.MaxConnections {
-			conn.Close()
-
-			return unavailable(string(gatewayEntity), "Maximum connections reached")
-		}
-	}
-	if err := e.connections.Create(conn.GetID(), conn); err != nil {
-		conn.Close()
-
-		return wrapF(err, "failed to store connection %s", conn.GetID())
+	if !conn.IsActive() {
+		e.mutex.Lock()
+		_ = e.connections.Delete(conn.GetID())
+		e.mutex.Unlock()
+		return unavailable(string(gatewayEntity), "Connection closed during OnConnect")
 	}
 	if e.options.Hooks != nil && e.options.Hooks.Metrics != nil {
 		e.options.Hooks.Metrics.ConnectionOpened(conn.GetID(), "endpoint")
@@ -365,9 +378,7 @@ func (e *Endpoint) addConnection(conn Transport) error {
 
 	conn.OnClose(e.handleClose)
 
-	conn.HandleMessages()
-
-	err := conn.SendJSON(Event{
+	err = conn.SendJSON(Event{
 		Action:      connect,
 		ChannelName: string(gatewayEntity),
 		RequestId:   uuid.NewString(),
@@ -380,13 +391,12 @@ func (e *Endpoint) addConnection(conn Transport) error {
 	if err != nil {
 		conn.Close()
 
-		_ = e.connections.Delete(conn.GetID())
-
 		if e.options.Hooks != nil && e.options.Hooks.Metrics != nil {
 			e.options.Hooks.Metrics.ConnectionError(conn.GetID(), err)
 		}
 		return wrapF(err, "failed to send connection confirmation to %s", conn.GetID())
 	}
+	conn.HandleMessages()
 	return nil
 }
 

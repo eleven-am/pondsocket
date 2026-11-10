@@ -5,12 +5,13 @@ package pondsocket
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
 type LocalPubSub struct {
 	mu         sync.RWMutex
-	subs       map[string][]subscription
+	subs       map[string][]*subscription
 	closed     bool
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -36,7 +37,7 @@ func NewLocalPubSub(ctx context.Context, bufferSize int) *LocalPubSub {
 	pubsubCtx, cancel := context.WithCancel(ctx)
 
 	return &LocalPubSub{
-		subs:       make(map[string][]subscription),
+		subs:       make(map[string][]*subscription),
 		ctx:        pubsubCtx,
 		cancel:     cancel,
 		bufferSize: bufferSize,
@@ -48,42 +49,84 @@ func NewLocalPubSub(ctx context.Context, bufferSize int) *LocalPubSub {
 // Each subscription runs in its own goroutine to prevent blocking.
 // Returns an error if the PubSub system is closed.
 func (l *LocalPubSub) Subscribe(pattern string, handler func(topic string, data []byte)) error {
+	_, err := l.SubscribeWithCancel(pattern, handler)
+	return err
+}
+
+// SubscribeWithCancel registers one ordered subscription and returns a function
+// that removes only that subscription.
+func (l *LocalPubSub) SubscribeWithCancel(pattern string, handler func(topic string, data []byte)) (func() error, error) {
 	l.mu.Lock()
 
-	defer l.mu.Unlock()
-
 	if l.closed {
-		return &pubsubClosedError{}
+		l.mu.Unlock()
+		return nil, &pubsubClosedError{}
 	}
 	subCtx, cancel := context.WithCancel(l.ctx)
 
 	ch := make(chan PubSubMessage, l.bufferSize)
 
-	sub := subscription{
+	sub := &subscription{
 		pattern: pattern,
 		handler: handler,
 		ch:      ch,
 		cancel:  cancel,
 	}
 	l.subs[pattern] = append(l.subs[pattern], sub)
+	l.mu.Unlock()
 
 	go l.runSubscription(subCtx, sub)
 
-	return nil
+	var once sync.Once
+	unsubscribe := func() error {
+		var err error
+		once.Do(func() {
+			err = l.removeSubscription(pattern, sub)
+		})
+		return err
+	}
+	return unsubscribe, nil
 }
 
-func (l *LocalPubSub) runSubscription(ctx context.Context, sub subscription) {
+func (l *LocalPubSub) runSubscription(ctx context.Context, sub *subscription) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case msg, ok := <-sub.ch:
-			if !ok {
-				return
-			}
-			go sub.handler(msg.Topic, msg.Data)
+		case msg := <-sub.ch:
+			func() {
+				defer func() { _ = recover() }()
+				sub.handler(msg.Topic, msg.Data)
+			}()
 		}
 	}
+}
+
+func (l *LocalPubSub) removeSubscription(pattern string, target *subscription) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		return &pubsubClosedError{}
+	}
+	subs, exists := l.subs[pattern]
+	if !exists {
+		return nil
+	}
+	for i, sub := range subs {
+		if sub != target {
+			continue
+		}
+		sub.cancel()
+		subs = append(subs[:i], subs[i+1:]...)
+		if len(subs) == 0 {
+			delete(l.subs, pattern)
+		} else {
+			l.subs[pattern] = subs
+		}
+		return nil
+	}
+	return nil
 }
 
 // Unsubscribe removes all handlers for the given pattern.
@@ -103,8 +146,6 @@ func (l *LocalPubSub) Unsubscribe(pattern string) error {
 	}
 	for _, sub := range subs {
 		sub.cancel()
-
-		close(sub.ch)
 	}
 	delete(l.subs, pattern)
 
@@ -116,26 +157,26 @@ func (l *LocalPubSub) Unsubscribe(pattern string) error {
 // If a subscriber's channel is full, the message is dropped for that subscriber.
 // Returns an error if the PubSub system is closed.
 func (l *LocalPubSub) Publish(topic string, data []byte) error {
-	l.mu.RLock()
-
-	defer l.mu.RUnlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	if l.closed {
 		return &pubsubClosedError{}
 	}
-	msg := PubSubMessage{
-		Topic: topic,
-		Data:  data,
-	}
+	var matching []*subscription
 	for pattern, subs := range l.subs {
 		if matchTopic(pattern, topic) {
-			for _, sub := range subs {
-				select {
-				case sub.ch <- msg:
-				default:
-				}
-			}
+			matching = append(matching, subs...)
 		}
+	}
+	for _, sub := range matching {
+		if len(sub.ch) == cap(sub.ch) {
+			return fmt.Errorf("pubsub: subscriber queue full for pattern %q", sub.pattern)
+		}
+	}
+	for _, sub := range matching {
+		messageData := append([]byte(nil), data...)
+		sub.ch <- PubSubMessage{Topic: topic, Data: messageData}
 	}
 	return nil
 }
@@ -157,10 +198,10 @@ func (l *LocalPubSub) Close() error {
 
 	for _, subs := range l.subs {
 		for _, sub := range subs {
-			close(sub.ch)
+			sub.cancel()
 		}
 	}
-	l.subs = make(map[string][]subscription)
+	l.subs = make(map[string][]*subscription)
 
 	return nil
 }

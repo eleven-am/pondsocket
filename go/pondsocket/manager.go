@@ -8,7 +8,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,10 +28,17 @@ type Manager struct {
 // GetEndpoints returns a slice of all registered endpoints in the manager.
 // This can be used to inspect or iterate over all active endpoints.
 func (m *Manager) GetEndpoints() []*Endpoint {
-	return m.endpoints.items
+	return m.endpoints.snapshot()
 }
 
 func createOriginChecker(opts *Options) func(*http.Request) bool {
+	if opts.AllowAnyOrigin {
+		return func(*http.Request) bool { return true }
+	}
+	if opts.CheckOriginFunc != nil {
+		return opts.CheckOriginFunc
+	}
+
 	var compiledRegexps []*regexp.Regexp
 	if opts.CheckOrigin && len(opts.AllowedOriginRegexps) > 0 {
 		compiledRegexps = make([]*regexp.Regexp, 0, len(opts.AllowedOriginRegexps))
@@ -46,7 +55,11 @@ func createOriginChecker(opts *Options) func(*http.Request) bool {
 		origin := r.Header.Get("Origin")
 
 		if origin == "" {
-			return false
+			return true
+		}
+		if len(opts.AllowedOrigins) == 0 && len(compiledRegexps) == 0 {
+			parsed, err := url.Parse(origin)
+			return err == nil && strings.EqualFold(parsed.Host, r.Host)
 		}
 		for _, allowed := range opts.AllowedOrigins {
 			if allowed == "*" {
@@ -67,44 +80,79 @@ func createOriginChecker(opts *Options) func(*http.Request) bool {
 
 // DefaultOptions returns a new Options struct with sensible default values.
 // These defaults provide a good starting point for most applications:
-// - No origin checking (accepts all origins)
+// - Same-origin browser connections (set AllowAnyOrigin only for deliberate public endpoints)
 // - 1KB read/write buffers
 // - 512KB max message size
 // - 30s ping interval, 60s pong wait
 // - Compression disabled
-// - 256 buffer size for send/receive channels
-// - 10 max concurrent handlers per connection
+// - 64-message bounded send/receive queues
+// - Messages from one connection are handled serially in arrival order
 func DefaultOptions() *Options {
 	return &Options{
-		CheckOrigin:           false,
-		ReadBufferSize:        1024,
-		WriteBufferSize:       1024,
-		MaxMessageSize:        512 * 1024,
-		PingInterval:          30 * time.Second,
-		PongWait:              60 * time.Second,
-		WriteWait:             10 * time.Second,
-		SendTimeout:           5 * time.Second,
-		EnableCompression:     false,
-		SendChannelBuffer:     256,
-		ReceiveChannelBuffer:  256,
-		InternalQueueTimeout:  1 * time.Second,
-		MaxConcurrentHandlers: 10,
+		CheckOrigin:          true,
+		ReadBufferSize:       1024,
+		WriteBufferSize:      1024,
+		MaxMessageSize:       512 * 1024,
+		PingInterval:         30 * time.Second,
+		PongWait:             60 * time.Second,
+		WriteWait:            10 * time.Second,
+		SendTimeout:          5 * time.Second,
+		EnableCompression:    false,
+		SendChannelBuffer:    64,
+		ReceiveChannelBuffer: 64,
+		InternalQueueTimeout: 1 * time.Second,
+	}
+}
+
+func (o *Options) fillDefaults() {
+	defaults := DefaultOptions()
+	if !o.AllowAnyOrigin {
+		o.CheckOrigin = defaults.CheckOrigin
+	}
+
+	if o.ReadBufferSize <= 0 {
+		o.ReadBufferSize = defaults.ReadBufferSize
+	}
+	if o.WriteBufferSize <= 0 {
+		o.WriteBufferSize = defaults.WriteBufferSize
+	}
+	if o.MaxMessageSize <= 0 {
+		o.MaxMessageSize = defaults.MaxMessageSize
+	}
+	if o.PingInterval <= 0 {
+		o.PingInterval = defaults.PingInterval
+	}
+	if o.PongWait <= 0 {
+		o.PongWait = defaults.PongWait
+	}
+	if o.WriteWait <= 0 {
+		o.WriteWait = defaults.WriteWait
+	}
+	if o.SendTimeout <= 0 {
+		o.SendTimeout = defaults.SendTimeout
+	}
+	if o.SendChannelBuffer <= 0 {
+		o.SendChannelBuffer = defaults.SendChannelBuffer
+	}
+	if o.ReceiveChannelBuffer <= 0 {
+		o.ReceiveChannelBuffer = defaults.ReceiveChannelBuffer
+	}
+	if o.InternalQueueTimeout <= 0 {
+		o.InternalQueueTimeout = defaults.InternalQueueTimeout
 	}
 }
 
 // NewManager creates a new Manager instance with the provided context and options.
 // The manager handles WebSocket upgrades, origin checking, and endpoint routing.
 // If no options are provided, default options will be used.
-// If no PubSub implementation is provided in options, a local in-memory PubSub will be created.
+// PubSub is opt-in. Single-node servers deliver directly without paying the
+// serialization, goroutine, and heartbeat cost of a broker loopback.
 func NewManager(ctx context.Context, options ...Options) *Manager {
 	optionCopy := *DefaultOptions()
 
 	if len(options) > 0 {
 		optionCopy = options[0]
-	}
-
-	if optionCopy.PubSub == nil {
-		optionCopy.PubSub = NewLocalPubSub(ctx, 100)
+		optionCopy.fillDefaults()
 	}
 
 	opts := optionCopy
@@ -149,6 +197,10 @@ func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler
 		if err != nil {
 			return next()
 		}
+		if err := m.setSSECORSHeaders(*response); err != nil {
+			http.Error(*response, err.Error(), http.StatusInternalServerError)
+			return nil
+		}
 
 		switch request.Method {
 		case http.MethodGet:
@@ -160,12 +212,36 @@ func (m *Manager) CreateEndpoint(path string, handlerFunc ConnectionEventHandler
 		case http.MethodDelete:
 			return m.handleSSEDisconnect(request, response, endpoint)
 
+		case http.MethodOptions:
+			if m.Options.CORSAllowOrigin == "" {
+				return next()
+			}
+			(*response).Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			(*response).Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Connection-ID")
+			(*response).WriteHeader(http.StatusNoContent)
+			return nil
+
 		default:
 			return next()
 		}
 	})
 
 	return endpoint
+}
+
+func (m *Manager) setSSECORSHeaders(response http.ResponseWriter) error {
+	if m.Options.CORSAllowOrigin == "" {
+		return nil
+	}
+	if m.Options.CORSAllowCredentials && m.Options.CORSAllowOrigin == "*" {
+		return badRequest(string(gatewayEntity), "credentialed SSE CORS requires an explicit origin")
+	}
+	response.Header().Set("Access-Control-Allow-Origin", m.Options.CORSAllowOrigin)
+	response.Header().Set("Access-Control-Expose-Headers", "X-Connection-ID")
+	if m.Options.CORSAllowCredentials {
+		response.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+	return nil
 }
 
 func (m *Manager) handleConnection(ctx context.Context, request *http.Request, response *http.ResponseWriter, endpoint *Endpoint, route *Route, handlerFunc ConnectionEventHandler, middlewares []ConnectionMiddleware) error {
@@ -185,11 +261,16 @@ func (m *Manager) handleConnection(ctx context.Context, request *http.Request, r
 	if err := executeWithMiddleware(connCtx, func(ctx *ConnectionContext) error {
 		return handlerFunc(ctx)
 	}, middlewares); err != nil {
+		connCtx.connectionCancel()
+		if conn, readErr := endpoint.connections.Read(userId); readErr == nil && conn != nil {
+			conn.Close()
+		}
 		return err
 	}
 
 	if connCtx.sseConn != nil {
 		connCtx.sseConn.Wait()
+		connCtx.sseConn.Close()
 	}
 
 	return nil
@@ -202,8 +283,17 @@ func (m *Manager) handleSSEMessage(request *http.Request, response *http.Respons
 		return nil
 	}
 
+	maxMessageSize := m.Options.MaxMessageSize
+	if maxMessageSize > 0 {
+		request.Body = http.MaxBytesReader(*response, request.Body, maxMessageSize)
+	}
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(*response, "Request body too large", http.StatusRequestEntityTooLarge)
+			return nil
+		}
 		http.Error(*response, "Failed to read request body", http.StatusBadRequest)
 		return nil
 	}

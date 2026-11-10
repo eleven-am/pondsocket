@@ -69,9 +69,8 @@ where
         E: PondEvent,
     {
         self.raw
-            .send_message(E::NAME, Some(to_pond_map(payload)?))
-            .await;
-        Ok(())
+            .send_message_checked(E::NAME, Some(to_pond_map(payload)?))
+            .await
     }
 
     pub async fn request<E>(

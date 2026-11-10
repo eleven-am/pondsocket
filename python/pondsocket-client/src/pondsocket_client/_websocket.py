@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 import json
 from typing import TYPE_CHECKING
 
@@ -38,16 +39,19 @@ class WebSocketClient(BaseClient, abc.ABC):
         self._recv_task = asyncio.create_task(self._receive_loop())
 
     async def _close_transport(self) -> None:
-        if self._recv_task is not None and not self._recv_task.done():
-            self._recv_task.cancel()
-            self._recv_task = None
+        recv_task = self._recv_task
+        self._recv_task = None
+        if recv_task is not None and not recv_task.done():
+            recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await recv_task
         socket = self._socket
         self._socket = None
         if socket is not None:
             try:
                 await socket.close()
-            except Exception:
-                return
+            except Exception as exc:
+                self._errors.publish(exc)
 
     async def _send_outbound(self, message: ClientMessage) -> None:
         socket = self._socket

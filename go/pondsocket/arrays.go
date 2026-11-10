@@ -31,9 +31,10 @@ func (a *array[T]) find(predicate arrayPredicate[T]) *T {
 	a.lock.RLock()
 	defer a.lock.RUnlock()
 
-	for i := range a.items {
-		if predicate(a.items[i]) {
-			return &a.items[i]
+	for _, item := range a.items {
+		if predicate(item) {
+			found := item
+			return &found
 		}
 	}
 	return nil
@@ -92,11 +93,18 @@ func (a *array[T]) length() int {
 }
 
 func (a *array[T]) forEach(fn func(T)) {
-	a.lock.RLock()
-	defer a.lock.RUnlock()
-	for _, item := range a.items {
+	for _, item := range a.snapshot() {
 		fn(item)
 	}
+}
+
+func (a *array[T]) snapshot() []T {
+	a.lock.RLock()
+	defer a.lock.RUnlock()
+
+	items := make([]T, len(a.items))
+	copy(items, a.items)
+	return items
 }
 
 func fromSlice[T any](slice []T) *array[T] {

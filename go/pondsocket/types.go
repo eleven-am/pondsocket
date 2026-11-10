@@ -5,6 +5,7 @@ package pondsocket
 import (
 	"context"
 	"crypto/tls"
+	"net/http"
 	"regexp"
 	"time"
 )
@@ -23,11 +24,6 @@ type Event struct {
 	Recipients  []string    `json:"recipients,omitempty"`
 	FromUserID  string      `json:"fromUserId,omitempty"`
 	Recipient   string      `json:"recipientDescriptor,omitempty"`
-}
-
-type internalEvent struct {
-	Event
-	Recipients *array[string]
 }
 
 type messageEvent struct {
@@ -74,6 +70,8 @@ type options struct {
 	PubSub               PubSub
 	Hooks                *Hooks
 	Namespace            string
+	Outboxes             *outboxes
+	SendBuffer           int
 }
 
 type recipient string
@@ -177,23 +175,28 @@ type LeaveEventHandler HandlerFunc[LeaveContext]
 // It includes settings for origin checking, buffer sizes, timeouts, connection limits,
 // hooks for extensibility, and PubSub for distributed deployments.
 type Options struct {
-	CheckOrigin           bool
-	AllowedOrigins        []string
-	AllowedOriginRegexps  []*regexp.Regexp
-	ReadBufferSize        int
-	WriteBufferSize       int
-	MaxMessageSize        int64
-	PingInterval          time.Duration
-	PongWait              time.Duration
-	WriteWait             time.Duration
-	SendTimeout           time.Duration
-	EnableCompression     bool
-	MaxConnections        int
-	SendChannelBuffer     int
-	ReceiveChannelBuffer  int
-	InternalQueueTimeout  time.Duration
-	CORSAllowOrigin       string
-	CORSAllowCredentials  bool
+	CheckOrigin          bool
+	AllowAnyOrigin       bool
+	AllowedOrigins       []string
+	AllowedOriginRegexps []*regexp.Regexp
+	CheckOriginFunc      func(r *http.Request) bool
+	ReadBufferSize       int
+	WriteBufferSize      int
+	MaxMessageSize       int64
+	PingInterval         time.Duration
+	PongWait             time.Duration
+	WriteWait            time.Duration
+	SendTimeout          time.Duration
+	EnableCompression    bool
+	MaxConnections       int
+	SendChannelBuffer    int
+	ReceiveChannelBuffer int
+	InternalQueueTimeout time.Duration
+	CORSAllowOrigin      string
+	CORSAllowCredentials bool
+	// MaxConcurrentHandlers is retained for source compatibility. PondSocket
+	// now always handles events from one transport serially to preserve order.
+	// Deprecated: this value is ignored.
 	MaxConcurrentHandlers int
 	Hooks                 *Hooks
 	PubSub                PubSub
@@ -203,12 +206,13 @@ type Options struct {
 // ServerOptions configures the HTTP server that hosts the WebSocket endpoints.
 // It includes the WebSocket options, server address, timeout settings, and optional TLS configuration.
 type ServerOptions struct {
-	Options            *Options
-	ServerAddr         string
-	ServerReadTimeout  time.Duration
-	ServerWriteTimeout time.Duration
-	ServerIdleTimeout  time.Duration
-	ServerTLSConfig    *tls.Config
+	Options                 *Options
+	ServerAddr              string
+	ServerReadHeaderTimeout time.Duration
+	ServerReadTimeout       time.Duration
+	ServerWriteTimeout      time.Duration
+	ServerIdleTimeout       time.Duration
+	ServerTLSConfig         *tls.Config
 }
 
 type contextKey string

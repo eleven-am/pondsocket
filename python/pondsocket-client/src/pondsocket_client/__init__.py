@@ -5,6 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 from ._base import BaseClient, ConnectionStateHandler, ErrorHandler
 from ._channel import (
     Channel,
+    ChannelQueueFullError,
     ChannelStateHandler,
     MessageHandler,
     PresenceHandler,
@@ -41,6 +42,7 @@ __all__ = [
     "DEFAULT_RESPONSE_TIMEOUT",
     "BaseClient",
     "Channel",
+    "ChannelQueueFullError",
     "ChannelStateHandler",
     "ClientOptions",
     "ConnectionState",

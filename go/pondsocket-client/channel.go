@@ -1,6 +1,8 @@
 package pondsocket
 
 import (
+	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -15,7 +17,7 @@ type Channel struct {
 	queue          []ClientMessage
 	presence       []PondPresence
 	params         JoinParams
-	publisher      func(ClientMessage)
+	publisher      func(ClientMessage) error
 	eventChan      chan ChannelEvent
 	connectionChan <-chan bool
 	channelState   chan ChannelState
@@ -26,6 +28,15 @@ type Channel struct {
 	closeOnce      sync.Once
 	cleanups       []func()
 	cleanupsMu     sync.Mutex
+	joinMu         sync.Mutex
+	connected      bool
+	joinTimeout    time.Duration
+	joinTimer      *time.Timer
+	pendingJoinID  string
+	receiverMu     sync.Mutex
+	receiverStop   chan struct{}
+	receiverDone   chan struct{}
+	receiverUnsub  func()
 
 	// Subscribers
 	eventSubs   map[int]*channelEventSubscriber
@@ -58,10 +69,21 @@ func (s *channelStateSubscriber) close() {
 
 // NewChannel creates a new channel instance
 func NewChannel(publisher func(ClientMessage), connectionChan <-chan bool, name string, params JoinParams) *Channel {
-	return NewChannelWithCleanup(publisher, connectionChan, nil, name, params)
+	return newChannel(publisher, connectionChan, nil, name, params, DefaultClientConfig().JoinTimeout, true)
 }
 
 func NewChannelWithCleanup(publisher func(ClientMessage), connectionChan <-chan bool, unsubscribeConnection func(), name string, params JoinParams) *Channel {
+	return newChannel(publisher, connectionChan, unsubscribeConnection, name, params, DefaultClientConfig().JoinTimeout, true)
+}
+
+func newChannel(publisher func(ClientMessage), connectionChan <-chan bool, unsubscribeConnection func(), name string, params JoinParams, joinTimeout time.Duration, connected bool) *Channel {
+	return newChannelWithPublisher(func(message ClientMessage) error {
+		publisher(message)
+		return nil
+	}, connectionChan, unsubscribeConnection, name, params, joinTimeout, connected)
+}
+
+func newChannelWithPublisher(publisher func(ClientMessage) error, connectionChan <-chan bool, unsubscribeConnection func(), name string, params JoinParams, joinTimeout time.Duration, connected bool) *Channel {
 	c := &Channel{
 		name:           name,
 		queue:          make([]ClientMessage, 0),
@@ -72,6 +94,8 @@ func NewChannelWithCleanup(publisher func(ClientMessage), connectionChan <-chan 
 		connectionChan: connectionChan,
 		channelState:   make(chan ChannelState, 1),
 		currentState:   Idle,
+		connected:      connected,
+		joinTimeout:    joinTimeout,
 		ctx:            make(chan struct{}),
 		eventSubs:      make(map[int]*channelEventSubscriber),
 		stateSubs:      make(map[int]*channelStateSubscriber),
@@ -107,26 +131,30 @@ func (c *Channel) Presence() []PondPresence {
 
 // Join attempts to join the channel
 func (c *Channel) Join() {
-	if c.State() == Joined {
+	state := c.State()
+	if state == Joined || state == Joining || state == Closed {
 		return
 	}
 
-	message := ClientMessage{
-		Action:      JoinChannel,
-		Event:       string(JoinChannel),
-		Payload:     c.params,
-		ChannelName: c.name,
-		RequestID:   uuid.New().String(),
-	}
-
 	c.setState(Joining)
-	c.publish(message)
+	c.joinMu.Lock()
+	connected := c.connected
+	c.joinMu.Unlock()
+	if connected {
+		c.sendJoinRequest()
+	}
 }
 
 // Leave disconnects from the channel
 func (c *Channel) Leave() {
+	_ = c.LeaveChecked()
+}
+
+// LeaveChecked disconnects from the channel and reports a transport failure
+// while preserving the original fire-and-forget Leave API.
+func (c *Channel) LeaveChecked() error {
 	if c.State() == Closed {
-		return
+		return nil
 	}
 	message := ClientMessage{
 		Action:      LeaveChannel,
@@ -136,12 +164,20 @@ func (c *Channel) Leave() {
 		Payload:     map[string]interface{}{},
 	}
 
-	c.publish(message)
+	err := c.publish(message)
 	c.close()
+	return err
 }
 
 // SendMessage sends a message to the channel
 func (c *Channel) SendMessage(event string, payload PondMessage) {
+	_ = c.SendMessageChecked(event, payload)
+}
+
+// SendMessageChecked sends or queues a message and reports queue saturation or
+// an immediate transport failure. Failed transport writes remain queued in FIFO
+// order for a later successful rejoin.
+func (c *Channel) SendMessageChecked(event string, payload PondMessage) error {
 	message := ClientMessage{
 		Action:      Broadcast,
 		Event:       event,
@@ -150,11 +186,17 @@ func (c *Channel) SendMessage(event string, payload PondMessage) {
 		RequestID:   uuid.New().String(),
 	}
 
-	c.publish(message)
+	return c.publish(message)
 }
 
 // SendForResponse sends a message and waits for a response
 func (c *Channel) SendForResponse(event string, payload PondMessage, timeout time.Duration) (<-chan PondMessage, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("response timeout must be positive")
+	}
+	if c.State() == Closed {
+		return nil, fmt.Errorf("channel is closed")
+	}
 	requestID := uuid.New().String()
 	responseChan := make(chan PondMessage, 1)
 	var once sync.Once
@@ -217,7 +259,11 @@ func (c *Channel) SendForResponse(event string, payload PondMessage, timeout tim
 		RequestID:   requestID,
 	}
 
-	c.publish(message)
+	if err := c.publish(message); err != nil {
+		unsubscribe()
+		finish()
+		return nil, err
+	}
 	return responseChan, nil
 }
 
@@ -342,6 +388,10 @@ func (c *Channel) OnChannelStateChange(callback ChannelStateHandler) func() {
 
 // Acknowledge acknowledges that the channel has been joined
 func (c *Channel) Acknowledge(eventChan <-chan ChannelEvent, unsubscribe ...func()) {
+	c.acknowledge("", eventChan, unsubscribe...)
+}
+
+func (c *Channel) acknowledge(requestID string, eventChan <-chan ChannelEvent, unsubscribe ...func()) {
 	var cleanup func()
 	if len(unsubscribe) > 0 {
 		cleanup = unsubscribe[0]
@@ -353,20 +403,45 @@ func (c *Channel) Acknowledge(eventChan <-chan ChannelEvent, unsubscribe ...func
 		}
 		return
 	}
-	c.setState(Joined)
+	if !c.clearPendingJoin(requestID) {
+		if cleanup != nil {
+			cleanup()
+		}
+		return
+	}
 	c.init(eventChan, cleanup)
-	c.emptyQueue()
+	c.joinAndEmptyQueue()
 }
 
 // init initializes the channel's event handling
 func (c *Channel) init(eventChan <-chan ChannelEvent, unsubscribe func()) {
-	c.cleanupsMu.Lock()
-	if unsubscribe != nil {
-		c.cleanups = append(c.cleanups, unsubscribe)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	c.receiverMu.Lock()
+	oldStop := c.receiverStop
+	oldDone := c.receiverDone
+	oldUnsub := c.receiverUnsub
+	c.receiverStop = stop
+	c.receiverDone = done
+	c.receiverUnsub = unsubscribe
+	c.receiverMu.Unlock()
+	if oldStop != nil {
+		close(oldStop)
 	}
-	c.cleanupsMu.Unlock()
+	if oldUnsub != nil {
+		oldUnsub()
+	}
+	if oldDone != nil {
+		<-oldDone
+	}
 
 	go func() {
+		defer func() {
+			if unsubscribe != nil {
+				unsubscribe()
+			}
+			close(done)
+		}()
 		for {
 			select {
 			case event, ok := <-eventChan:
@@ -378,11 +453,13 @@ func (c *Channel) init(eventChan <-chan ChannelEvent, unsubscribe func()) {
 					case c.eventChan <- event:
 					case <-c.ctx:
 						return
-					default:
-						// Channel is full, skip
+					case <-stop:
+						return
 					}
 				}
 			case <-c.ctx:
+				return
+			case <-stop:
 				return
 			}
 		}
@@ -391,6 +468,7 @@ func (c *Channel) init(eventChan <-chan ChannelEvent, unsubscribe func()) {
 
 func (c *Channel) close() {
 	c.closeOnce.Do(func() {
+		c.clearPendingJoin("")
 		c.setState(Closed)
 
 		c.stateSubsMu.RLock()
@@ -404,6 +482,7 @@ func (c *Channel) close() {
 		}
 
 		close(c.ctx)
+		c.stopReceiver()
 
 		c.cleanupsMu.Lock()
 		cleanups := append([]func(){}, c.cleanups...)
@@ -435,6 +514,9 @@ func (c *Channel) decline(event ChannelEvent) {
 		c.surface(event)
 		return
 	}
+	if !c.clearPendingJoin(event.RequestID) {
+		return
+	}
 	c.setState(Declined)
 
 	c.mu.Lock()
@@ -448,7 +530,6 @@ func (c *Channel) surface(event ChannelEvent) {
 	select {
 	case c.eventChan <- event:
 	case <-c.ctx:
-	default:
 	}
 }
 
@@ -466,41 +547,60 @@ func (c *Channel) setState(state ChannelState) {
 	if oldState != state {
 		select {
 		case c.channelState <- state:
-		default:
-			// Channel is full, skip
+		case <-c.ctx:
 		}
 	}
 }
 
 // publish sends a message, queuing it if the channel is not joined
-func (c *Channel) publish(message ClientMessage) {
+func (c *Channel) publish(message ClientMessage) error {
+	if _, err := json.Marshal(message); err != nil {
+		return fmt.Errorf("failed to marshal outbound message: %w", err)
+	}
 	if message.Action == JoinChannel || message.Action == LeaveChannel {
-		c.publisher(message)
-		return
+		return c.publisher(message)
 	}
 
 	c.mu.Lock()
-	if c.State() == Joined {
-		c.mu.Unlock()
-		c.publisher(message)
-		return
+	defer c.mu.Unlock()
+	if len(c.queue) >= maxQueueSize {
+		return fmt.Errorf("channel %q outbound queue is full (max %d)", c.name, maxQueueSize)
 	}
 	c.queue = append(c.queue, message)
-	if len(c.queue) > maxQueueSize {
-		c.queue = c.queue[len(c.queue)-maxQueueSize:]
+	if c.State() != Joined {
+		return nil
 	}
-	c.mu.Unlock()
+	return c.drainQueueLocked()
 }
 
 // emptyQueue sends all queued messages
-func (c *Channel) emptyQueue() {
+func (c *Channel) emptyQueue() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.drainQueueLocked()
+}
 
-	for _, message := range c.queue {
-		c.publisher(message)
+func (c *Channel) joinAndEmptyQueue() {
+	c.mu.Lock()
+	c.setState(Joined)
+	_ = c.drainQueueLocked()
+	c.mu.Unlock()
+}
+
+// drainQueueLocked publishes in FIFO order. It removes an entry only after the
+// transport accepted it, so a failed send leaves that entry and all later work
+// available for the next successful rejoin. c.mu must be held by the caller.
+func (c *Channel) drainQueueLocked() error {
+	for len(c.queue) > 0 {
+		if err := c.publisher(c.queue[0]); err != nil {
+			c.setState(Stalled)
+			return err
+		}
+		copy(c.queue, c.queue[1:])
+		c.queue[len(c.queue)-1] = ClientMessage{}
+		c.queue = c.queue[:len(c.queue)-1]
 	}
-	c.queue = c.queue[:0]
+	return nil
 }
 
 // subscribeToPresence subscribes to presence events
@@ -597,11 +697,28 @@ func (c *Channel) dispatchStateChanges() {
 func (c *Channel) handleConnectionChanges() {
 	for {
 		select {
-		case connected := <-c.connectionChan:
-			if connected && c.State() == Stalled {
-				// Rejoin
-				c.Join()
-			} else if !connected && c.State() == Joined {
+		case connected, ok := <-c.connectionChan:
+			if !ok {
+				return
+			}
+			c.joinMu.Lock()
+			c.connected = connected
+			if !connected {
+				if c.joinTimer != nil {
+					c.joinTimer.Stop()
+					c.joinTimer = nil
+				}
+				c.pendingJoinID = ""
+			}
+			c.joinMu.Unlock()
+
+			state := c.State()
+			if connected && state == Stalled {
+				c.setState(Joining)
+				c.sendJoinRequest()
+			} else if connected && state == Joining {
+				c.sendJoinRequest()
+			} else if !connected && state == Joined {
 				c.setState(Stalled)
 			}
 		case <-c.ctx:
@@ -610,11 +727,96 @@ func (c *Channel) handleConnectionChanges() {
 	}
 }
 
+func (c *Channel) sendJoinRequest() {
+	requestID := uuid.New().String()
+
+	c.joinMu.Lock()
+	if !c.connected || c.pendingJoinID != "" || c.State() == Closed {
+		c.joinMu.Unlock()
+		return
+	}
+	c.pendingJoinID = requestID
+	if c.joinTimer != nil {
+		c.joinTimer.Stop()
+	}
+	if c.joinTimeout > 0 {
+		c.joinTimer = time.AfterFunc(c.joinTimeout, func() {
+			c.handleJoinTimeout(requestID)
+		})
+	}
+	c.joinMu.Unlock()
+
+	if err := c.publisher(ClientMessage{
+		Action:      JoinChannel,
+		Event:       string(JoinChannel),
+		Payload:     c.params,
+		ChannelName: c.name,
+		RequestID:   requestID,
+	}); err != nil {
+		c.clearPendingJoin(requestID)
+		c.setState(Stalled)
+	}
+}
+
+func (c *Channel) handleJoinTimeout(requestID string) {
+	c.joinMu.Lock()
+	if c.pendingJoinID != requestID {
+		c.joinMu.Unlock()
+		return
+	}
+	c.joinTimer = nil
+	c.joinMu.Unlock()
+
+	c.decline(ChannelEvent{
+		Action:      System,
+		Event:       string(EventInternalError),
+		ChannelName: c.name,
+		RequestID:   requestID,
+		Payload: PondMessage{
+			"message":    fmt.Sprintf("timed out joining channel %q", c.name),
+			"statusCode": 408,
+		},
+	})
+}
+
+func (c *Channel) clearPendingJoin(requestID string) bool {
+	c.joinMu.Lock()
+	defer c.joinMu.Unlock()
+	if requestID != "" && c.pendingJoinID != "" && requestID != c.pendingJoinID {
+		return false
+	}
+	if c.joinTimer != nil {
+		c.joinTimer.Stop()
+		c.joinTimer = nil
+	}
+	c.pendingJoinID = ""
+	return true
+}
+
+func (c *Channel) stopReceiver() {
+	c.receiverMu.Lock()
+	stop := c.receiverStop
+	done := c.receiverDone
+	unsubscribe := c.receiverUnsub
+	c.receiverStop = nil
+	c.receiverDone = nil
+	c.receiverUnsub = nil
+	c.receiverMu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+	if unsubscribe != nil {
+		unsubscribe()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
 func safeSendChannelEvent(sub *channelEventSubscriber, event ChannelEvent) {
 	select {
 	case <-sub.done:
 	case sub.ch <- event:
-	default:
 	}
 }
 
@@ -622,6 +824,5 @@ func safeSendChannelState(sub *channelStateSubscriber, state ChannelState) {
 	select {
 	case <-sub.done:
 	case sub.ch <- state:
-	default:
 	}
 }

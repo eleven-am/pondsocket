@@ -104,10 +104,12 @@ export abstract class BaseClient {
             return;
         }
 
-        const delay = Math.min(
-            1000 * 2 ** this._reconnectAttempts,
+        const maximumDelay = Math.min(
+            1000 * 2 ** Math.min(this._reconnectAttempts, 30),
             this._options.maxReconnectDelay,
         );
+        const minimumDelay = maximumDelay / 2;
+        const delay = minimumDelay + Math.random() * (maximumDelay - minimumDelay);
 
         this._reconnectAttempts++;
 
@@ -178,14 +180,20 @@ export abstract class BaseClient {
 
     protected _parseMessages (data: string): ChannelEvent[] {
         const events: ChannelEvent[] = [];
-        const lines = data.trim().split('\n');
+        const lines = data.split(/\r?\n/);
 
-        for (const line of lines) {
+        for (const [index, line] of lines.entries()) {
             if (line.trim()) {
-                const parsed = JSON.parse(line);
-                const event = channelEventSchema.parse(parsed);
+                try {
+                    const parsed = JSON.parse(line);
+                    const event = channelEventSchema.parse(parsed);
 
-                events.push(event);
+                    events.push(event);
+                } catch (error) {
+                    const reason = error instanceof Error ? error.message : String(error);
+
+                    this._errorSubject.publish(new Error(`Failed to parse server message at line ${index + 1}: ${reason}`));
+                }
             }
         }
 
@@ -232,6 +240,8 @@ export abstract class BaseClient {
             } else if (message.action === ServerActions.ERROR || message.event === Events.UNAUTHORIZED) {
                 this.#handleError(message);
             } else if (message.event === Events.CONNECTION && message.action === ServerActions.CONNECT) {
+                this._reconnectAttempts = 0;
+                this._clearReconnectTimeout();
                 this._connectionState.publish(ConnectionState.CONNECTED);
             }
         });

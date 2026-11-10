@@ -124,7 +124,7 @@ func TestAdversarialDuplicateDecline(t *testing.T) {
 	}
 }
 
-func TestAdversarialQueueDropOldestExactBoundary(t *testing.T) {
+func TestAdversarialQueueRejectsOverflowWithoutDroppingOldest(t *testing.T) {
 	publisher := func(msg ClientMessage) {}
 	connectionChan := make(chan bool, 1)
 	channel := NewChannel(publisher, connectionChan, "lobby", JoinParams{})
@@ -140,7 +140,9 @@ func TestAdversarialQueueDropOldestExactBoundary(t *testing.T) {
 		t.Fatalf("expected exactly %d queued at cap, got %d", maxQueueSize, atCap)
 	}
 
-	channel.SendMessage("evt", PondMessage{"index": maxQueueSize})
+	if err := channel.SendMessageChecked("evt", PondMessage{"index": maxQueueSize}); err == nil {
+		t.Fatal("expected queue overflow to return an error")
+	}
 
 	channel.mu.RLock()
 	defer channel.mu.RUnlock()
@@ -148,12 +150,12 @@ func TestAdversarialQueueDropOldestExactBoundary(t *testing.T) {
 		t.Fatalf("expected queue still %d after overflow, got %d", maxQueueSize, len(channel.queue))
 	}
 	first := channel.queue[0].Payload.(PondMessage)
-	if first["index"] != 1 {
-		t.Errorf("expected oldest dropped so index 0 is gone and head is 1, got %v", first["index"])
+	if first["index"] != 0 {
+		t.Errorf("expected oldest retained at index 0, got %v", first["index"])
 	}
 	last := channel.queue[maxQueueSize-1].Payload.(PondMessage)
-	if last["index"] != maxQueueSize {
-		t.Errorf("expected newest retained index %d, got %v", maxQueueSize, last["index"])
+	if last["index"] != maxQueueSize-1 {
+		t.Errorf("expected last accepted index %d, got %v", maxQueueSize-1, last["index"])
 	}
 }
 

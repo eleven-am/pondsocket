@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,12 +19,12 @@ type SSEConn struct {
 	closeOnce     sync.Once
 	mutex         sync.RWMutex
 	isClosing     bool
+	handlersRan   bool
 	closeHandlers *array[func(Transport) error]
 	handler       *transportEventHandler
 	options       *Options
 	ctx           context.Context
 	cancel        context.CancelFunc
-	handlerSem    chan struct{}
 }
 
 type sseOptions struct {
@@ -39,6 +40,9 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 	if !ok {
 		return nil, internal(string(gatewayEntity), "ResponseWriter does not support flushing")
 	}
+	if opts.options != nil && opts.options.CORSAllowCredentials && opts.options.CORSAllowOrigin == "*" {
+		return nil, badRequest(string(gatewayEntity), "credentialed SSE CORS requires an explicit origin")
+	}
 
 	ctx, cancel := context.WithCancel(opts.parentCtx)
 
@@ -47,14 +51,9 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 		assigns = make(map[string]interface{})
 	}
 
-	bufferSize := 256
+	bufferSize := DefaultOptions().ReceiveChannelBuffer
 	if opts.options != nil && opts.options.ReceiveChannelBuffer > 0 {
 		bufferSize = opts.options.ReceiveChannelBuffer
-	}
-
-	maxHandlers := 10
-	if opts.options != nil && opts.options.MaxConcurrentHandlers > 0 {
-		maxHandlers = opts.options.MaxConcurrentHandlers
 	}
 
 	conn := &SSEConn{
@@ -68,7 +67,6 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 		options:       opts.options,
 		ctx:           ctx,
 		cancel:        cancel,
-		handlerSem:    make(chan struct{}, maxHandlers),
 	}
 
 	opts.writer.Header().Set("Content-Type", "text/event-stream")
@@ -86,6 +84,10 @@ func newSSEConn(opts sseOptions) (*SSEConn, error) {
 	}
 
 	go conn.keepAlive()
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
 
 	return conn, nil
 }
@@ -148,8 +150,20 @@ func (s *SSEConn) SendJSON(v interface{}) error {
 	default:
 	}
 
-	if event, ok := v.(Event); ok && event.Event != "" {
-		_, err = s.writer.Write([]byte("event: " + event.Event + "\n"))
+	var eventName string
+	switch event := v.(type) {
+	case Event:
+		eventName = event.Event
+	case *Event:
+		if event != nil {
+			eventName = event.Event
+		}
+	}
+	if eventName != "" {
+		if strings.ContainsAny(eventName, "\r\n") {
+			return badRequest(string(gatewayEntity), "invalid SSE event name")
+		}
+		_, err = s.writer.Write([]byte("event: " + eventName + "\n"))
 		if err != nil {
 			go s.Close()
 			return wrapF(err, "failed to write SSE event field for connection %s", s.id)
@@ -232,11 +246,14 @@ func (s *SSEConn) IsActive() bool {
 }
 
 func (s *SSEConn) Close() {
+	var handlersToRun []func(Transport) error
+
 	s.closeOnce.Do(func() {
 		s.mutex.Lock()
 		s.isClosing = true
-		handlersToRun := make([]func(Transport) error, len(s.closeHandlers.items))
+		handlersToRun = make([]func(Transport) error, len(s.closeHandlers.items))
 		copy(handlersToRun, s.closeHandlers.items)
+		s.handlersRan = true
 		s.mutex.Unlock()
 
 		if s.cancel != nil {
@@ -244,18 +261,18 @@ func (s *SSEConn) Close() {
 		}
 
 		close(s.closeChan)
-
-		var closeHandlerErrors error
-		for _, handler := range handlersToRun {
-			if err := handler(s); err != nil {
-				closeHandlerErrors = addError(closeHandlerErrors, err)
-			}
-		}
-
-		if closeHandlerErrors != nil {
-			s.reportError("sse_close_handlers", closeHandlerErrors)
-		}
 	})
+
+	var closeHandlerErrors error
+	for _, handler := range handlersToRun {
+		if err := handler(s); err != nil {
+			closeHandlerErrors = addError(closeHandlerErrors, err)
+		}
+	}
+
+	if closeHandlerErrors != nil {
+		s.reportError("sse_close_handlers", closeHandlerErrors)
+	}
 }
 
 func (s *SSEConn) Wait() {
@@ -267,7 +284,7 @@ func (s *SSEConn) Wait() {
 
 func (s *SSEConn) OnClose(callback func(Transport) error) {
 	s.mutex.Lock()
-	if s.isClosing {
+	if s.handlersRan {
 		s.mutex.Unlock()
 		if err := callback(s); err != nil {
 			s.reportError("sse_close_handlers", err)
@@ -322,29 +339,7 @@ func (s *SSEConn) HandleMessages() {
 					continue
 				}
 
-				select {
-				case s.handlerSem <- struct{}{}:
-				case <-s.ctx.Done():
-					return
-				case <-s.closeChan:
-					return
-				}
-
-				go func(ev Event, h *transportEventHandler) {
-					defer func() {
-						<-s.handlerSem
-						if r := recover(); r != nil {
-							s.reportError("sse_handler_panic", internal(string(gatewayEntity), "handler panic recovered"))
-						}
-					}()
-
-					if err := (*h)(ev, s); err != nil {
-						s.reportError("sse_handler", err)
-						if errEv := errorEventWithRequestId(err, ev.RequestId); errEv != nil {
-							_ = s.SendJSON(errEv)
-						}
-					}
-				}(event, handler)
+				s.dispatch(event, handler)
 
 			case <-s.ctx.Done():
 				return
@@ -353,6 +348,21 @@ func (s *SSEConn) HandleMessages() {
 			}
 		}
 	}()
+}
+
+func (s *SSEConn) dispatch(ev Event, h *transportEventHandler) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.reportError("sse_handler_panic", internal(string(gatewayEntity), "handler panic recovered"))
+		}
+	}()
+
+	if err := (*h)(ev, s); err != nil {
+		s.reportError("sse_handler", err)
+		if errEv := errorEventWithRequestId(err, ev.RequestId); errEv != nil {
+			_ = s.SendJSON(errEv)
+		}
+	}
 }
 
 func (s *SSEConn) Type() TransportType {
@@ -372,7 +382,17 @@ func (s *SSEConn) PushMessage(data []byte) error {
 	if !s.IsActive() {
 		return internal(string(gatewayEntity), "SSE connection "+s.id+" is not active")
 	}
+	if s.options != nil && s.options.MaxMessageSize > 0 && int64(len(data)) > s.options.MaxMessageSize {
+		return badRequest(string(gatewayEntity), "SSE message exceeds maximum size")
+	}
 
+	select {
+	case s.incoming <- data:
+		return nil
+	default:
+	}
+	timer := time.NewTimer(s.getSendTimeout())
+	defer timer.Stop()
 	select {
 	case s.incoming <- data:
 		return nil
@@ -380,7 +400,7 @@ func (s *SSEConn) PushMessage(data []byte) error {
 		return internal(string(gatewayEntity), "SSE connection "+s.id+" is closing")
 	case <-s.ctx.Done():
 		return internal(string(gatewayEntity), "SSE connection "+s.id+" context cancelled")
-	case <-time.After(s.getSendTimeout()):
+	case <-timer.C:
 		return timeout(string(gatewayEntity), "timeout pushing message to SSE connection "+s.id)
 	}
 }

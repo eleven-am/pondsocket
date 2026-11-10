@@ -799,7 +799,7 @@ func TestRequestRemoteUser(t *testing.T) {
 			Name:                 "test:channel",
 			Middleware:           newMiddleWare[*messageEvent, *Channel](),
 			Outgoing:             newMiddleWare[*OutgoingContext, interface{}](),
-			InternalQueueTimeout: 1 * time.Second,
+			InternalQueueTimeout: 100 * time.Millisecond,
 			PubSub:               sharedPubSub,
 		}
 
@@ -815,8 +815,8 @@ func TestRequestRemoteUser(t *testing.T) {
 			t.Error("Expected error when user not found")
 		}
 
-		if elapsed < 400*time.Millisecond || elapsed > 1*time.Second {
-			t.Errorf("Expected timeout around 500ms, got: %v", elapsed)
+		if elapsed < 75*time.Millisecond || elapsed > 500*time.Millisecond {
+			t.Errorf("Expected configured timeout around 100ms, got: %v", elapsed)
 		}
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestArrayCreation(t *testing.T) {
@@ -122,6 +123,40 @@ func TestArrayFind(t *testing.T) {
 			t.Error("expected to find first occurrence of 2")
 		}
 	})
+}
+
+func TestArrayFindReturnsStableCopy(t *testing.T) {
+	arr := newArray[int]()
+	arr.push(7)
+
+	found := arr.find(func(item int) bool { return item == 7 })
+	if found == nil {
+		t.Fatal("expected item")
+	}
+	for i := 0; i < 10_000; i++ {
+		arr.push(i)
+	}
+	if *found != 7 {
+		t.Fatalf("found pointer changed after slice growth: %d", *found)
+	}
+}
+
+func TestArrayForEachAllowsMutation(t *testing.T) {
+	arr := fromSlice([]int{1, 2, 3})
+	done := make(chan struct{})
+	go func() {
+		arr.forEach(func(item int) { arr.push(item + 10) })
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("forEach held the array lock while invoking its callback")
+	}
+	if got := arr.length(); got != 6 {
+		t.Fatalf("length = %d, want 6", got)
+	}
 }
 
 func TestArrayFindIndex(t *testing.T) {

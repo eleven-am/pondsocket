@@ -19,6 +19,7 @@ type Server struct {
 	manager   *Manager
 	mutex     sync.RWMutex
 	isRunning bool
+	stopped   bool
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
@@ -46,17 +47,22 @@ func NewServer(options *ServerOptions) *Server {
 	if addr == "" {
 		addr = ":8080"
 	}
+	readHeaderTimeout := options.ServerReadHeaderTimeout
+	if readHeaderTimeout <= 0 {
+		readHeaderTimeout = 5 * time.Second
+	}
 	return &Server{
 		ctx:     ctx,
 		cancel:  cancel,
 		manager: manager,
 		server: &http.Server{
-			Addr:         addr,
-			Handler:      manager.HTTPHandler(),
-			ReadTimeout:  options.ServerReadTimeout,
-			WriteTimeout: options.ServerWriteTimeout,
-			IdleTimeout:  options.ServerIdleTimeout,
-			TLSConfig:    options.ServerTLSConfig,
+			Addr:              addr,
+			Handler:           manager.HTTPHandler(),
+			ReadHeaderTimeout: readHeaderTimeout,
+			ReadTimeout:       options.ServerReadTimeout,
+			WriteTimeout:      options.ServerWriteTimeout,
+			IdleTimeout:       options.ServerIdleTimeout,
+			TLSConfig:         options.ServerTLSConfig,
 		},
 	}
 }
@@ -80,6 +86,11 @@ func (s *Server) Start() error {
 		s.mutex.Unlock()
 
 		return internal("SERVER", "Server is already running")
+	}
+	if s.stopped {
+		s.mutex.Unlock()
+
+		return internal("SERVER", "Server has already been stopped and cannot be restarted; create a new Server instance")
 	}
 
 	listener, err := net.Listen("tcp", s.server.Addr)
@@ -125,6 +136,7 @@ func (s *Server) Listen() error {
 	quit := make(chan os.Signal, 1)
 
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
 
 	<-quit
 	shutdownTimeout := 30 * time.Second
@@ -151,14 +163,19 @@ func (s *Server) IsRunning() bool {
 func (s *Server) Stop(timeout time.Duration) error {
 	s.mutex.Lock()
 
-	if !s.isRunning {
+	if s.stopped {
 		s.mutex.Unlock()
 
 		return nil
 	}
+	wasRunning := s.isRunning
+	s.stopped = true
 	s.mutex.Unlock()
 
 	s.cancel()
+	if !wasRunning {
+		return nil
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
 

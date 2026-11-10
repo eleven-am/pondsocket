@@ -1,4 +1,4 @@
-import { ChannelEvent, Events, ServerActions } from '@eleven-am/pondsocket-common';
+import { ChannelEvent, ClientActions, Events, ServerActions } from '@eleven-am/pondsocket-common';
 
 import { SSEClient } from './sseClient';
 import { ConnectionState } from '../types';
@@ -59,6 +59,34 @@ describe('SSEClient', () => {
         expect(mockEventSource?.onmessage).toBeInstanceOf(Function);
         expect(mockEventSource?.onerror).toBeInstanceOf(Function);
         expect(mockEventSource?.onopen).toBeInstanceOf(Function);
+    });
+
+    test('does not create overlapping event sources and ignores stale messages', () => {
+        sseClient.connect();
+        const firstEventSource = sseClient['_eventSource'] as unknown as MockEventSource;
+
+        sseClient.connect();
+        expect(sseClient['_eventSource']).toBe(firstEventSource);
+
+        firstEventSource.readyState = MockEventSource.CLOSED;
+        sseClient.connect();
+        const secondEventSource = sseClient['_eventSource'] as unknown as MockEventSource;
+        const connectionEvent = (connectionId: string) => ({
+            data: JSON.stringify({
+                event: Events.CONNECTION,
+                action: ServerActions.CONNECT,
+                channelName: 'GATEWAY',
+                requestId: connectionId,
+                payload: { connectionId },
+            }),
+        } as MessageEvent);
+
+        expect(secondEventSource).not.toBe(firstEventSource);
+        expect(firstEventSource.close).toHaveBeenCalled();
+        firstEventSource.onmessage?.(connectionEvent('stale'));
+        expect(sseClient.getConnectionId()).toBeUndefined();
+        secondEventSource.onmessage?.(connectionEvent('current'));
+        expect(sseClient.getConnectionId()).toBe('current');
     });
 
     test('connect should transition to CONNECTING state', () => {
@@ -167,12 +195,13 @@ describe('SSEClient', () => {
         expect(errorCallback).toHaveBeenCalledWith(expect.any(Error));
     });
 
-    test('disconnect should close EventSource and send DELETE request', () => {
+    test('disconnect should close EventSource and send DELETE request', async () => {
         sseClient.connect();
         const mockEventSource = sseClient['_eventSource'];
 
         sseClient['_connectionId'] = 'test-conn-id';
         sseClient.disconnect();
+        await sseClient['_publishChain'];
 
         expect(mockEventSource?.close).toHaveBeenCalled();
         expect(sseClient.getState()).toBe(ConnectionState.DISCONNECTED);
@@ -222,6 +251,45 @@ describe('SSEClient', () => {
         );
     });
 
+    test('serializes outgoing requests in publication order', async () => {
+        let resolveFirst: ((response: Response) => void) | undefined;
+        const firstResponse = new Promise<Response>((resolve) => {
+            resolveFirst = resolve;
+        });
+        const fetchMock = global.fetch as jest.Mock;
+        const publisher = sseClient['_createPublisher']();
+        const firstMessage = {
+            action: ClientActions.BROADCAST,
+            channelName: 'testChannel',
+            requestId: 'first',
+            event: 'first',
+            payload: {},
+        };
+        const secondMessage = {
+            ...firstMessage,
+            requestId: 'second',
+            event: 'second',
+        };
+
+        fetchMock
+            .mockImplementationOnce(() => firstResponse)
+            .mockResolvedValueOnce({ ok: true, status: 202 });
+        sseClient['_connectionId'] = 'test-conn-id';
+        sseClient['_connectionState'].publish(ConnectionState.CONNECTED);
+        publisher(firstMessage);
+        publisher(secondMessage);
+        await Promise.resolve();
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body).requestId).toBe('first');
+
+        resolveFirst?.({ ok: true, status: 202 } as Response);
+        await sseClient['_publishChain'];
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock.mock.calls.map(([, options]) => JSON.parse(options.body).requestId)).toEqual(['first', 'second']);
+    });
+
     test('connection timeout should trigger error', () => {
         jest.useFakeTimers();
 
@@ -239,7 +307,10 @@ describe('SSEClient', () => {
 
         expect(errorCallback).toHaveBeenCalledWith(expect.objectContaining({ message: 'Connection timeout' }));
         expect(mockEventSource.close).toHaveBeenCalled();
+        expect(clientWithTimeout.getState()).toBe(ConnectionState.DISCONNECTED);
+        expect(clientWithTimeout['_eventSource']).toBeUndefined();
 
+        clientWithTimeout.disconnect();
         jest.useRealTimers();
     });
 

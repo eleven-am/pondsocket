@@ -22,25 +22,20 @@ type Conn struct {
 	receive       chan []byte
 	assigns       map[string]interface{}
 	closeChan     chan struct{}
-	readDone      chan struct{}
 	closeOnce     sync.Once
 	mutex         sync.RWMutex
+	sendMutex     sync.Mutex
 	isClosing     bool
+	handlersRan   bool
 	closeHandlers *array[func(Transport) error]
 	handler       *eventHandler
 	options       *Options
 	ctx           context.Context
 	cancel        context.CancelFunc
-	handlerSem    chan struct{}
 }
 
 func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]interface{}, id string, options *Options) (*Conn, error) {
 	ctx, cancel := context.WithCancel(mCtx)
-
-	maxHandlers := options.MaxConcurrentHandlers
-	if maxHandlers <= 0 {
-		maxHandlers = 10
-	}
 
 	c := &Conn{
 		ID:            id,
@@ -49,12 +44,10 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 		ctx:           ctx,
 		cancel:        cancel,
 		closeChan:     make(chan struct{}),
-		readDone:      make(chan struct{}),
 		send:          make(chan []byte, options.SendChannelBuffer),
 		receive:       make(chan []byte, options.ReceiveChannelBuffer),
 		closeHandlers: newArray[func(Transport) error](),
 		options:       options,
-		handlerSem:    make(chan struct{}, maxHandlers),
 	}
 
 	wsConn.SetReadLimit(options.MaxMessageSize)
@@ -81,11 +74,7 @@ func newConn(mCtx context.Context, wsConn *websocket.Conn, assigns map[string]in
 }
 
 func (c *Conn) readPump() {
-	defer func() {
-		close(c.readDone)
-
-		c.close(true)
-	}()
+	defer c.Close()
 
 	for {
 		select {
@@ -123,9 +112,17 @@ func (c *Conn) readPump() {
 			}
 			select {
 			case c.receive <- message:
+				continue
+			default:
+			}
+			timer := time.NewTimer(c.options.WriteWait)
+			select {
+			case c.receive <- message:
+				timer.Stop()
 			case <-c.ctx.Done():
+				timer.Stop()
 				return
-			case <-time.After(c.options.WriteWait):
+			case <-timer.C:
 				c.reportError("read_pump", timeout(string(gatewayEntity), "timed out delivering message to handler"))
 
 				return
@@ -247,29 +244,7 @@ func (c *Conn) HandleMessages() {
 					continue
 				}
 
-				select {
-				case c.handlerSem <- struct{}{}:
-				case <-c.ctx.Done():
-					return
-				case <-c.closeChan:
-					return
-				}
-
-				go func(ev Event, h *eventHandler) {
-					defer func() {
-						<-c.handlerSem
-						if r := recover(); r != nil {
-							c.reportError("connection_handler_panic", internal(string(gatewayEntity), "handler panic recovered"))
-						}
-					}()
-
-					if err := (*h)(ev, c); err != nil {
-						c.reportError("connection_handler", err)
-						if errEv := errorEventWithRequestId(err, ev.RequestId); errEv != nil {
-							_ = c.SendJSON(errEv)
-						}
-					}
-				}(event, handler)
+				c.dispatch(event, handler)
 
 			case <-c.ctx.Done():
 				return
@@ -280,7 +255,25 @@ func (c *Conn) HandleMessages() {
 	}()
 }
 
+func (c *Conn) dispatch(ev Event, h *eventHandler) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.reportError("connection_handler_panic", internal(string(gatewayEntity), "handler panic recovered"))
+		}
+	}()
+
+	if err := (*h)(ev, c); err != nil {
+		c.reportError("connection_handler", err)
+		if errEv := errorEventWithRequestId(err, ev.RequestId); errEv != nil {
+			_ = c.SendJSON(errEv)
+		}
+	}
+}
+
 func (c *Conn) SendJSON(v interface{}) (err error) {
+	c.sendMutex.Lock()
+	defer c.sendMutex.Unlock()
+
 	if !c.IsActive() {
 		return internal(string(gatewayEntity), "Connection with id "+c.ID+" is closing")
 	}
@@ -297,6 +290,19 @@ func (c *Conn) SendJSON(v interface{}) (err error) {
 	}()
 
 	select {
+	case c.send <- data:
+		return nil
+	default:
+	}
+
+	timeout := c.options.SendTimeout
+	if timeout <= 0 {
+		timeout = DefaultOptions().SendTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
 	case <-c.closeChan:
 		return internal(string(gatewayEntity), "Connection with id "+c.ID+" is closing")
 
@@ -305,7 +311,7 @@ func (c *Conn) SendJSON(v interface{}) (err error) {
 
 	case c.send <- data:
 		return nil
-	case <-time.After(c.getSendTimeout()):
+	case <-timer.C:
 		go c.Close()
 
 		return internal(string(gatewayEntity), "send timeout, connection with id "+c.ID+" is closing")
@@ -351,7 +357,7 @@ func (c *Conn) GetAssign(key string) interface{} {
 // they were added. Callbacks are executed synchronously during connection cleanup.
 func (c *Conn) OnClose(callback func(Transport) error) {
 	c.mutex.Lock()
-	if c.isClosing {
+	if c.handlersRan {
 		c.mutex.Unlock()
 		if err := callback(c); err != nil {
 			c.reportError("connection_close_handlers", err)
@@ -366,10 +372,12 @@ func (c *Conn) OnClose(callback func(Transport) error) {
 // Returns false if the connection is closing or has been closed.
 // This method is thread-safe and can be called concurrently.
 func (c *Conn) IsActive() bool {
-	select {
-	case <-c.ctx.Done():
-		return false
-	default:
+	if c.ctx != nil {
+		select {
+		case <-c.ctx.Done():
+			return false
+		default:
+		}
 	}
 	c.mutex.RLock()
 
@@ -383,17 +391,15 @@ func (c *Conn) IsActive() bool {
 // closes the WebSocket connection, and cleans up all channels.
 // This method is idempotent and can be called multiple times safely.
 func (c *Conn) Close() {
-	c.close(false)
-}
+	var handlersToRun []func(Transport) error
 
-func (c *Conn) close(fromReader bool) {
 	c.closeOnce.Do(func() {
 		c.mutex.Lock()
 
 		c.isClosing = true
-		handlersToRun := make([]func(Transport) error, len(c.closeHandlers.items))
-
+		handlersToRun = make([]func(Transport) error, len(c.closeHandlers.items))
 		copy(handlersToRun, c.closeHandlers.items)
+		c.handlersRan = true
 
 		c.mutex.Unlock()
 
@@ -402,33 +408,20 @@ func (c *Conn) close(fromReader bool) {
 		}
 		close(c.closeChan)
 
-		conn := c.conn
-
-		if !fromReader && conn != nil {
-			_ = conn.Close()
+		if c.conn != nil {
+			_ = c.conn.Close()
 		}
-
-		if !fromReader {
-			if c.readDone != nil {
-				<-c.readDone
-			}
-		}
-
-		var closeHandlerErrors error
-		for _, handler := range handlersToRun {
-			if err := handler(c); err != nil {
-				closeHandlerErrors = addError(closeHandlerErrors, err)
-			}
-		}
-		if closeHandlerErrors != nil {
-			c.reportError("connection_close_handlers", closeHandlerErrors)
-		}
-
-		if fromReader && conn != nil {
-			_ = conn.Close()
-		}
-
 	})
+
+	var closeHandlerErrors error
+	for _, handler := range handlersToRun {
+		if err := handler(c); err != nil {
+			closeHandlerErrors = addError(closeHandlerErrors, err)
+		}
+	}
+	if closeHandlerErrors != nil {
+		c.reportError("connection_close_handlers", closeHandlerErrors)
+	}
 }
 
 func (c *Conn) reportError(component string, err error) {
@@ -480,11 +473,4 @@ func (c *Conn) Type() TransportType {
 
 func (c *Conn) PushMessage(_ []byte) error {
 	return badRequest(string(gatewayEntity), "PushMessage not supported for WebSocket transport")
-}
-
-func (c *Conn) getSendTimeout() time.Duration {
-	if c.options != nil && c.options.SendTimeout > 0 {
-		return c.options.SendTimeout
-	}
-	return 5 * time.Second
 }

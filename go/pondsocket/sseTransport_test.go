@@ -196,6 +196,18 @@ func TestSSEConnSendJSON(t *testing.T) {
 		}
 	})
 
+	t.Run("sends event field for Event pointers used by outgoing middleware", func(t *testing.T) {
+		conn, writer := createTestSSEConn("test-pointer", nil)
+		defer conn.Close()
+
+		if err := conn.SendJSON(&Event{Event: "pointer-event", Payload: "value"}); err != nil {
+			t.Fatal(err)
+		}
+		if body := writer.GetBody(); !strings.HasPrefix(body, "event: pointer-event\n") {
+			t.Fatalf("expected pointer event field, got %q", body)
+		}
+	})
+
 	t.Run("omits event field for non-Event types", func(t *testing.T) {
 		conn, writer := createTestSSEConn("test-id", nil)
 		defer conn.Close()
@@ -377,6 +389,89 @@ func TestSSEConnOnClose(t *testing.T) {
 			t.Errorf("expected 3 handlers called, got %d", len(order))
 		}
 	})
+}
+
+func TestSSEConnCloseHandlerCanCloseConnection(t *testing.T) {
+	conn, _ := createTestSSEConn("recursive-close", nil)
+	done := make(chan struct{})
+	conn.OnClose(func(transport Transport) error {
+		transport.Close()
+		close(done)
+		return nil
+	})
+
+	go conn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("close handler deadlocked while closing its connection")
+	}
+}
+
+func TestSSEConnParentCancellationRunsCloseHandlers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn, err := newSSEConn(sseOptions{
+		writer:    newMockResponseWriter(),
+		id:        "cancelled-parent",
+		options:   DefaultOptions(),
+		parentCtx: ctx,
+	})
+	if err != nil {
+		t.Fatalf("failed to create SSE connection: %v", err)
+	}
+	done := make(chan struct{})
+	conn.OnClose(func(Transport) error {
+		close(done)
+		return nil
+	})
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("parent cancellation did not run close handlers")
+	}
+	if conn.IsActive() {
+		t.Fatal("SSE connection remained active after parent cancellation")
+	}
+}
+
+func TestSSEConnRejectsUnsafeEventName(t *testing.T) {
+	conn, writer := createTestSSEConn("unsafe-event", nil)
+	defer conn.Close()
+
+	err := conn.SendJSON(Event{Event: "message\ndata: injected"})
+	if err == nil {
+		t.Fatal("expected unsafe event name to be rejected")
+	}
+	if writer.GetBody() != "" {
+		t.Fatalf("unsafe event wrote a partial frame: %q", writer.GetBody())
+	}
+	if err := conn.SendJSON(&Event{Event: "message\rdata: injected"}); err == nil {
+		t.Fatal("expected unsafe pointer event name to be rejected")
+	}
+}
+
+func TestSSEConnRejectsOversizedMessage(t *testing.T) {
+	writer := newMockResponseWriter()
+	opts := DefaultOptions()
+	opts.MaxMessageSize = 4
+	conn, err := newSSEConn(sseOptions{
+		writer:    writer,
+		id:        "oversized-message",
+		options:   opts,
+		parentCtx: context.Background(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create SSE connection: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.PushMessage([]byte("12345")); err == nil {
+		t.Fatal("expected oversized message to be rejected")
+	}
 }
 
 func TestSSEConnOnMessageAndHandleMessages(t *testing.T) {
@@ -561,14 +656,30 @@ func TestSSEConnCORSHeaders(t *testing.T) {
 			t.Errorf("expected no Access-Control-Allow-Credentials header, got %s", writer.headers.Get("Access-Control-Allow-Credentials"))
 		}
 	})
+
+	t.Run("rejects wildcard origin with credentials", func(t *testing.T) {
+		writer := newMockResponseWriter()
+		opts := DefaultOptions()
+		opts.CORSAllowOrigin = "*"
+		opts.CORSAllowCredentials = true
+
+		_, err := newSSEConn(sseOptions{
+			writer:    writer,
+			id:        "unsafe-cors",
+			options:   opts,
+			parentCtx: context.Background(),
+		})
+		if err == nil {
+			t.Fatal("expected wildcard credentialed CORS to be rejected")
+		}
+	})
 }
 
 func TestSSEConnConcurrentHandleMessages(t *testing.T) {
-	t.Run("handles multiple messages concurrently", func(t *testing.T) {
+	t.Run("handles multiple messages pushed concurrently", func(t *testing.T) {
 		writer := newMockResponseWriter()
 		ctx := context.Background()
 		opts := DefaultOptions()
-		opts.MaxConcurrentHandlers = 5
 
 		sseOpts := sseOptions{
 			writer:    writer,
@@ -631,11 +742,10 @@ func TestSSEConnConcurrentHandleMessages(t *testing.T) {
 		}
 	})
 
-	t.Run("respects MaxConcurrentHandlers limit", func(t *testing.T) {
+	t.Run("never runs two handlers at once", func(t *testing.T) {
 		writer := newMockResponseWriter()
 		ctx := context.Background()
 		opts := DefaultOptions()
-		opts.MaxConcurrentHandlers = 2
 
 		sseOpts := sseOptions{
 			writer:    writer,
@@ -663,7 +773,7 @@ func TestSSEConnConcurrentHandleMessages(t *testing.T) {
 			}
 			mu.Unlock()
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 
 			mu.Lock()
 			concurrentCount--
@@ -688,8 +798,8 @@ func TestSSEConnConcurrentHandleMessages(t *testing.T) {
 		time.Sleep(400 * time.Millisecond)
 
 		mu.Lock()
-		if maxConcurrent > 2 {
-			t.Errorf("expected max concurrent handlers to be 2, got %d", maxConcurrent)
+		if maxConcurrent != 1 {
+			t.Errorf("handlers for one connection must run serially: max concurrency was %d, expected 1", maxConcurrent)
 		}
 		mu.Unlock()
 	})

@@ -104,6 +104,37 @@ func TestEndpointAutoDeclineOnUnresponsiveHandler(t *testing.T) {
 	}
 }
 
+func TestConnectionBootstrapPrecedesImmediateJoinAck(t *testing.T) {
+	rig := newWireRig(t, nil, nil)
+	conn := rig.dial()
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"action":      "JOIN_CHANNEL",
+		"channelName": "/room/1",
+		"requestId":   "immediate-join",
+		"event":       "JOIN_CHANNEL",
+		"payload":     map[string]any{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var received []wireMessage
+	for len(received) < 2 {
+		messages, err := readMessages(conn, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		received = append(received, messages...)
+	}
+	if received[0].Action != string(connect) || received[0].Event != string(connectionEvent) {
+		t.Fatalf("first message = action %q event %q, want connection bootstrap", received[0].Action, received[0].Event)
+	}
+	if received[1].Event != string(acknowledgeEvent) {
+		t.Fatalf("second message event = %q, want join acknowledgment", received[1].Event)
+	}
+}
+
 func channelUserForTest(e *Endpoint, channelName, userID string) (*User, error) {
 	ch, err := e.channels.Read(channelName)
 	if err != nil {

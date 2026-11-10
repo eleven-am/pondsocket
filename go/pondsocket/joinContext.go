@@ -70,22 +70,17 @@ func (c *JoinContext) Accept() *JoinContext {
 
 	c.HasResponded = true
 	c.accepted = true
-	if err := c.Channel.addUser(c.conn); err != nil {
-		c.err = wrapF(err, "failed to add user %s to Channel %s", c.conn.GetID(), c.Channel.name)
-		return c
-	}
-
 	ackEvent := Event{
 		Action:      system,
 		ChannelName: c.Channel.name,
 		RequestId:   c.event.RequestId,
 		Event:       string(acknowledgeEvent),
 		Payload:     make(map[string]interface{}),
+		Recipients:  []string{c.conn.GetID()},
 	}
 
-	recp := recipients{userIds: []string{c.conn.GetID()}}
-	if err := c.Channel.sendMessage(string(channelEntity), recp, ackEvent); err != nil {
-		c.err = wrapF(err, "failed to send join acknowledgment for Channel %s", c.Channel.name)
+	if err := c.Channel.addUserAcknowledged(c.conn, &ackEvent); err != nil {
+		c.err = wrapF(err, "failed to add user %s to Channel %s", c.conn.GetID(), c.Channel.name)
 	}
 
 	return c
