@@ -1472,24 +1472,22 @@ impl Channel {
                         .await?;
                 }
             }
-            "user:get_response" => {
-                if !self.has_user(user_id).await {
-                    if let Some(assigns) = event.payload.get("assigns").and_then(Value::as_object) {
-                        self.assigns
-                            .write()
-                            .await
-                            .insert(user_id.to_owned(), assigns.clone());
-                    }
-                    if let Some(presence) = event.payload.get("presence").and_then(Value::as_object)
-                        && !presence.is_empty()
-                    {
-                        self.presence
-                            .write()
-                            .await
-                            .insert(user_id.to_owned(), presence.clone());
-                    }
-                    self.track_node_user(&event.node_id, user_id).await;
+            "user:get_response" if !self.has_user(user_id).await => {
+                if let Some(assigns) = event.payload.get("assigns").and_then(Value::as_object) {
+                    self.assigns
+                        .write()
+                        .await
+                        .insert(user_id.to_owned(), assigns.clone());
                 }
+                if let Some(presence) = event.payload.get("presence").and_then(Value::as_object)
+                    && !presence.is_empty()
+                {
+                    self.presence
+                        .write()
+                        .await
+                        .insert(user_id.to_owned(), presence.clone());
+                }
+                self.track_node_user(&event.node_id, user_id).await;
             }
             _ => {}
         }
