@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::errors::{Result, not_found};
+use crate::errors::{Result, bad_request, not_found};
 use crate::types::Route;
 
 pub fn parse(route: &str, current_path: &str) -> Result<Route> {
@@ -20,15 +20,38 @@ pub fn parse(route: &str, current_path: &str) -> Result<Route> {
         for part in query_string.split('&') {
             let (key, value) = part.split_once('=').unwrap_or((part, ""));
             query
-                .entry(percent_decode(key))
+                .entry(form_percent_decode(key))
                 .or_insert_with(Vec::new)
-                .push(percent_decode(value));
+                .push(form_percent_decode(value));
         }
     }
 
     let route_segments = split_path(route);
     let path_segments = split_path(path);
-    let wildcard_index = route_segments.iter().position(|s| s == "*");
+    let wildcard_indexes = route_segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| (segment == "*").then_some(index))
+        .collect::<Vec<_>>();
+    if wildcard_indexes.len() > 1
+        || wildcard_indexes
+            .first()
+            .is_some_and(|index| *index + 1 != route_segments.len())
+    {
+        return Err(bad_request(
+            route,
+            "route wildcard must appear once and as the final segment",
+        ));
+    }
+    if route_segments.iter().any(|segment| {
+        segment.strip_prefix(':').is_some_and(str::is_empty)
+            || segment
+                .split_once(':')
+                .is_some_and(|(_, parameter)| parameter.is_empty())
+    }) {
+        return Err(bad_request(route, "route parameter name must not be empty"));
+    }
+    let wildcard_index = wildcard_indexes.first().copied();
 
     let matched = if let Some(index) = wildcard_index {
         wildcard = Some(path_segments.get(index..).unwrap_or(&[]).join("/"));
@@ -99,22 +122,35 @@ fn split_path(path: &str) -> Vec<String> {
 }
 
 fn percent_decode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
+    let mut out = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(hex) = u8::from_str_radix(&value[i + 1..i + 3], 16)
+            && let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
         {
-            out.push(hex as char);
+            out.push((high << 4) | low);
             i += 3;
             continue;
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn form_percent_decode(value: &str) -> String {
+    percent_decode(&value.replace('+', " "))
 }
 
 #[cfg(test)]
@@ -130,5 +166,41 @@ mod tests {
             route.query_param("token"),
             &["x".to_string(), "y".to_string()]
         );
+    }
+
+    #[test]
+    fn decodes_utf8_and_form_encoded_query_values() {
+        let route = parse(
+            "/caf%C3%A9/:name",
+            "/caf%C3%A9/Jos%C3%A9?q=hello+world&emoji=%F0%9F%8C%8A",
+        )
+        .unwrap();
+        assert_eq!(route.param("name"), Some("José"));
+        assert_eq!(route.query_param("q"), &["hello world".to_owned()]);
+        assert_eq!(route.query_param("emoji"), &["🌊".to_owned()]);
+    }
+
+    #[test]
+    fn plus_remains_literal_in_path_parameters() {
+        let route = parse("/users/:name", "/users/a+b").unwrap();
+        assert_eq!(route.param("name"), Some("a+b"));
+    }
+
+    #[test]
+    fn rejects_non_terminal_or_duplicate_wildcards() {
+        assert!(parse("/room/*/events", "/room/a/events").is_err());
+        assert!(parse("/room/*/*", "/room/a/b").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_parameter_names() {
+        assert!(parse("/room/:", "/room/value").is_err());
+        assert!(parse("/room/prefix:", "/room/prefix-value").is_err());
+    }
+
+    #[test]
+    fn malformed_percent_encoding_never_panics() {
+        let route = parse("/room/:value", "/room/%aé").unwrap();
+        assert_eq!(route.param("value"), Some("%aé"));
     }
 }

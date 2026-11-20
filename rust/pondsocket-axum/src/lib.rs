@@ -1,10 +1,11 @@
 //! Axum adapter for PondSocket.
 
 use async_trait::async_trait;
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
 use pondsocket::contexts::IncomingConnection;
-use pondsocket::errors::{Result, internal};
+use pondsocket::endpoint::ConnectionPermit;
+use pondsocket::errors::{Result, internal, timeout as pond_timeout};
 use pondsocket::transport::Transport;
 use pondsocket::types::{Event, TransportType};
 use pondsocket::wire::{event_to_json, parse_inbound_text};
@@ -13,23 +14,58 @@ use pondsocket_common::{PondAssigns, uuid};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
+use tokio::time::{Instant, sleep_until, timeout};
 
 pub struct AxumWebSocketTransport {
     id: String,
     assigns: RwLock<PondAssigns>,
     active: RwLock<bool>,
     tx: mpsc::Sender<Message>,
+    send_timeout: Duration,
+}
+
+/// Applies PondSocket's allocation limits during the HTTP upgrade, before a
+/// WebSocket frame is buffered by Axum.
+pub fn configure_websocket_upgrade(
+    upgrade: WebSocketUpgrade,
+    endpoint: &Arc<Endpoint>,
+) -> Result<(WebSocketUpgrade, ConnectionPermit)> {
+    let permit = endpoint.try_reserve_connection()?;
+    Ok((
+        upgrade
+            .max_frame_size(endpoint.max_message_size())
+            .max_message_size(endpoint.max_message_size()),
+        permit,
+    ))
 }
 
 impl AxumWebSocketTransport {
     pub fn new(id: impl Into<String>, assigns: PondAssigns, tx: mpsc::Sender<Message>) -> Self {
+        Self::with_send_timeout(id, assigns, tx, Duration::from_secs(30))
+    }
+
+    pub fn with_send_timeout(
+        id: impl Into<String>,
+        assigns: PondAssigns,
+        tx: mpsc::Sender<Message>,
+        send_timeout: Duration,
+    ) -> Self {
         Self {
             id: id.into(),
             assigns: RwLock::new(assigns),
             active: RwLock::new(true),
             tx,
+            send_timeout,
         }
+    }
+
+    async fn send_raw(&self, message: Message) -> Result<()> {
+        timeout(self.send_timeout, self.tx.send(message))
+            .await
+            .map_err(|_| pond_timeout("", "websocket writer queue timed out"))?
+            .map_err(|_| internal("", "websocket writer closed"))
     }
 }
 
@@ -41,15 +77,12 @@ impl Transport for AxumWebSocketTransport {
 
     async fn send_event(&self, event: Event) -> Result<()> {
         let text = event_to_json(&event).map_err(|e| internal("", e.to_string()))?;
-        self.tx
-            .send(Message::Text(text.into()))
-            .await
-            .map_err(|_| internal("", "websocket writer closed"))
+        self.send_raw(Message::Text(text.into())).await
     }
 
     async fn close(&self) -> Result<()> {
         *self.active.write().await = false;
-        let _ = self.tx.send(Message::Close(None)).await;
+        let _ = timeout(self.send_timeout, self.tx.send(Message::Close(None))).await;
         Ok(())
     }
 
@@ -84,12 +117,42 @@ pub struct RequestParts {
 }
 
 pub async fn handle_socket(pond: Arc<PondSocket>, socket: WebSocket, request: RequestParts) {
+    handle_socket_inner(pond, socket, request, None).await;
+}
+
+/// Handles a socket using a capacity reservation acquired before the upgrade.
+pub async fn handle_socket_with_permit(
+    pond: Arc<PondSocket>,
+    socket: WebSocket,
+    request: RequestParts,
+    permit: ConnectionPermit,
+) {
+    handle_socket_inner(pond, socket, request, Some(permit)).await;
+}
+
+async fn handle_socket_inner(
+    pond: Arc<PondSocket>,
+    socket: WebSocket,
+    request: RequestParts,
+    permit: Option<ConnectionPermit>,
+) {
     let Some(matched) = pond.match_endpoint(&request.path).await else {
         let mut socket = socket;
         let _ = socket.send(Message::Close(None)).await;
         return;
     };
     let endpoint = matched.endpoint;
+    let permit = match permit {
+        Some(permit) => permit,
+        None => match endpoint.try_reserve_connection() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut socket = socket;
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+        },
+    };
     let incoming = IncomingConnection {
         id: String::new(),
         headers: request.headers,
@@ -108,39 +171,71 @@ pub async fn handle_socket(pond: Arc<PondSocket>, socket: WebSocket, request: Re
     }
 
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<Message>(1024);
-    let transport = Arc::new(AxumWebSocketTransport::new(
+    let (tx, mut rx) = mpsc::channel::<Message>(endpoint.internal_queue_buffer());
+    let transport = Arc::new(AxumWebSocketTransport::with_send_timeout(
         ctx.user_id.clone(),
         ctx.assigns(),
         tx,
+        endpoint.internal_queue_timeout(),
     ));
+    let writer_timeout = endpoint.internal_queue_timeout();
+    let mut writer = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            match timeout(writer_timeout, sender.send(message)).await {
+                Ok(Ok(())) => {}
+                _ => break,
+            }
+        }
+    });
     if endpoint
-        .register_transport(transport.clone())
+        .register_transport_with_permit(transport.clone(), permit)
         .await
         .is_err()
     {
-        let _ = sender.send(Message::Close(None)).await;
+        let _ = transport.close().await;
+        writer.abort();
+        let _ = writer.await;
         return;
     }
     send_pending_reply(&ctx, transport.clone()).await;
 
-    let writer = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            if sender.send(message).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    read_loop(endpoint.clone(), transport.clone(), &mut receiver).await;
+    tokio::select! {
+        _ = read_loop(endpoint.clone(), transport.clone(), &mut receiver) => {}
+        _ = &mut writer => {}
+    }
     let _ = endpoint.unregister_transport(transport.id()).await;
     let _ = transport.close().await;
-    writer.abort();
+    if !writer.is_finished() {
+        writer.abort();
+    }
+    let _ = writer.await;
 }
 
 enum Inbound {
     Dispatch(Event),
     Feedback { event: Event, close: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivenessTimerAction {
+    Ping,
+    Close,
+}
+
+fn liveness_timer_action(
+    now: Instant,
+    last_activity: Instant,
+    probe_sent: Option<Instant>,
+    pong_timeout: Duration,
+    idle_timeout: Duration,
+) -> LivenessTimerAction {
+    if now.duration_since(last_activity) >= idle_timeout
+        || probe_sent.is_some_and(|sent| now.duration_since(sent) >= pong_timeout)
+    {
+        LivenessTimerAction::Close
+    } else {
+        LivenessTimerAction::Ping
+    }
 }
 
 fn gateway_error_event(message: impl Into<String>) -> Event {
@@ -174,9 +269,49 @@ async fn read_loop(
     transport: Arc<AxumWebSocketTransport>,
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
 ) {
-    while let Some(next) = receiver.next().await {
-        let Ok(message) = next else {
-            break;
+    let ping_interval = endpoint.socket_ping_interval();
+    let pong_timeout = endpoint.socket_pong_timeout();
+    let idle_timeout = endpoint.socket_idle_timeout();
+    let mut last_activity = Instant::now();
+    let mut probe_sent = None;
+    loop {
+        let idle_deadline = last_activity + idle_timeout;
+        let liveness_deadline = probe_sent
+            .map(|sent| sent + pong_timeout)
+            .unwrap_or(last_activity + ping_interval);
+        let deadline = idle_deadline.min(liveness_deadline);
+        let message = tokio::select! {
+            next = receiver.next() => {
+                let Some(Ok(message)) = next else {
+                    break;
+                };
+                last_activity = Instant::now();
+                probe_sent = None;
+                message
+            }
+            _ = sleep_until(deadline) => {
+                let now = Instant::now();
+                match liveness_timer_action(
+                    now,
+                    last_activity,
+                    probe_sent,
+                    pong_timeout,
+                    idle_timeout,
+                ) {
+                    LivenessTimerAction::Close => break,
+                    LivenessTimerAction::Ping => {
+                        if transport
+                            .send_raw(Message::Ping(Vec::new().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        probe_sent = Some(now);
+                        continue;
+                    }
+                }
+            }
         };
         let outcome = match message {
             Message::Text(text) => classify_text(&text, endpoint.max_message_size()),
@@ -197,7 +332,13 @@ async fn read_loop(
                 }
             }
             Message::Close(_) => break,
-            _ => continue,
+            Message::Ping(payload) => {
+                if transport.send_raw(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            Message::Pong(_) => continue,
         };
         match outcome {
             Inbound::Dispatch(event) => {
@@ -239,6 +380,37 @@ mod tests {
                 .get("message")
                 .and_then(Value::as_str)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn silent_socket_closes_after_probe_timeout() {
+        let start = Instant::now();
+        let probe = start + Duration::from_secs(5);
+        assert_eq!(
+            liveness_timer_action(
+                probe + Duration::from_secs(2),
+                start,
+                Some(probe),
+                Duration::from_secs(2),
+                Duration::from_secs(30),
+            ),
+            LivenessTimerAction::Close
+        );
+    }
+
+    #[test]
+    fn active_socket_gets_ping_before_idle_close() {
+        let start = Instant::now();
+        assert_eq!(
+            liveness_timer_action(
+                start + Duration::from_secs(5),
+                start,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(30),
+            ),
+            LivenessTimerAction::Ping
         );
     }
 

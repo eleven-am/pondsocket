@@ -92,6 +92,8 @@ pub struct User {
 pub struct Options {
     pub max_message_size: usize,
     pub internal_queue_timeout: Duration,
+    /// Maximum execution time for user handlers and async hooks.
+    pub handler_timeout: Duration,
     pub internal_queue_buffer: usize,
     pub dispatch_concurrency: usize,
     pub max_connections: usize,
@@ -99,6 +101,12 @@ pub struct Options {
     pub namespace: String,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
+    /// Interval between server WebSocket liveness probes.
+    pub socket_ping_interval: Duration,
+    /// Maximum wait for inbound activity after a server Ping.
+    pub socket_pong_timeout: Duration,
+    /// Maximum time an upgraded socket may remain completely silent.
+    pub socket_idle_timeout: Duration,
     pub hooks: Option<Arc<Hooks>>,
 }
 
@@ -107,6 +115,7 @@ impl Default for Options {
         Self {
             max_message_size: 1024 * 1024,
             internal_queue_timeout: Duration::from_secs(30),
+            handler_timeout: Duration::from_secs(30),
             internal_queue_buffer: 128,
             dispatch_concurrency: 32,
             max_connections: 0,
@@ -114,7 +123,32 @@ impl Default for Options {
             namespace: "default".to_owned(),
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(90),
+            socket_ping_interval: Duration::from_secs(30),
+            socket_pong_timeout: Duration::from_secs(10),
+            socket_idle_timeout: Duration::from_secs(90),
             hooks: None,
         }
+    }
+}
+
+impl Options {
+    /// Returns a safe runtime configuration with invalid zero values clamped
+    /// and heartbeat expiry never shorter than its publish interval.
+    pub fn normalized(mut self) -> Self {
+        let minimum = Duration::from_millis(1);
+        self.max_message_size = self.max_message_size.max(1);
+        self.internal_queue_buffer = self.internal_queue_buffer.max(1);
+        self.dispatch_concurrency = self.dispatch_concurrency.max(1);
+        self.internal_queue_timeout = self.internal_queue_timeout.max(minimum);
+        self.handler_timeout = self.handler_timeout.max(minimum);
+        self.heartbeat_interval = self.heartbeat_interval.max(minimum);
+        self.heartbeat_timeout = self.heartbeat_timeout.max(self.heartbeat_interval);
+        self.socket_ping_interval = self.socket_ping_interval.max(minimum);
+        self.socket_pong_timeout = self.socket_pong_timeout.max(minimum);
+        self.socket_idle_timeout = self.socket_idle_timeout.max(self.socket_pong_timeout);
+        if self.namespace.is_empty() {
+            self.namespace = "default".to_owned();
+        }
+        self
     }
 }

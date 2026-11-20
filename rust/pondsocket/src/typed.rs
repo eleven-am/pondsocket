@@ -349,7 +349,7 @@ impl Endpoint {
         self: &Arc<Self>,
         pattern: impl Into<String>,
         handler: H,
-    ) -> TypedLobby<S>
+    ) -> Result<TypedLobby<S>>
     where
         S: PondSchema + Send + Sync + 'static,
         H: for<'a> Fn(TypedJoinContext<'a, S>) -> BoxHandlerFuture<'a> + Send + Sync + 'static,
@@ -362,7 +362,7 @@ impl Endpoint {
                     _schema: PhantomData,
                 },
             )
-            .await;
-        TypedLobby::new(lobby)
+            .await?;
+        Ok(TypedLobby::new(lobby))
     }
 }

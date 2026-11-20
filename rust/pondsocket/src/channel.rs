@@ -1,21 +1,29 @@
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use pondsocket_common::{PondAssigns, PresenceEventType, ServerAction, uuid};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Instant;
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use crate::contexts::{EventContext, LeaveContext, OutgoingContext};
+use crate::endpoint::Endpoint;
 use crate::errors::{Result, conflict, internal, not_found};
+use crate::liveness::NodeLiveness;
 use crate::lobby::Lobby;
 use crate::parser::parse;
-use crate::pubsub::{PubSub, SubscriptionId, format_heartbeat_topic, format_topic};
+use crate::pubsub::{PubSub, PubSubFailureHandler, SubscriptionId, format_topic, pubsub_handler};
 use crate::transport::Transport;
 use crate::types::{Event, Options, User};
+
+tokio::task_local! {
+    static DELIVERY_USER_ID: String;
+}
 
 #[async_trait]
 pub trait EventHandler: Send + Sync {
@@ -80,6 +88,259 @@ pub struct OutgoingRegistration {
 struct DispatchItem {
     event: Event,
     recipients: Vec<String>,
+    completions: Option<Vec<oneshot::Sender<Result<()>>>>,
+    enqueued: Option<oneshot::Sender<Result<()>>>,
+    post_delivery: Option<PostDeliveryAction>,
+}
+
+#[derive(Clone)]
+struct PostDeliveryAction {
+    user_id: String,
+    reason: String,
+}
+
+struct DeliveryItem {
+    channel: Arc<Channel>,
+    event: Event,
+    user: User,
+    completion: Option<oneshot::Sender<Result<()>>>,
+    post_delivery: Option<PostDeliveryAction>,
+}
+
+struct DeliveryEntry {
+    tx: mpsc::Sender<DeliveryItem>,
+    task: JoinHandle<()>,
+    owner: bool,
+    memberships: usize,
+}
+
+/// One bounded FIFO per endpoint connection, shared by every channel joined by
+/// that connection. This is the final ordering point before the transport.
+pub(crate) struct DeliveryHub {
+    buffer_size: usize,
+    entries: RwLock<HashMap<String, DeliveryEntry>>,
+    endpoint: OnceLock<Weak<Endpoint>>,
+    failed: Mutex<HashSet<String>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChannelLifecycle {
+    New,
+    Active,
+    Closed,
+}
+
+impl DeliveryHub {
+    pub(crate) fn new(buffer_size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            buffer_size: buffer_size.max(1),
+            entries: RwLock::new(HashMap::new()),
+            endpoint: OnceLock::new(),
+            failed: Mutex::new(HashSet::new()),
+        })
+    }
+
+    pub(crate) fn bind_endpoint(&self, endpoint: Weak<Endpoint>) {
+        let _ = self.endpoint.set(endpoint);
+    }
+
+    pub(crate) async fn register_owner(self: &Arc<Self>, transport: Arc<dyn Transport>) {
+        self.register(transport, true).await;
+    }
+
+    pub(crate) async fn register_membership(self: &Arc<Self>, transport: Arc<dyn Transport>) {
+        self.register(transport, false).await;
+    }
+
+    async fn register(self: &Arc<Self>, transport: Arc<dyn Transport>, owner: bool) {
+        let user_id = transport.id().to_owned();
+        let mut entries = self.entries.write().await;
+        if let Some(entry) = entries.get_mut(&user_id) {
+            if owner {
+                entry.owner = true;
+            } else {
+                entry.memberships += 1;
+            }
+            return;
+        }
+        self.failed.lock().await.remove(&user_id);
+        let (tx, mut rx) = mpsc::channel::<DeliveryItem>(self.buffer_size);
+        let worker_user_id = user_id.clone();
+        let hub = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            DELIVERY_USER_ID
+                .scope(worker_user_id.clone(), async move {
+                    while let Some(item) = rx.recv().await {
+                        let mut result = item
+                            .channel
+                            .deliver_one(item.event, item.user, transport.clone())
+                            .await;
+                        if result.is_ok()
+                            && let Some(action) = item.post_delivery
+                            && action.user_id == worker_user_id
+                        {
+                            result = item
+                                .channel
+                                .remove_user(&worker_user_id, &action.reason)
+                                .await;
+                        }
+                        match result {
+                            Ok(()) => {
+                                if let Some(completion) = item.completion {
+                                    let _ = completion.send(Ok(()));
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(completion) = item.completion {
+                                    let _ = completion.send(Err(error));
+                                }
+                                if let Some(hub) = hub.upgrade() {
+                                    if hub.has_supervisor() {
+                                        hub.report_failure(&worker_user_id).await;
+                                    } else {
+                                        let _ = item
+                                            .channel
+                                            .remove_user(&worker_user_id, "delivery_failed")
+                                            .await;
+                                        let _ = transport.close().await;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                })
+                .await;
+        });
+        entries.insert(
+            user_id,
+            DeliveryEntry {
+                tx,
+                task,
+                owner,
+                memberships: usize::from(!owner),
+            },
+        );
+    }
+
+    pub(crate) async fn unregister_membership(&self, user_id: &str) {
+        let entry = {
+            let mut entries = self.entries.write().await;
+            let Some(entry) = entries.get_mut(user_id) else {
+                return;
+            };
+            entry.memberships = entry.memberships.saturating_sub(1);
+            if entry.owner || entry.memberships > 0 {
+                return;
+            }
+            entries.remove(user_id)
+        };
+        if let Some(entry) = entry {
+            drop(entry.tx);
+            let is_current = DELIVERY_USER_ID
+                .try_with(|current| current == user_id)
+                .unwrap_or(false);
+            if !is_current {
+                entry.task.abort();
+                let _ = entry.task.await;
+            }
+        }
+    }
+
+    pub(crate) async fn unregister(&self, user_id: &str) {
+        if let Some(entry) = self.entries.write().await.remove(user_id) {
+            drop(entry.tx);
+            entry.task.abort();
+            let _ = entry.task.await;
+        }
+    }
+
+    pub(crate) async fn close(&self) {
+        let entries = self.entries.write().await.drain().collect::<Vec<_>>();
+        let current_user = DELIVERY_USER_ID.try_with(Clone::clone).ok();
+        for (user_id, entry) in entries {
+            drop(entry.tx);
+            if current_user.as_deref() != Some(&user_id) {
+                entry.task.abort();
+                let _ = entry.task.await;
+            }
+        }
+        self.failed.lock().await.clear();
+    }
+
+    async fn report_failure(self: &Arc<Self>, user_id: &str) {
+        let Some(endpoint) = self.endpoint.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        if !self.failed.lock().await.insert(user_id.to_owned()) {
+            return;
+        }
+        let user_id = user_id.to_owned();
+        tokio::spawn(async move {
+            endpoint.handle_delivery_failure(&user_id).await;
+        });
+    }
+
+    fn has_supervisor(&self) -> bool {
+        self.endpoint
+            .get()
+            .is_some_and(|endpoint| endpoint.strong_count() > 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn entry_count(&self) -> usize {
+        self.entries.read().await.len()
+    }
+
+    async fn enqueue(
+        self: &Arc<Self>,
+        user_id: &str,
+        channel: Arc<Channel>,
+        event: Event,
+        completion: Option<oneshot::Sender<Result<()>>>,
+        post_delivery: Option<PostDeliveryAction>,
+    ) -> Result<()> {
+        let sender = self
+            .entries
+            .read()
+            .await
+            .get(user_id)
+            .map(|entry| entry.tx.clone());
+        let Some(sender) = sender else {
+            let error = internal(user_id, "transport delivery queue is not registered");
+            if let Some(completion) = completion {
+                let _ = completion.send(Err(error.clone()));
+            }
+            self.report_failure(user_id).await;
+            return Err(error);
+        };
+        let user = channel.get_user(user_id).await?;
+        match sender.try_send(DeliveryItem {
+            channel,
+            event,
+            user,
+            completion,
+            post_delivery,
+        }) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let (message, mut item) = match error {
+                    mpsc::error::TrySendError::Full(item) => {
+                        ("slow consumer delivery queue full", item)
+                    }
+                    mpsc::error::TrySendError::Closed(item) => {
+                        ("transport delivery queue closed", item)
+                    }
+                };
+                let error = internal(user_id, message);
+                if let Some(completion) = item.completion.take() {
+                    let _ = completion.send(Err(error.clone()));
+                }
+                self.report_failure(user_id).await;
+                Err(error)
+            }
+        }
+    }
 }
 
 pub struct Channel {
@@ -97,16 +358,15 @@ pub struct Channel {
     dispatch_tx: mpsc::Sender<DispatchItem>,
     dispatch_rx: RwLock<Option<mpsc::Receiver<DispatchItem>>>,
     dispatch_task: RwLock<Option<JoinHandle<()>>>,
-    dispatch_semaphore: Arc<Semaphore>,
+    delivery_hub: Arc<DeliveryHub>,
+    owns_delivery_hub: bool,
+    lifecycle: Mutex<ChannelLifecycle>,
+    liveness: Arc<NodeLiveness>,
     active: RwLock<bool>,
-    node_last_seen: RwLock<HashMap<String, Instant>>,
     node_users: RwLock<HashMap<String, HashSet<String>>>,
-    heartbeat_task: RwLock<Option<JoinHandle<()>>>,
-    stale_task: RwLock<Option<JoinHandle<()>>>,
     lobby: Weak<Lobby>,
     in_flight_joins: AtomicUsize,
     pubsub_sub_id: RwLock<Option<SubscriptionId>>,
-    heartbeat_sub_id: RwLock<Option<SubscriptionId>>,
 }
 
 pub struct ChannelConfig {
@@ -121,16 +381,41 @@ pub struct ChannelConfig {
 }
 
 impl Channel {
-    pub fn new(config: ChannelConfig) -> Arc<Self> {
-        let (dispatch_tx, dispatch_rx) = mpsc::channel(config.options.internal_queue_buffer);
+    pub fn new(mut config: ChannelConfig) -> Arc<Self> {
+        config.options = config.options.normalized();
+        if config.pubsub.is_some() && config.options.node_id.is_empty() {
+            config.options.node_id = uuid();
+        }
+        let delivery_hub = DeliveryHub::new(config.options.internal_queue_buffer);
+        let liveness = NodeLiveness::new(&config.options, config.pubsub.clone());
+        Self::build(config, delivery_hub, liveness, true)
+    }
+
+    pub(crate) fn new_with_runtime(
+        mut config: ChannelConfig,
+        delivery_hub: Arc<DeliveryHub>,
+        liveness: Arc<NodeLiveness>,
+    ) -> Arc<Self> {
+        config.options = config.options.normalized();
+        Self::build(config, delivery_hub, liveness, false)
+    }
+
+    fn build(
+        config: ChannelConfig,
+        delivery_hub: Arc<DeliveryHub>,
+        liveness: Arc<NodeLiveness>,
+        owns_delivery_hub: bool,
+    ) -> Arc<Self> {
+        let mut options = config.options.normalized();
+        if config.pubsub.is_some() && options.node_id.is_empty() {
+            options.node_id = uuid();
+        }
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(options.internal_queue_buffer);
         Arc::new(Self {
             name: config.name,
             endpoint_path: config.endpoint_path,
-            node_id: config.options.node_id.clone(),
-            dispatch_semaphore: Arc::new(Semaphore::new(
-                config.options.dispatch_concurrency.max(1),
-            )),
-            options: config.options,
+            node_id: options.node_id.clone(),
+            options,
             pubsub: config.pubsub,
             connections: RwLock::new(HashMap::new()),
             assigns: RwLock::new(HashMap::new()),
@@ -141,15 +426,15 @@ impl Channel {
             dispatch_tx,
             dispatch_rx: RwLock::new(Some(dispatch_rx)),
             dispatch_task: RwLock::new(None),
+            delivery_hub,
+            owns_delivery_hub,
+            lifecycle: Mutex::new(ChannelLifecycle::New),
+            liveness,
             active: RwLock::new(false),
-            node_last_seen: RwLock::new(HashMap::new()),
             node_users: RwLock::new(HashMap::new()),
-            heartbeat_task: RwLock::new(None),
-            stale_task: RwLock::new(None),
             lobby: config.lobby,
             in_flight_joins: AtomicUsize::new(0),
             pubsub_sub_id: RwLock::new(None),
-            heartbeat_sub_id: RwLock::new(None),
         })
     }
 
@@ -168,9 +453,25 @@ impl Channel {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        let mut lifecycle = self.lifecycle.lock().await;
+        match *lifecycle {
+            ChannelLifecycle::Active => return Ok(()),
+            ChannelLifecycle::Closed => {
+                return Err(internal(&self.name, "closed channel cannot be restarted"));
+            }
+            ChannelLifecycle::New => {}
+        }
         *self.active.write().await = true;
-        self.subscribe_to_pubsub().await?;
-        self.start_liveness().await?;
+        if let Err(error) = self.subscribe_to_pubsub().await {
+            *self.active.write().await = false;
+            return Err(error);
+        }
+        if let Err(error) = self.liveness.register(self).await {
+            *self.active.write().await = false;
+            let _ = self.unsubscribe_from_pubsub().await;
+            return Err(error);
+        }
+        self.request_channel_state().await;
         if let Some(mut rx) = self.dispatch_rx.write().await.take() {
             let channel = self.clone();
             let task = tokio::spawn(async move {
@@ -186,34 +487,58 @@ impl Channel {
         if let Some(hooks) = &self.options.hooks
             && let Some(metrics) = &hooks.metrics
         {
-            metrics.channel_created(&self.name);
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                metrics.channel_created(&self.name);
+            }));
         }
+        *lifecycle = ChannelLifecycle::Active;
         Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
+        let mut lifecycle = self.lifecycle.lock().await;
+        if *lifecycle == ChannelLifecycle::Closed {
+            return Ok(());
+        }
+        *lifecycle = ChannelLifecycle::Closed;
         *self.active.write().await = false;
-        self.unsubscribe_from_pubsub().await?;
+        let mut first_error = self.unsubscribe_from_pubsub().await.err();
+        if let Err(error) = self.liveness.unregister(self).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         if let Some(task) = self.dispatch_task.write().await.take() {
             task.abort();
+            let _ = task.await;
         }
-        if let Some(task) = self.heartbeat_task.write().await.take() {
-            task.abort();
+        let user_ids = self
+            .connections
+            .write()
+            .await
+            .drain()
+            .map(|(user_id, _)| user_id)
+            .collect::<Vec<_>>();
+        for user_id in user_ids {
+            self.delivery_hub.unregister_membership(&user_id).await;
         }
-        if let Some(task) = self.stale_task.write().await.take() {
-            task.abort();
+        if self.owns_delivery_hub {
+            self.delivery_hub.close().await;
         }
-        self.connections.write().await.clear();
         self.assigns.write().await.clear();
         self.presence.write().await.clear();
-        self.node_last_seen.write().await.clear();
         self.node_users.write().await.clear();
         if let Some(hooks) = &self.options.hooks
             && let Some(metrics) = &hooks.metrics
         {
-            metrics.channel_destroyed(&self.name);
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                metrics.channel_destroyed(&self.name);
+            }));
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub async fn has_user(&self, user_id: &str) -> bool {
@@ -224,28 +549,36 @@ impl Channel {
         self.connections.read().await.len()
     }
 
-    pub async fn add_user(&self, transport: Arc<dyn Transport>) -> Result<()> {
+    pub async fn add_user(self: &Arc<Self>, transport: Arc<dyn Transport>) -> Result<()> {
         if !*self.active.read().await {
             return Err(internal(&self.name, "channel is not active"));
         }
         let user_id = transport.id().to_owned();
+        let assigns = transport.clone_assigns().await;
         let mut connections = self.connections.write().await;
         if connections.contains_key(&user_id) {
             return Err(conflict(&self.name, "user already exists in channel"));
         }
-        let assigns = transport.clone_assigns().await;
-        connections.insert(user_id.clone(), transport);
+        connections.insert(user_id.clone(), transport.clone());
         drop(connections);
+        self.delivery_hub.register_membership(transport).await;
         self.assigns
             .write()
             .await
             .insert(user_id.clone(), assigns.clone());
+        if let Err(error) = self.publish_user_joined(&user_id, &assigns).await {
+            self.connections.write().await.remove(&user_id);
+            self.assigns.write().await.remove(&user_id);
+            self.delivery_hub.unregister_membership(&user_id).await;
+            return Err(error);
+        }
         if let Some(hooks) = &self.options.hooks
             && let Some(metrics) = &hooks.metrics
         {
-            metrics.channel_joined(&user_id, &self.name);
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                metrics.channel_joined(&user_id, &self.name);
+            }));
         }
-        let _ = self.publish_user_joined(&user_id, &assigns).await;
         Ok(())
     }
 
@@ -253,6 +586,7 @@ impl Channel {
         if self.connections.write().await.remove(user_id).is_none() {
             return Ok(());
         }
+        self.delivery_hub.unregister_membership(user_id).await;
         let assigns = self
             .assigns
             .write()
@@ -260,11 +594,19 @@ impl Channel {
             .remove(user_id)
             .unwrap_or_default();
         let presence = self.presence.write().await.remove(user_id);
-        if let Some(old) = presence.clone() {
-            self.publish_presence_change(user_id, PresenceEventType::Leave, old)
-                .await?;
+        let mut first_error = None;
+        if let Some(old) = presence.clone()
+            && let Err(error) = self
+                .publish_presence_change(user_id, PresenceEventType::Leave, old)
+                .await
+        {
+            first_error = Some(error);
         }
-        let _ = self.publish_user_left(user_id).await;
+        if let Err(error) = self.publish_user_left(user_id).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         let user = User {
             id: user_id.to_owned(),
             assigns,
@@ -276,17 +618,36 @@ impl Channel {
                 user,
                 reason: reason.to_owned(),
             };
-            let _ = handler.call(&mut ctx).await;
+            match timeout(
+                self.options.handler_timeout.max(Duration::from_millis(1)),
+                AssertUnwindSafe(handler.call(&mut ctx)).catch_unwind(),
+            )
+            .await
+            {
+                Ok(Ok(Err(error))) if first_error.is_none() => first_error = Some(error),
+                Ok(Err(_)) if first_error.is_none() => {
+                    first_error = Some(internal(&self.name, "leave handler panicked"));
+                }
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(internal(&self.name, "leave handler timed out"));
+                }
+                _ => {}
+            }
         }
         if let Some(hooks) = &self.options.hooks
             && let Some(metrics) = &hooks.metrics
         {
-            metrics.channel_left(user_id, &self.name);
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                metrics.channel_left(user_id, &self.name);
+            }));
         }
         if let Some(lobby) = self.lobby.upgrade() {
             lobby.remove_channel_if_idle(&self.name).await;
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub async fn get_user(&self, user_id: &str) -> Result<User> {
@@ -482,8 +843,15 @@ impl Channel {
             "EVICTED",
             json!({ "reason": reason }),
         );
-        self.send_direct(&[user_id.to_owned()], ev).await?;
-        self.remove_user(user_id, "evicted").await
+        self.send_direct_with_post(
+            &[user_id.to_owned()],
+            ev,
+            PostDeliveryAction {
+                user_id: user_id.to_owned(),
+                reason: "evicted".to_owned(),
+            },
+        )
+        .await
     }
 
     pub async fn handle_incoming_event(
@@ -497,7 +865,16 @@ impl Channel {
                 continue;
             };
             let mut ctx = EventContext::new(self.clone(), event.clone(), user.clone(), route);
-            return reg.handler.call(&mut ctx).await;
+            return match timeout(
+                self.options.handler_timeout.max(Duration::from_millis(1)),
+                AssertUnwindSafe(reg.handler.call(&mut ctx)).catch_unwind(),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(internal(&self.name, "event handler panicked")),
+                Err(_) => Err(internal(&self.name, "event handler timed out")),
+            };
         }
         self.send_system(
             "NOT_FOUND",
@@ -520,9 +897,6 @@ impl Channel {
         recipient_descriptor: Option<String>,
         sender: Option<String>,
     ) -> Result<()> {
-        if recipients.is_empty() {
-            return Ok(());
-        }
         let mut ev = Event::new(
             action_to_str(action),
             &self.name,
@@ -540,31 +914,119 @@ impl Channel {
             ev.from_user_id = sender;
         }
         ev.node_id = self.node_id.clone();
-        self.enqueue_dispatch(DispatchItem {
-            event: ev.clone(),
-            recipients,
-        })
-        .await?;
-        if action == ServerAction::Broadcast {
-            self.publish_event_to_pubsub(ev, "message").await?;
+        let local_result = async {
+            if recipients.is_empty() {
+                return Ok(());
+            }
+            let (enqueued, receiver) = if *self.active.read().await {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            self.enqueue_dispatch(DispatchItem {
+                event: ev.clone(),
+                recipients,
+                completions: None,
+                enqueued,
+                post_delivery: None,
+            })
+            .await?;
+            if let Some(receiver) = receiver {
+                timeout(self.options.internal_queue_timeout, receiver)
+                    .await
+                    .map_err(|_| internal(&self.name, "channel dispatch timed out"))?
+                    .map_err(|_| internal(&self.name, "channel dispatch worker closed"))??;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let remote_result = if action == ServerAction::Broadcast {
+            self.publish_event_to_pubsub(ev, "message").await
+        } else {
+            Ok(())
+        };
+        local_result.and(remote_result)
     }
 
     async fn send_direct(&self, user_ids: &[String], event: Event) -> Result<()> {
-        let transports = {
-            let connections = self.connections.read().await;
-            user_ids
-                .iter()
-                .filter_map(|user_id| connections.get(user_id).cloned())
-                .collect::<Vec<_>>()
-        };
-        for transport in transports {
-            if transport.is_active().await {
-                let _ = transport.send_event(event.clone()).await;
-            }
+        self.send_direct_inner(user_ids, event, None).await
+    }
+
+    async fn send_direct_with_post(
+        &self,
+        user_ids: &[String],
+        event: Event,
+        post_delivery: PostDeliveryAction,
+    ) -> Result<()> {
+        self.send_direct_inner(user_ids, event, Some(post_delivery))
+            .await
+    }
+
+    async fn send_direct_inner(
+        &self,
+        user_ids: &[String],
+        event: Event,
+        post_delivery: Option<PostDeliveryAction>,
+    ) -> Result<()> {
+        if user_ids.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let current_user = DELIVERY_USER_ID.try_with(Clone::clone).ok();
+        let reentrant_user = current_user
+            .as_ref()
+            .filter(|current| user_ids.iter().any(|user_id| user_id == *current));
+        if let Some(current) = reentrant_user {
+            self.enqueue_dispatch(DispatchItem {
+                event: event.clone(),
+                recipients: vec![current.clone()],
+                completions: None,
+                enqueued: None,
+                post_delivery: post_delivery.clone(),
+            })
+            .await?;
+            let others = user_ids
+                .iter()
+                .filter(|user_id| *user_id != current)
+                .cloned()
+                .collect::<Vec<_>>();
+            if others.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send_direct_non_reentrant(&others, event, post_delivery)
+                .await;
+        }
+        self.send_direct_non_reentrant(user_ids, event, post_delivery)
+            .await
+    }
+
+    async fn send_direct_non_reentrant(
+        &self,
+        user_ids: &[String],
+        event: Event,
+        post_delivery: Option<PostDeliveryAction>,
+    ) -> Result<()> {
+        let (completions, receivers): (Vec<_>, Vec<_>) =
+            user_ids.iter().map(|_| oneshot::channel()).unzip();
+        self.enqueue_dispatch(DispatchItem {
+            event,
+            recipients: user_ids.to_vec(),
+            completions: Some(completions),
+            enqueued: None,
+            post_delivery,
+        })
+        .await?;
+        timeout(self.options.internal_queue_timeout, async {
+            for receiver in receivers {
+                receiver
+                    .await
+                    .map_err(|_| internal(&self.name, "channel dispatch worker closed"))??;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| internal(&self.name, "direct delivery timed out"))?
     }
 
     async fn enqueue_dispatch(&self, item: DispatchItem) -> Result<()> {
@@ -618,16 +1080,28 @@ impl Channel {
         if recipients.is_empty() {
             return Ok(());
         }
-        self.enqueue_dispatch(DispatchItem { event, recipients })
-            .await
+        self.enqueue_dispatch(DispatchItem {
+            event,
+            recipients,
+            completions: None,
+            enqueued: None,
+            post_delivery: None,
+        })
+        .await
     }
 
     async fn dispatch_local_best_effort(&self, event: Event, recipients: Vec<String>) {
         if recipients.is_empty() {
             return;
         }
-        self.enqueue_dispatch_best_effort(DispatchItem { event, recipients })
-            .await;
+        self.enqueue_dispatch_best_effort(DispatchItem {
+            event,
+            recipients,
+            completions: None,
+            enqueued: None,
+            post_delivery: None,
+        })
+        .await;
     }
 
     async fn dispatch_pubsub_event(self: &Arc<Self>, mut event: Event) -> Result<()> {
@@ -709,30 +1183,72 @@ impl Channel {
     }
 
     async fn dispatch_item(self: &Arc<Self>, item: DispatchItem) {
+        let mut completions = item.completions.unwrap_or_default().into_iter();
+        let mut first_error = None;
         for recipient_id in item.recipients {
-            let channel = self.clone();
-            let event = item.event.clone();
-            let permit = self.dispatch_semaphore.clone().acquire_owned().await;
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _ = channel.deliver_one(event, &recipient_id).await;
+            let completion = completions.next();
+            if self
+                .delivery_hub
+                .enqueue(
+                    &recipient_id,
+                    self.clone(),
+                    item.event.clone(),
+                    completion,
+                    item.post_delivery.clone(),
+                )
+                .await
+                .is_err()
+            {
+                if first_error.is_none() {
+                    first_error =
+                        Some(internal(&self.name, "recipient delivery queue unavailable"));
+                }
+                if !self.delivery_hub.has_supervisor() {
+                    let channel = self.clone();
+                    let delivery_hub = self.delivery_hub.clone();
+                    tokio::spawn(async move {
+                        delivery_hub.unregister(&recipient_id).await;
+                        if let Some(transport) =
+                            channel.connections.read().await.get(&recipient_id).cloned()
+                        {
+                            let _ = channel.remove_user(&recipient_id, "delivery_failed").await;
+                            let _ = transport.close().await;
+                        }
+                    });
+                }
+            }
+        }
+        if let Some(enqueued) = item.enqueued {
+            let _ = enqueued.send(match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
             });
         }
     }
 
-    async fn deliver_one(self: &Arc<Self>, event: Event, recipient_id: &str) -> Result<()> {
-        let Some(transport) = self.connections.read().await.get(recipient_id).cloned() else {
-            return Ok(());
-        };
+    async fn deliver_one(
+        self: &Arc<Self>,
+        event: Event,
+        user: User,
+        transport: Arc<dyn Transport>,
+    ) -> Result<()> {
         if !transport.is_active().await {
             return Ok(());
         }
-        let user = self.get_user(recipient_id).await?;
         let mut ctx = OutgoingContext::new(self.clone(), event, user, transport.clone());
         for reg in &self.outgoing_handlers {
             if let Ok(route) = parse(&reg.pattern, &ctx.event.event) {
                 ctx.route = route;
-                reg.handler.call(&mut ctx).await?;
+                match timeout(
+                    self.options.handler_timeout.max(Duration::from_millis(1)),
+                    AssertUnwindSafe(reg.handler.call(&mut ctx)).catch_unwind(),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => result?,
+                    Ok(Err(_)) => return Err(internal(&self.name, "outgoing handler panicked")),
+                    Err(_) => return Err(internal(&self.name, "outgoing handler timed out")),
+                }
                 break;
             }
         }
@@ -761,34 +1277,67 @@ impl Channel {
         if self.endpoint_path.is_empty() {
             return Ok(());
         }
+        let failed_channel = Arc::downgrade(self);
+        let on_failure: PubSubFailureHandler = Arc::new(move || {
+            let Some(channel) = failed_channel.upgrade() else {
+                return;
+            };
+            tokio::spawn(async move {
+                channel.fail_pubsub_subscription().await;
+            });
+        });
+        let handler_failure = on_failure.clone();
         let channel = self.clone();
         let id = pubsub
-            .subscribe(
+            .subscribe_supervised(
                 &self.pubsub_pattern(),
-                Arc::new(move |_topic, data| {
+                pubsub_handler(move |_topic, data| {
                     let channel = channel.clone();
-                    tokio::spawn(async move {
-                        let _ = channel.handle_pubsub_message(data).await;
-                    });
+                    let handler_failure = handler_failure.clone();
+                    async move {
+                        if channel.handle_pubsub_message(data).await.is_err() {
+                            handler_failure();
+                        }
+                    }
                 }),
+                on_failure,
             )
             .await?;
         *self.pubsub_sub_id.write().await = Some(id);
         Ok(())
     }
 
+    pub(crate) async fn fail_pubsub_subscription(self: Arc<Self>) {
+        {
+            let mut active = self.active.write().await;
+            if !*active {
+                return;
+            }
+            *active = false;
+        }
+        let transports = self
+            .connections
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for transport in transports {
+            let _ = transport.close().await;
+        }
+        if let Some(lobby) = self.lobby.upgrade() {
+            lobby.remove_failed_channel(&self.name, &self).await;
+        } else {
+            let _ = self.close().await;
+        }
+    }
+
     async fn unsubscribe_from_pubsub(&self) -> Result<()> {
-        if let Some(pubsub) = &self.pubsub {
-            if !self.endpoint_path.is_empty()
-                && let Some(id) = self.pubsub_sub_id.write().await.take()
-            {
-                let _ = pubsub.unsubscribe(&self.pubsub_pattern(), id).await;
-            }
-            if let Some(id) = self.heartbeat_sub_id.write().await.take() {
-                let _ = pubsub
-                    .unsubscribe(&format_heartbeat_topic(self.namespace()), id)
-                    .await;
-            }
+        if let Some(pubsub) = &self.pubsub
+            && !self.endpoint_path.is_empty()
+            && let Some(id) = self.pubsub_sub_id.write().await.take()
+        {
+            let _ = pubsub.unsubscribe(&self.pubsub_pattern(), id).await;
         }
         Ok(())
     }
@@ -947,99 +1496,21 @@ impl Channel {
         Ok(())
     }
 
-    async fn start_liveness(self: &Arc<Self>) -> Result<()> {
-        let Some(pubsub) = self.pubsub.clone() else {
-            return Ok(());
-        };
-        let heartbeat_topic = format_heartbeat_topic(self.namespace());
-
-        let handler_channel = self.clone();
-        let heartbeat_id = pubsub
-            .subscribe(
-                &heartbeat_topic,
-                Arc::new(move |_topic, data| {
-                    let channel = handler_channel.clone();
-                    tokio::spawn(async move {
-                        channel.handle_heartbeat(data).await;
-                    });
-                }),
-            )
-            .await?;
-        *self.heartbeat_sub_id.write().await = Some(heartbeat_id);
-
-        let interval = self.options.heartbeat_interval;
-        let hb_channel = self.clone();
-        let hb_pubsub = pubsub.clone();
-        let hb_topic = heartbeat_topic.clone();
-        let node_id = self.node_id.clone();
-        let heartbeat_task = tokio::spawn(async move {
-            loop {
-                if !*hb_channel.active.read().await {
-                    break;
-                }
-                let bytes = heartbeat_to_bytes(&node_id);
-                let _ = hb_pubsub.publish(&hb_topic, bytes).await;
-                sleep(interval).await;
+    pub(crate) async fn expire_remote_node(self: &Arc<Self>, node: &str) {
+        let users = self.node_users.write().await.remove(node);
+        if let Some(users) = users {
+            let mut assigns = self.assigns.write().await;
+            let mut presence = self.presence.write().await;
+            for user in users {
+                assigns.remove(&user);
+                presence.remove(&user);
             }
-        });
-        *self.heartbeat_task.write().await = Some(heartbeat_task);
-
-        let timeout_duration = self.options.heartbeat_timeout;
-        let stale_channel = self.clone();
-        let stale_task = tokio::spawn(async move {
-            loop {
-                sleep(timeout_duration).await;
-                if !*stale_channel.active.read().await {
-                    break;
-                }
-                stale_channel.cleanup_stale_nodes().await;
-            }
-        });
-        *self.stale_task.write().await = Some(stale_task);
-
-        self.request_channel_state().await;
-        Ok(())
-    }
-
-    async fn handle_heartbeat(&self, data: Vec<u8>) {
-        if let Some(node) = parse_heartbeat_node(&data)
-            && node != self.node_id
-        {
-            self.node_last_seen
-                .write()
-                .await
-                .insert(node, Instant::now());
-        }
-    }
-
-    async fn cleanup_stale_nodes(&self) {
-        let timeout_duration = self.options.heartbeat_timeout;
-        let now = Instant::now();
-        let stale = self
-            .node_last_seen
-            .read()
-            .await
-            .iter()
-            .filter(|(_, seen)| now.duration_since(**seen) >= timeout_duration)
-            .map(|(node, _)| node.clone())
-            .collect::<Vec<_>>();
-        if stale.is_empty() {
-            return;
-        }
-        for node in stale {
-            let users = self.node_users.write().await.remove(&node);
-            if let Some(users) = users {
-                let mut assigns = self.assigns.write().await;
-                let mut presence = self.presence.write().await;
-                for user in users {
-                    assigns.remove(&user);
-                    presence.remove(&user);
-                }
-            }
-            self.node_last_seen.write().await.remove(&node);
         }
         if let Some(lobby) = self.lobby.upgrade() {
-            lobby.remove_channel_if_idle(&self.name).await;
+            let channel_name = self.name.clone();
+            tokio::spawn(async move {
+                lobby.remove_channel_if_idle(&channel_name).await;
+            });
         }
     }
 
@@ -1047,17 +1518,13 @@ impl Channel {
         if node_id.is_empty() {
             return;
         }
+        self.liveness.mark_seen(node_id).await;
         self.node_users
             .write()
             .await
             .entry(node_id.to_owned())
             .or_default()
             .insert(user_id.to_owned());
-        self.node_last_seen
-            .write()
-            .await
-            .entry(node_id.to_owned())
-            .or_insert_with(Instant::now);
     }
 
     async fn untrack_node_user(&self, node_id: &str, user_id: &str) {
@@ -1651,7 +2118,7 @@ fn distributed_bytes_to_event(data: &[u8]) -> Option<Event> {
     }
 }
 
-fn heartbeat_to_bytes(node_id: &str) -> Vec<u8> {
+pub(crate) fn heartbeat_to_bytes(node_id: &str) -> Vec<u8> {
     let mut ev = Event::new(
         "HEARTBEAT",
         "__heartbeat__",
@@ -1663,7 +2130,7 @@ fn heartbeat_to_bytes(node_id: &str) -> Vec<u8> {
     distributed_event_to_bytes(&ev, "heartbeat", "__heartbeat__").unwrap_or_default()
 }
 
-fn parse_heartbeat_node(data: &[u8]) -> Option<String> {
+pub(crate) fn parse_heartbeat_node(data: &[u8]) -> Option<String> {
     let event = distributed_bytes_to_event(data)?;
     if event.action != "HEARTBEAT" {
         return None;
@@ -1681,7 +2148,772 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pubsub::{PubSub, PubSubFailureHandler, PubSubHandler, SubscriptionId};
+    use crate::transport::Transport;
+    use crate::types::TransportType;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
+    use tokio::sync::{Mutex, Notify};
+
+    struct OrderedTransport {
+        id: String,
+        events: Mutex<Vec<String>>,
+    }
+
+    struct BlockingTransport {
+        id: String,
+        started: Notify,
+        release: Notify,
+    }
+
+    struct SelfEvictOutgoing;
+
+    #[async_trait]
+    impl OutgoingHandler for SelfEvictOutgoing {
+        async fn call(&self, ctx: &mut OutgoingContext) -> Result<()> {
+            if ctx.event.event == "trigger" {
+                ctx.channel.evict_user(&ctx.user.id, "self-evicted").await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPubSub {
+        messages: Mutex<Vec<(String, Vec<u8>)>>,
+        subscriptions: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PubSub for RecordingPubSub {
+        async fn subscribe(
+            &self,
+            _pattern: &str,
+            _handler: PubSubHandler,
+        ) -> Result<SubscriptionId> {
+            Ok(self.subscriptions.fetch_add(1, AtomicOrdering::SeqCst) as u64 + 1)
+        }
+
+        async fn subscribe_supervised(
+            &self,
+            topic: &str,
+            handler: PubSubHandler,
+            _on_failure: PubSubFailureHandler,
+        ) -> Result<SubscriptionId> {
+            self.subscribe(topic, handler).await
+        }
+
+        async fn unsubscribe(&self, _pattern: &str, _id: SubscriptionId) -> Result<()> {
+            self.subscriptions.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish(&self, topic: &str, data: Vec<u8>) -> Result<()> {
+            self.messages.lock().await.push((topic.to_owned(), data));
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingPublishPubSub;
+
+    #[derive(Default)]
+    struct FailureTriggerPubSub {
+        failure: Mutex<Option<PubSubFailureHandler>>,
+        next_id: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PubSub for FailureTriggerPubSub {
+        async fn subscribe(&self, _topic: &str, _handler: PubSubHandler) -> Result<SubscriptionId> {
+            Ok(self.next_id.fetch_add(1, AtomicOrdering::SeqCst) as u64)
+        }
+
+        async fn subscribe_supervised(
+            &self,
+            _topic: &str,
+            _handler: PubSubHandler,
+            on_failure: PubSubFailureHandler,
+        ) -> Result<SubscriptionId> {
+            *self.failure.lock().await = Some(on_failure);
+            Ok(self.next_id.fetch_add(1, AtomicOrdering::SeqCst) as u64)
+        }
+
+        async fn unsubscribe(&self, _topic: &str, _id: SubscriptionId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn publish(&self, _topic: &str, _data: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PubSub for FailingPublishPubSub {
+        async fn subscribe(
+            &self,
+            _pattern: &str,
+            _handler: PubSubHandler,
+        ) -> Result<SubscriptionId> {
+            Ok(1)
+        }
+
+        async fn subscribe_supervised(
+            &self,
+            topic: &str,
+            handler: PubSubHandler,
+            _on_failure: PubSubFailureHandler,
+        ) -> Result<SubscriptionId> {
+            self.subscribe(topic, handler).await
+        }
+
+        async fn unsubscribe(&self, _pattern: &str, _id: SubscriptionId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn publish(&self, _topic: &str, _data: Vec<u8>) -> Result<()> {
+            Err(crate::errors::unavailable("pubsub", "publish failed"))
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Transport for OrderedTransport {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn send_event(&self, event: Event) -> Result<()> {
+            if event.event == "first" {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            self.events.lock().await.push(event.event);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn transport_type(&self) -> TransportType {
+            TransportType::InMemory
+        }
+
+        async fn is_active(&self) -> bool {
+            true
+        }
+
+        async fn get_assign(&self, _key: &str) -> Option<Value> {
+            None
+        }
+
+        async fn set_assign(&self, _key: &str, _value: Value) {}
+
+        async fn clone_assigns(&self) -> PondAssigns {
+            PondAssigns::new()
+        }
+    }
+
+    #[async_trait]
+    impl Transport for BlockingTransport {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn send_event(&self, _event: Event) -> Result<()> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.release.notify_waiters();
+            Ok(())
+        }
+
+        fn transport_type(&self) -> TransportType {
+            TransportType::InMemory
+        }
+
+        async fn is_active(&self) -> bool {
+            true
+        }
+
+        async fn get_assign(&self, _key: &str) -> Option<Value> {
+            None
+        }
+
+        async fn set_assign(&self, _key: &str, _value: Value) {}
+
+        async fn clone_assigns(&self) -> PondAssigns {
+            PondAssigns::new()
+        }
+    }
+
+    fn standalone_channel(
+        name: &str,
+        options: Options,
+        pubsub: Option<Arc<dyn PubSub>>,
+        outgoing_handlers: Vec<OutgoingRegistration>,
+    ) -> Arc<Channel> {
+        Channel::new(ChannelConfig {
+            name: name.to_owned(),
+            endpoint_path: "/socket".to_owned(),
+            options,
+            pubsub,
+            event_handlers: Vec::new(),
+            outgoing_handlers,
+            leave_handler: None,
+            lobby: Weak::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn standalone_membership_churn_releases_delivery_workers() {
+        let channel = standalone_channel("/churn", Options::default(), None, Vec::new());
+        channel.start().await.unwrap();
+
+        for index in 0..64 {
+            let transport = Arc::new(crate::transport::MemoryTransport::new(
+                format!("user-{index}"),
+                PondAssigns::new(),
+            ));
+            let weak = Arc::downgrade(&transport);
+            channel.add_user(transport.clone()).await.unwrap();
+            channel
+                .remove_user(transport.id(), "test_churn")
+                .await
+                .unwrap();
+            drop(transport);
+            assert_eq!(channel.delivery_hub.entry_count().await, 0);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_standalone_add_releases_delivery_worker() {
+        let pubsub: Arc<dyn PubSub> = Arc::new(FailingPublishPubSub);
+        let channel = standalone_channel(
+            "/failed-add",
+            Options {
+                node_id: "node-a".to_owned(),
+                ..Options::default()
+            },
+            Some(pubsub),
+            Vec::new(),
+        );
+        channel.start().await.unwrap();
+        let transport = Arc::new(crate::transport::MemoryTransport::new(
+            "failed",
+            PondAssigns::new(),
+        ));
+        let weak = Arc::downgrade(&transport);
+
+        assert!(channel.add_user(transport.clone()).await.is_err());
+        drop(transport);
+
+        assert_eq!(channel.delivery_hub.entry_count().await, 0);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn standalone_close_releases_delivery_workers() {
+        let channel = standalone_channel("/close", Options::default(), None, Vec::new());
+        channel.start().await.unwrap();
+        let transport = Arc::new(crate::transport::MemoryTransport::new(
+            "user",
+            PondAssigns::new(),
+        ));
+        let weak = Arc::downgrade(&transport);
+        channel.add_user(transport.clone()).await.unwrap();
+
+        channel.close().await.unwrap();
+        drop(transport);
+
+        assert_eq!(channel.delivery_hub.entry_count().await, 0);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_is_idempotent_and_close_is_terminal() {
+        let pubsub = Arc::new(RecordingPubSub::default());
+        let channel = standalone_channel(
+            "/lifecycle",
+            Options {
+                node_id: "node-a".to_owned(),
+                ..Options::default()
+            },
+            Some(pubsub.clone()),
+            Vec::new(),
+        );
+
+        channel.start().await.unwrap();
+        channel.start().await.unwrap();
+        assert_eq!(pubsub.subscriptions.load(AtomicOrdering::SeqCst), 2);
+        channel.close().await.unwrap();
+        channel.close().await.unwrap();
+        assert_eq!(pubsub.subscriptions.load(AtomicOrdering::SeqCst), 0);
+        assert!(channel.start().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn outgoing_handler_self_evict_delivers_before_removal() {
+        let channel = standalone_channel(
+            "/self-evict",
+            Options::default(),
+            None,
+            vec![OutgoingRegistration {
+                pattern: "*".to_owned(),
+                handler: Arc::new(SelfEvictOutgoing),
+            }],
+        );
+        channel.start().await.unwrap();
+        let transport = Arc::new(OrderedTransport {
+            id: "user".to_owned(),
+            events: Mutex::new(Vec::new()),
+        });
+        channel.add_user(transport.clone()).await.unwrap();
+
+        channel.broadcast("trigger", json!({})).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while channel.has_user("user").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("self eviction never completed");
+        assert_eq!(
+            *transport.events.lock().await,
+            vec!["trigger".to_owned(), "EVICTED".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn reentrant_multi_recipient_direct_surfaces_other_recipient_failure() {
+        let channel = standalone_channel("/direct", Options::default(), None, Vec::new());
+        channel.start().await.unwrap();
+        let transport = Arc::new(OrderedTransport {
+            id: "user".to_owned(),
+            events: Mutex::new(Vec::new()),
+        });
+        channel.add_user(transport.clone()).await.unwrap();
+
+        let result = DELIVERY_USER_ID
+            .scope("user".to_owned(), async {
+                channel
+                    .send_system(
+                        "direct",
+                        json!({}),
+                        "request",
+                        &["user".to_owned(), "missing".to_owned()],
+                    )
+                    .await
+            })
+            .await;
+
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.events.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*transport.events.lock().await, vec!["direct".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn adv_delivery_is_fifo_for_each_transport() {
+        let lobby = crate::lobby::Lobby::new("/chat/:room", "/", Options::default(), None);
+        let channel = lobby.get_or_create_channel("/chat/ordered").await.unwrap();
+        let transport = Arc::new(OrderedTransport {
+            id: "u1".to_owned(),
+            events: Mutex::new(Vec::new()),
+        });
+        channel.add_user(transport.clone()).await.unwrap();
+
+        channel.broadcast("first", json!({})).await.unwrap();
+        channel.broadcast("second", json!({})).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if transport.events.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordered deliveries did not complete");
+        assert_eq!(
+            *transport.events.lock().await,
+            vec!["first".to_owned(), "second".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn adv_delivery_is_fifo_across_channels_on_one_connection() {
+        let options = Options::default();
+        let hub = DeliveryHub::new(options.internal_queue_buffer);
+        let build = |name: &str| {
+            Channel::new_with_runtime(
+                ChannelConfig {
+                    name: name.to_owned(),
+                    endpoint_path: "/".to_owned(),
+                    options: options.clone(),
+                    pubsub: None,
+                    event_handlers: Vec::new(),
+                    outgoing_handlers: Vec::new(),
+                    leave_handler: None,
+                    lobby: Weak::new(),
+                },
+                hub.clone(),
+                NodeLiveness::new(&options, None),
+            )
+        };
+        let first = build("/first");
+        let second = build("/second");
+        first.start().await.unwrap();
+        second.start().await.unwrap();
+        let transport = Arc::new(OrderedTransport {
+            id: "u1".to_owned(),
+            events: Mutex::new(Vec::new()),
+        });
+        first.add_user(transport.clone()).await.unwrap();
+        second.add_user(transport.clone()).await.unwrap();
+
+        first.broadcast("first", json!({})).await.unwrap();
+        second.broadcast("second", json!({})).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if transport.events.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *transport.events.lock().await,
+            vec!["first".to_owned(), "second".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn adv_slow_consumer_does_not_block_other_connections() {
+        let lobby = crate::lobby::Lobby::new(
+            "/chat/:room",
+            "/",
+            Options {
+                internal_queue_buffer: 1,
+                internal_queue_timeout: Duration::from_millis(100),
+                ..Options::default()
+            },
+            None,
+        );
+        let channel = lobby.get_or_create_channel("/chat/slow").await.unwrap();
+        let slow = Arc::new(BlockingTransport {
+            id: "slow".to_owned(),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let fast = Arc::new(crate::transport::MemoryTransport::new(
+            "fast",
+            PondAssigns::new(),
+        ));
+        channel.add_user(slow.clone()).await.unwrap();
+        channel.add_user(fast.clone()).await.unwrap();
+
+        channel.broadcast("one", json!({})).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), slow.started.notified())
+            .await
+            .unwrap();
+        channel.broadcast("two", json!({})).await.unwrap();
+        assert!(channel.broadcast("three", json!({})).await.is_err());
+
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut names = Vec::new();
+            while names.len() < 3 {
+                names.push(fast.recv().await.unwrap().event);
+            }
+            names
+        })
+        .await
+        .expect("slow consumer stalled the healthy connection");
+        assert_eq!(received, ["one", "two", "three"]);
+    }
+
+    #[tokio::test]
+    async fn adv_broadcast_with_only_remote_users_still_reaches_pubsub() {
+        let pubsub = Arc::new(RecordingPubSub::default());
+        let channel = Channel::new(ChannelConfig {
+            name: "/chat/remote".to_owned(),
+            endpoint_path: "/socket".to_owned(),
+            options: Options {
+                node_id: "node-a".to_owned(),
+                ..Options::default()
+            },
+            pubsub: Some(pubsub.clone()),
+            event_handlers: Vec::new(),
+            outgoing_handlers: Vec::new(),
+            leave_handler: None,
+            lobby: Weak::new(),
+        });
+        channel.start().await.unwrap();
+
+        channel
+            .broadcast("remote-only", json!({ "ok": true }))
+            .await
+            .unwrap();
+
+        let messages = pubsub.messages.lock().await;
+        assert!(messages.iter().any(|(_, data)| {
+            serde_json::from_slice::<Value>(data)
+                .ok()
+                .and_then(|value| value.get("event").cloned())
+                == Some(json!("remote-only"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn broadcast_publishes_remotely_when_local_dispatch_worker_is_closed() {
+        let pubsub = Arc::new(RecordingPubSub::default());
+        let channel = Channel::new(ChannelConfig {
+            name: "/chat/local-failure".to_owned(),
+            endpoint_path: "/socket".to_owned(),
+            options: Options {
+                node_id: "node-a".to_owned(),
+                ..Options::default()
+            },
+            pubsub: Some(pubsub.clone()),
+            event_handlers: Vec::new(),
+            outgoing_handlers: Vec::new(),
+            leave_handler: None,
+            lobby: Weak::new(),
+        });
+        channel.start().await.unwrap();
+        let transport = Arc::new(crate::transport::MemoryTransport::new(
+            "local",
+            PondAssigns::new(),
+        ));
+        channel.add_user(transport).await.unwrap();
+        pubsub.messages.lock().await.clear();
+
+        let dispatch_task = channel.dispatch_task.write().await.take().unwrap();
+        dispatch_task.abort();
+        let _ = dispatch_task.await;
+
+        assert!(
+            channel
+                .broadcast("remote-despite-local-failure", json!({ "ok": true }))
+                .await
+                .is_err()
+        );
+        let messages = pubsub.messages.lock().await;
+        assert!(messages.iter().any(|(_, data)| {
+            serde_json::from_slice::<Value>(data)
+                .ok()
+                .and_then(|value| value.get("event").cloned())
+                == Some(json!("remote-despite-local-failure"))
+        }));
+        drop(messages);
+        channel.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervised_pubsub_failure_removes_channel_instead_of_silent_desync() {
+        let pubsub = Arc::new(FailureTriggerPubSub::default());
+        let lobby = crate::lobby::Lobby::new(
+            "/chat/:room",
+            "/socket",
+            Options {
+                node_id: "node-a".to_owned(),
+                ..Options::default()
+            },
+            Some(pubsub.clone()),
+        );
+        let channel = lobby.get_or_create_channel("/chat/failure").await.unwrap();
+        let transport = Arc::new(crate::transport::MemoryTransport::new(
+            "failed-user",
+            PondAssigns::new(),
+        ));
+        channel.add_user(transport.clone()).await.unwrap();
+        assert!(*channel.active.read().await);
+
+        let failure = pubsub
+            .failure
+            .lock()
+            .await
+            .clone()
+            .expect("channel did not install a supervised subscription");
+        failure();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lobby.get_channel("/chat/failure").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed channel remained registered");
+        assert!(!*channel.active.read().await);
+        assert!(!transport.is_active().await);
+    }
+
+    #[tokio::test]
+    async fn adv_distributed_state_and_leave_are_processed_in_subscription_order() {
+        let pubsub = Arc::new(crate::pubsub::LocalPubSub::new(4));
+        let channel = Channel::new(ChannelConfig {
+            name: "/chat/ordered-remote".to_owned(),
+            endpoint_path: "/socket".to_owned(),
+            options: Options {
+                node_id: "node-a".to_owned(),
+                ..Options::default()
+            },
+            pubsub: Some(pubsub.clone()),
+            event_handlers: Vec::new(),
+            outgoing_handlers: Vec::new(),
+            leave_handler: None,
+            lobby: Weak::new(),
+        });
+        channel.start().await.unwrap();
+        let users = (0..5_000)
+            .map(|index| json!({ "id": format!("remote-{index}"), "assigns": {}, "presence": {} }))
+            .collect::<Vec<_>>();
+        let mut state = Event::new(
+            "STATE_RESPONSE",
+            &channel.name,
+            "state",
+            "state:response",
+            json!({ "users": users }),
+        );
+        state.node_id = "node-b".to_owned();
+        let mut left = Event::new(
+            "USER_LEFT",
+            &channel.name,
+            "left",
+            "user:left",
+            json!({ "userId": "remote-4999" }),
+        );
+        left.node_id = "node-b".to_owned();
+        let mut marker = Event::new(
+            "USER_JOINED",
+            &channel.name,
+            "marker",
+            "user:joined",
+            json!({ "userId": "marker", "assigns": {}, "presence": {} }),
+        );
+        marker.node_id = "node-b".to_owned();
+        let topic = channel.pubsub_pattern();
+        pubsub
+            .publish(
+                &topic,
+                distributed_event_to_bytes(&state, "state:response", "socket").unwrap(),
+            )
+            .await
+            .unwrap();
+        pubsub
+            .publish(
+                &topic,
+                distributed_event_to_bytes(&left, "user:left", "socket").unwrap(),
+            )
+            .await
+            .unwrap();
+        pubsub
+            .publish(
+                &topic,
+                distributed_event_to_bytes(&marker, "user:joined", "socket").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if channel
+                    .node_users
+                    .read()
+                    .await
+                    .get("node-b")
+                    .is_some_and(|users| users.contains("marker"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!channel.assigns.read().await.contains_key("remote-4999"));
+    }
+
+    #[tokio::test]
+    async fn distributed_events_preserve_listener_order_across_channels() {
+        let pubsub = Arc::new(crate::pubsub::LocalPubSub::new(8));
+        let lobby = crate::lobby::Lobby::new(
+            "/chat/:room",
+            "/socket",
+            Options {
+                node_id: "node-a".to_owned(),
+                ..Options::default()
+            },
+            Some(pubsub.clone()),
+        );
+        let first = lobby.get_or_create_channel("/chat/a").await.unwrap();
+        let second = lobby.get_or_create_channel("/chat/b").await.unwrap();
+        let transport = Arc::new(crate::transport::MemoryTransport::new(
+            "ordered-user",
+            PondAssigns::new(),
+        ));
+        first.add_user(transport.clone()).await.unwrap();
+        second.add_user(transport.clone()).await.unwrap();
+
+        let mut event_a = Event::new(
+            "BROADCAST",
+            &first.name,
+            "a",
+            "a",
+            json!({ "large": vec![0_u8; 100_000] }),
+        );
+        event_a.node_id = "node-b".to_owned();
+        let mut event_b = Event::new("BROADCAST", &second.name, "b", "b", json!({}));
+        event_b.node_id = "node-b".to_owned();
+        pubsub
+            .publish(
+                &first.pubsub_pattern(),
+                distributed_event_to_bytes(&event_a, "message", "socket").unwrap(),
+            )
+            .await
+            .unwrap();
+        pubsub
+            .publish(
+                &second.pubsub_pattern(),
+                distributed_event_to_bytes(&event_b, "message", "socket").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+            vec![
+                transport.recv().await.unwrap().event,
+                transport.recv().await.unwrap().event,
+            ]
+        })
+        .await
+        .expect("distributed delivery stalled");
+        assert_eq!(delivered, ["a", "b"]);
+    }
 
     #[tokio::test]
     async fn internal_queue_timeout_is_enforced() {

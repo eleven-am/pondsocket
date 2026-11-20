@@ -1,6 +1,6 @@
 [package]
 name = "pondsocket"
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -13,7 +13,7 @@ readme = "../README.md"
 
 [features]
 default = []
-redis = ["dep:redis", "dep:tokio-stream"]
+redis = ["dep:redis", "dep:rustls", "dep:tokio-stream"]
 
 [dependencies]
 async-trait.workspace = true
@@ -21,6 +21,7 @@ bytes.workspace = true
 futures-util.workspace = true
 pondsocket-common = { path = "../pondsocket-common", version = "0.1.4" }
 redis = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

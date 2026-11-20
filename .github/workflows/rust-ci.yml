@@ -1,0 +1,61 @@
+name: Rust CI
+
+on:
+  pull_request:
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust-ci.yml"
+  push:
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      PONDSOCKET_TEST_REDIS_URL: redis://127.0.0.1:6379
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint all targets and features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test all features
+        run: cargo test --workspace --all-features --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: rust

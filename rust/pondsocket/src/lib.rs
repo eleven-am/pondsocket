@@ -4,6 +4,7 @@ pub mod distributed;
 pub mod endpoint;
 pub mod errors;
 pub mod hooks;
+mod liveness;
 pub mod lobby;
 pub mod parser;
 pub mod pubsub;
@@ -72,8 +73,11 @@ mod integration_tests {
     #[tokio::test]
     async fn joins_tracks_presence_and_broadcasts() {
         let pond = PondSocket::with_defaults();
-        let endpoint = pond.create_endpoint("/", AcceptConn).await;
-        let lobby = endpoint.create_channel("/chat/:room", AcceptJoin).await;
+        let endpoint = pond.create_endpoint("/", AcceptConn).await.unwrap();
+        let lobby = endpoint
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
         lobby.on_message("message", Echo).await;
 
         let transport = Arc::new(MemoryTransport::new(
@@ -143,10 +147,16 @@ mod integration_tests {
         };
         let pond_a = PondSocket::new(opts_a, Some(pubsub.clone()));
         let pond_b = PondSocket::new(opts_b, Some(pubsub));
-        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await;
-        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await;
-        let lobby_a = endpoint_a.create_channel("/chat/:room", AcceptJoin).await;
-        let _lobby_b = endpoint_b.create_channel("/chat/:room", AcceptJoin).await;
+        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await.unwrap();
+        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await.unwrap();
+        let lobby_a = endpoint_a
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
+        let _lobby_b = endpoint_b
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
         lobby_a.on_message("message", Echo).await;
 
         let ta = Arc::new(MemoryTransport::new(
@@ -205,7 +215,7 @@ mod integration_tests {
     #[tokio::test]
     async fn duplicate_connection_ids_are_rejected() {
         let pond = PondSocket::with_defaults();
-        let endpoint = pond.create_endpoint("/", AcceptConn).await;
+        let endpoint = pond.create_endpoint("/", AcceptConn).await.unwrap();
         let first = Arc::new(MemoryTransport::new(
             "same-id",
             pondsocket_common::PondAssigns::new(),
@@ -232,8 +242,11 @@ mod integration_tests {
             ..Options::default()
         };
         let pond = PondSocket::new(opts, None);
-        let endpoint = pond.create_endpoint("/", AcceptConn).await;
-        let lobby = endpoint.create_channel("/chat/:room", AcceptJoin).await;
+        let endpoint = pond.create_endpoint("/", AcceptConn).await.unwrap();
+        let lobby = endpoint
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
         lobby.on_message("message", Echo).await;
         let transport = Arc::new(MemoryTransport::new(
             "u1",
@@ -310,6 +323,15 @@ mod integration_tests {
             Ok(self.subscribe_count.fetch_add(1, Ordering::SeqCst) as u64)
         }
 
+        async fn subscribe_supervised(
+            &self,
+            topic: &str,
+            handler: pubsub::PubSubHandler,
+            _on_failure: pubsub::PubSubFailureHandler,
+        ) -> Result<pubsub::SubscriptionId> {
+            self.subscribe(topic, handler).await
+        }
+
         async fn unsubscribe(&self, _pattern: &str, _id: pubsub::SubscriptionId) -> Result<()> {
             Ok(())
         }
@@ -354,10 +376,16 @@ mod integration_tests {
         };
         let pond_a = PondSocket::new(opts_a, Some(pubsub.clone()));
         let pond_b = PondSocket::new(opts_b, Some(pubsub));
-        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await;
-        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await;
-        let lobby_a = endpoint_a.create_channel("/chat/:room", AcceptJoin).await;
-        let lobby_b = endpoint_b.create_channel("/chat/:room", AcceptJoin).await;
+        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await.unwrap();
+        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await.unwrap();
+        let lobby_a = endpoint_a
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
+        let lobby_b = endpoint_b
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
 
         let tb = Arc::new(MemoryTransport::new(
             "b",
@@ -422,10 +450,16 @@ mod integration_tests {
         };
         let pond_a = PondSocket::new(opts_a, Some(pubsub.clone()));
         let pond_b = PondSocket::new(opts_b, Some(pubsub));
-        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await;
-        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await;
-        let lobby_a = endpoint_a.create_channel("/chat/:room", AcceptJoin).await;
-        let lobby_b = endpoint_b.create_channel("/chat/:room", AcceptJoin).await;
+        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await.unwrap();
+        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await.unwrap();
+        let lobby_a = endpoint_a
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
+        let lobby_b = endpoint_b
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
 
         let tb = Arc::new(MemoryTransport::new(
             "b",
@@ -507,10 +541,16 @@ mod integration_tests {
         };
         let pond_a = PondSocket::new(opts_a, Some(pubsub.clone()));
         let pond_b = PondSocket::new(opts_b, Some(pubsub));
-        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await;
-        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await;
-        let lobby_a = endpoint_a.create_channel("/chat/:room", AcceptJoin).await;
-        let _lobby_b = endpoint_b.create_channel("/chat/:room", AcceptJoin).await;
+        let endpoint_a = pond_a.create_endpoint("/", AcceptConn).await.unwrap();
+        let endpoint_b = pond_b.create_endpoint("/", AcceptConn).await.unwrap();
+        let lobby_a = endpoint_a
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
+        let _lobby_b = endpoint_b
+            .create_channel("/chat/:room", AcceptJoin)
+            .await
+            .unwrap();
 
         let ta = Arc::new(MemoryTransport::new(
             "a",
@@ -598,7 +638,7 @@ mod integration_tests {
     #[tokio::test]
     async fn typed_channel_api_wraps_dynamic_runtime() {
         let pond = PondSocket::with_defaults();
-        let endpoint = pond.create_endpoint("/", AcceptConn).await;
+        let endpoint = pond.create_endpoint("/", AcceptConn).await.unwrap();
         let lobby = endpoint
             .create_typed_channel::<ChatSchema, _>("/chat/:room", |mut ctx| {
                 Box::pin(async move {
@@ -615,7 +655,8 @@ mod integration_tests {
                     .await
                 })
             })
-            .await;
+            .await
+            .unwrap();
         lobby
             .on::<Chat, _>(|mut ctx| {
                 Box::pin(async move {

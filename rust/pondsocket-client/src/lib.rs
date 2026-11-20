@@ -1,8 +1,9 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use pondsocket_common::{
     ChannelEvent, ChannelState, ClientAction, ClientMessage, EventName, JoinParams, PondMessage,
     PondPresence, PresenceEventType, PresenceMessage, ServerAction, ServerMessage, uuid,
@@ -11,8 +12,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::Instant;
+use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{Bytes, Message};
 use url::Url;
 
 pub mod typed;
@@ -29,7 +32,14 @@ pub enum ConnectionState {
 pub struct ClientOptions {
     pub connection_timeout: Duration,
     pub response_timeout: Duration,
+    pub join_timeout: Duration,
     pub max_queue_size: usize,
+    pub reconnect_initial_delay: Duration,
+    pub max_reconnect_delay: Duration,
+    pub ping_interval: Option<Duration>,
+    pub pong_timeout: Duration,
+    pub max_message_size: usize,
+    pub max_frame_size: usize,
 }
 
 impl Default for ClientOptions {
@@ -37,7 +47,14 @@ impl Default for ClientOptions {
         Self {
             connection_timeout: Duration::from_secs(10),
             response_timeout: Duration::from_secs(5),
+            join_timeout: Duration::from_secs(10),
             max_queue_size: 100,
+            reconnect_initial_delay: Duration::from_millis(250),
+            max_reconnect_delay: Duration::from_secs(30),
+            ping_interval: Some(Duration::from_secs(30)),
+            pong_timeout: Duration::from_secs(60),
+            max_message_size: 1024 * 1024,
+            max_frame_size: 1024 * 1024,
         }
     }
 }
@@ -62,13 +79,20 @@ pub enum ClientError {
     ChannelDeclined,
     #[error("response timed out")]
     ResponseTimeout,
+    #[error("channel join timed out")]
+    JoinTimeout,
+    #[error("connection lost: {0}")]
+    ConnectionLost(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("max_queue_size must be greater than zero")]
     InvalidQueueCapacity,
+    #[error("invalid client option: {0}")]
+    InvalidOption(String),
 }
 
 type Result<T> = std::result::Result<T, ClientError>;
 
-#[derive(Clone)]
 pub struct PondClient {
     inner: Arc<ClientInner>,
 }
@@ -77,12 +101,199 @@ struct ClientInner {
     url: String,
     options: ClientOptions,
     state: watch::Sender<ConnectionState>,
-    conn_events: broadcast::Sender<ConnectionState>,
+    errors: broadcast::Sender<Arc<ClientError>>,
     channels: Mutex<HashMap<String, Channel>>,
     outbound: Mutex<Option<mpsc::Sender<ClientMessage>>>,
-    read_task: Mutex<Option<JoinHandle<()>>>,
-    write_task: Mutex<Option<JoinHandle<()>>>,
+    read_task: StdMutex<Option<JoinHandle<()>>>,
+    write_task: StdMutex<Option<JoinHandle<()>>>,
+    reconnect_task: StdMutex<Option<JoinHandle<()>>>,
     lifecycle_lock: Mutex<()>,
+    desired_connected: AtomicBool,
+    reconnecting: AtomicBool,
+    generation: AtomicU64,
+    owners: AtomicUsize,
+    liveness: StdMutex<LivenessState>,
+    liveness_changed: Notify,
+    cancel: Notify,
+    #[cfg(test)]
+    connect_install_hook: StdMutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+}
+
+#[derive(Debug)]
+struct LivenessState {
+    last_inbound: Instant,
+    outstanding_ping: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatAction {
+    Wait,
+    SendPing,
+    TimedOut,
+}
+
+impl LivenessState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_inbound: now,
+            outstanding_ping: None,
+        }
+    }
+
+    fn deadline(&self, ping_interval: Duration, pong_timeout: Duration) -> Instant {
+        self.outstanding_ping
+            .map_or(self.last_inbound + ping_interval, |ping_sent_at| {
+                ping_sent_at + pong_timeout
+            })
+    }
+
+    fn action(
+        &self,
+        now: Instant,
+        ping_interval: Duration,
+        pong_timeout: Duration,
+    ) -> HeartbeatAction {
+        if let Some(ping_sent_at) = self.outstanding_ping {
+            if now >= ping_sent_at + pong_timeout {
+                HeartbeatAction::TimedOut
+            } else {
+                HeartbeatAction::Wait
+            }
+        } else if now >= self.last_inbound + ping_interval {
+            HeartbeatAction::SendPing
+        } else {
+            HeartbeatAction::Wait
+        }
+    }
+
+    fn ping_sent(&mut self, now: Instant) {
+        self.outstanding_ping = Some(now);
+    }
+
+    fn inbound_received(&mut self, now: Instant) {
+        self.last_inbound = now;
+        // Any inbound frame proves the peer is alive, not only an explicit
+        // Pong. Active application traffic therefore clears an outstanding
+        // probe as well.
+        self.outstanding_ping = None;
+    }
+}
+
+struct ConnectAttemptGuard {
+    inner: Arc<ClientInner>,
+    armed: bool,
+}
+
+impl ConnectAttemptGuard {
+    fn new(inner: &Arc<ClientInner>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.abort_io_tasks();
+        if let Ok(mut outbound) = self.inner.outbound.try_lock() {
+            *outbound = None;
+        }
+        self.inner
+            .set_connection_state(ConnectionState::Disconnected);
+        self.inner.schedule_reconnect();
+    }
+}
+
+struct PendingRequestGuard {
+    inner: Arc<ChannelInner>,
+    request_id: String,
+}
+
+impl PendingRequestGuard {
+    fn new(inner: &Arc<ChannelInner>, request_id: String) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            request_id,
+        }
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.inner
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.request_id);
+    }
+}
+
+struct AckFlushGuard {
+    inner: Arc<ChannelInner>,
+    armed: bool,
+}
+
+struct ReconnectCancellationGuard {
+    inner: Arc<ClientInner>,
+    armed: bool,
+}
+
+impl ReconnectCancellationGuard {
+    fn new(inner: &Arc<ClientInner>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReconnectCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.inner.reconnecting.store(false, Ordering::Release);
+        if self.inner.desired_connected.load(Ordering::Acquire)
+            && self.inner.state() == ConnectionState::Disconnected
+        {
+            self.inner.schedule_reconnect();
+        }
+    }
+}
+
+impl AckFlushGuard {
+    fn new(inner: &Arc<ChannelInner>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AckFlushGuard {
+    fn drop(&mut self) {
+        if self.armed && *self.inner.state.borrow() == ChannelState::Joined {
+            self.inner.state.send_replace(ChannelState::Stalled);
+            self.inner.queue_space.notify_waiters();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -93,18 +304,45 @@ pub struct Channel {
 struct ChannelInner {
     name: String,
     params: JoinParams,
-    client: Arc<ClientInner>,
+    client: Weak<ClientInner>,
     state: watch::Sender<ChannelState>,
     events: broadcast::Sender<ChannelEvent>,
     presence: Mutex<Vec<PondPresence>>,
     queue: Mutex<VecDeque<ClientMessage>>,
     queue_space: Notify,
     send_lock: Mutex<()>,
-    pending: Mutex<HashMap<String, oneshot::Sender<Result<PondMessage>>>>,
+    pending: StdMutex<HashMap<String, oneshot::Sender<Result<PondMessage>>>>,
     pending_join: Mutex<Option<String>>,
+    join_changed: Notify,
     decline_reason: Mutex<Option<PondMessage>>,
-    conn_task: Mutex<Option<JoinHandle<()>>>,
+    join_task: StdMutex<Option<JoinHandle<()>>>,
     closed: Mutex<bool>,
+}
+
+impl Clone for PondClient {
+    fn clone(&self) -> Self {
+        self.inner.owners.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for PondClient {
+    fn drop(&mut self) {
+        if self.inner.owners.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        self.inner.desired_connected.store(false, Ordering::Release);
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.cancel.notify_waiters();
+        self.inner.abort_background_tasks();
+        if let Ok(mut outbound) = self.inner.outbound.try_lock() {
+            *outbound = None;
+        }
+        self.inner
+            .set_connection_state(ConnectionState::Disconnected);
+    }
 }
 
 impl PondClient {
@@ -120,21 +358,48 @@ impl PondClient {
         if options.max_queue_size == 0 {
             return Err(ClientError::InvalidQueueCapacity);
         }
+        if options.connection_timeout.is_zero()
+            || options.response_timeout.is_zero()
+            || options.join_timeout.is_zero()
+            || options.reconnect_initial_delay.is_zero()
+            || options.max_reconnect_delay < options.reconnect_initial_delay
+            || options
+                .ping_interval
+                .is_some_and(|duration| duration.is_zero())
+            || options.pong_timeout.is_zero()
+            || options.max_message_size == 0
+            || options.max_frame_size == 0
+        {
+            return Err(ClientError::InvalidOption(
+                "timeouts and message limits must be non-zero, and max reconnect delay must not be smaller than the initial delay"
+                    .to_owned(),
+            ));
+        }
         let url = resolve_url(endpoint.as_ref(), params.as_ref())?;
         let (state, _) = watch::channel(ConnectionState::Disconnected);
-        let (conn_events, _) = broadcast::channel(16);
+        let (errors, _) = broadcast::channel(64);
 
         Ok(Self {
             inner: Arc::new(ClientInner {
                 url,
                 options,
                 state,
-                conn_events,
+                errors,
                 channels: Mutex::new(HashMap::new()),
                 outbound: Mutex::new(None),
-                read_task: Mutex::new(None),
-                write_task: Mutex::new(None),
+                read_task: StdMutex::new(None),
+                write_task: StdMutex::new(None),
+                reconnect_task: StdMutex::new(None),
                 lifecycle_lock: Mutex::new(()),
+                desired_connected: AtomicBool::new(false),
+                reconnecting: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+                owners: AtomicUsize::new(1),
+                liveness: StdMutex::new(LivenessState::new(Instant::now())),
+                liveness_changed: Notify::new(),
+                cancel: Notify::new(),
+                #[cfg(test)]
+                connect_install_hook: StdMutex::new(None),
             }),
         })
     }
@@ -145,6 +410,10 @@ impl PondClient {
 
     pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
         self.inner.state.subscribe()
+    }
+
+    pub fn subscribe_errors(&self) -> broadcast::Receiver<Arc<ClientError>> {
+        self.inner.errors.subscribe()
     }
 
     pub async fn create_channel(
@@ -167,141 +436,331 @@ impl PondClient {
             inner: Arc::new(ChannelInner {
                 name: name.clone(),
                 params: params.unwrap_or_default(),
-                client: Arc::clone(&self.inner),
+                client: Arc::downgrade(&self.inner),
                 state,
                 events,
                 presence: Mutex::new(Vec::new()),
                 queue: Mutex::new(VecDeque::new()),
                 queue_space: Notify::new(),
                 send_lock: Mutex::new(()),
-                pending: Mutex::new(HashMap::new()),
+                pending: StdMutex::new(HashMap::new()),
                 pending_join: Mutex::new(None),
+                join_changed: Notify::new(),
                 decline_reason: Mutex::new(None),
-                conn_task: Mutex::new(None),
+                join_task: StdMutex::new(None),
                 closed: Mutex::new(false),
             }),
         };
-
-        let watcher = channel.clone();
-        let mut conn_rx = self.inner.conn_events.subscribe();
-        let handle = tokio::spawn(async move {
-            loop {
-                match conn_rx.recv().await {
-                    Ok(state) => watcher.on_connection_change(state).await,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let state = *watcher.inner.client.state.borrow();
-                        watcher.on_connection_change(state).await;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-                if *watcher.inner.closed.lock().await {
-                    break;
-                }
-            }
-        });
-        *channel.inner.conn_task.lock().await = Some(handle);
 
         channels.insert(name, channel.clone());
         channel
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let _lifecycle = self.inner.lifecycle_lock.lock().await;
-        if self.state() != ConnectionState::Disconnected {
-            return Ok(());
+        self.inner.desired_connected.store(true, Ordering::Release);
+        self.inner.cancel_reconnect_task().await;
+        let result = self.inner.connect_once().await;
+        if let Err(error) = &result {
+            self.inner.emit_error(Arc::new(clone_error(error)));
+            self.inner.schedule_reconnect();
         }
-        self.inner.set_connection_state(ConnectionState::Connecting);
-        let connect = connect_async(&self.inner.url);
-        let (socket, _) =
-            match tokio::time::timeout(self.inner.options.connection_timeout, connect).await {
-                Ok(Ok(connection)) => connection,
-                Ok(Err(error)) => {
-                    self.inner
-                        .set_connection_state(ConnectionState::Disconnected);
-                    return Err(ClientError::WebSocket(error));
-                }
-                Err(_) => {
-                    self.inner
-                        .set_connection_state(ConnectionState::Disconnected);
-                    return Err(ClientError::ConnectionTimeout);
-                }
-            };
-        let (mut writer, mut reader) = socket.split();
-        let (tx, mut rx) = mpsc::channel::<ClientMessage>(self.inner.options.max_queue_size);
-        *self.inner.outbound.lock().await = Some(tx);
-
-        let write_task = tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                let Ok(text) = serde_json::to_string(&message) else {
-                    continue;
-                };
-                if writer.send(Message::Text(text.into())).await.is_err() {
-                    break;
-                }
-            }
-            let _ = writer.close().await;
-        });
-
-        let inner = Arc::clone(&self.inner);
-        // Publish Connected before the reader can observe an immediate peer
-        // close. Otherwise a fast reader exit can set Disconnected and then be
-        // overwritten by this connect call after the socket is already gone.
-        self.inner.set_connection_state(ConnectionState::Connected);
-        let read_task = tokio::spawn(async move {
-            while let Some(frame) = reader.next().await {
-                let text = match frame {
-                    Ok(Message::Text(text)) => text.to_string(),
-                    Ok(Message::Binary(bytes)) => match String::from_utf8(bytes.to_vec()) {
-                        Ok(text) => text,
-                        Err(_) => continue,
-                    },
-                    Ok(Message::Close(_)) => break,
-                    Ok(_) => continue,
-                    Err(_) => break,
-                };
-                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                    let Ok(event) = pondsocket_common::parse_channel_event(line) else {
-                        continue;
-                    };
-                    inner.route_event(event).await;
-                }
-            }
-            *inner.outbound.lock().await = None;
-            inner.set_connection_state(ConnectionState::Disconnected);
-        });
-
-        *self.inner.read_task.lock().await = Some(read_task);
-        *self.inner.write_task.lock().await = Some(write_task);
-        Ok(())
+        result
     }
 
     pub async fn disconnect(&self) {
+        self.inner.desired_connected.store(false, Ordering::Release);
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.cancel.notify_waiters();
+        self.inner.abort_background_tasks();
         let _lifecycle = self.inner.lifecycle_lock.lock().await;
+        // A connector that was already past its final desired-state check can
+        // install new IO tasks while disconnect waits for this lock. Invalidate
+        // and abort once more inside the serialized lifecycle section.
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.abort_background_tasks();
         *self.inner.outbound.lock().await = None;
         self.inner
             .set_connection_state(ConnectionState::Disconnected);
+        self.inner
+            .notify_channels(ConnectionState::Disconnected)
+            .await;
         let channels: Vec<Channel> = self.inner.channels.lock().await.values().cloned().collect();
         for channel in channels {
             channel.force_close().await;
         }
         self.inner.channels.lock().await.clear();
-
-        if let Some(mut task) = self.inner.write_task.lock().await.take()
-            && tokio::time::timeout(self.inner.options.connection_timeout, &mut task)
-                .await
-                .is_err()
-        {
-            task.abort();
-            let _ = task.await;
-        }
-        if let Some(task) = self.inner.read_task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
-        }
     }
 }
 
 impl ClientInner {
+    async fn connect_once(self: &Arc<Self>) -> Result<()> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        // Register before checking the desired state so a concurrent
+        // disconnect cannot notify between the check and waiter creation.
+        let cancelled = self.cancel.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
+        if !self.desired_connected.load(Ordering::Acquire) {
+            return Err(ClientError::NotConnected);
+        }
+        if self.state() != ConnectionState::Disconnected {
+            return Ok(());
+        }
+        self.set_connection_state(ConnectionState::Connecting);
+        let mut attempt = ConnectAttemptGuard::new(self);
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(self.options.max_message_size))
+            .max_frame_size(Some(self.options.max_frame_size));
+        let connect = connect_async_with_config(&self.url, Some(config), false);
+        let connection = tokio::select! {
+            connection = tokio::time::timeout(self.options.connection_timeout, connect) => connection,
+            () = &mut cancelled => {
+                self.set_connection_state(ConnectionState::Disconnected);
+                self.notify_channels(ConnectionState::Disconnected).await;
+                return Err(ClientError::NotConnected);
+            }
+        };
+        let (socket, _) = match connection {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                self.set_connection_state(ConnectionState::Disconnected);
+                self.notify_channels(ConnectionState::Disconnected).await;
+                return Err(ClientError::WebSocket(error));
+            }
+            Err(_) => {
+                self.set_connection_state(ConnectionState::Disconnected);
+                self.notify_channels(ConnectionState::Disconnected).await;
+                return Err(ClientError::ConnectionTimeout);
+            }
+        };
+        if !self.desired_connected.load(Ordering::Acquire) {
+            return Err(ClientError::NotConnected);
+        }
+
+        #[cfg(test)]
+        let connect_install_hook = self
+            .connect_install_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        #[cfg(test)]
+        if let Some((reached, resume)) = connect_install_hook {
+            reached.notify_one();
+            resume.notified().await;
+        }
+
+        self.abort_io_tasks();
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (mut writer, mut reader) = socket.split();
+        let (tx, mut rx) = mpsc::channel::<ClientMessage>(self.options.max_queue_size);
+        *self.outbound.lock().await = Some(tx);
+        *self
+            .liveness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = LivenessState::new(Instant::now());
+        self.set_connection_state(ConnectionState::Connected);
+
+        let write_inner = Arc::clone(self);
+        let write_task = tokio::spawn(async move {
+            let mut terminal_error = None;
+            loop {
+                let liveness_changed = write_inner.liveness_changed.notified();
+                tokio::pin!(liveness_changed);
+                liveness_changed.as_mut().enable();
+                let heartbeat_deadline = write_inner.options.ping_interval.map(|ping_interval| {
+                    write_inner
+                        .liveness
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .deadline(ping_interval, write_inner.options.pong_timeout)
+                });
+                tokio::select! {
+                    next = rx.recv() => {
+                        let Some(message) = next else { break; };
+                        let text = match serde_json::to_string(&message) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                write_inner.emit_error(Arc::new(ClientError::Serialization(error)));
+                                continue;
+                            }
+                        };
+                        let send_result = if message.action == ClientAction::JoinChannel {
+                            let channel = write_inner
+                                .channels
+                                .lock()
+                                .await
+                                .get(&message.channel_name)
+                                .cloned();
+                            let Some(channel) = channel else {
+                                continue;
+                            };
+                            let join_changed = channel.inner.join_changed.notified();
+                            tokio::pin!(join_changed);
+                            join_changed.as_mut().enable();
+                            if !channel.is_current_join(&message.request_id).await {
+                                continue;
+                            }
+                            tokio::select! {
+                                biased;
+                                () = &mut join_changed => continue,
+                                result = send_websocket_frame(
+                                    &mut writer,
+                                    Message::Text(text.into()),
+                                    write_inner.options.connection_timeout,
+                                ) => result,
+                            }
+                        } else {
+                            send_websocket_frame(
+                                &mut writer,
+                                Message::Text(text.into()),
+                                write_inner.options.connection_timeout,
+                            ).await
+                        };
+                        if let Err(error) = send_result {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    }
+                    () = &mut liveness_changed => {}
+                    _ = async {
+                        match heartbeat_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let action = write_inner
+                            .liveness
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .action(
+                                Instant::now(),
+                                write_inner.options.ping_interval.expect("deadline requires interval"),
+                                write_inner.options.pong_timeout,
+                            );
+                        match action {
+                            HeartbeatAction::Wait => {}
+                            HeartbeatAction::TimedOut => {
+                                terminal_error = Some(ClientError::ConnectionLost(
+                                    "server did not respond before the pong timeout".to_owned(),
+                                ));
+                                break;
+                            }
+                            HeartbeatAction::SendPing => {
+                                // Mark the probe before writing so an extremely
+                                // fast Pong cannot clear it and then be
+                                // overwritten after send() returns.
+                                write_inner
+                                    .liveness
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .ping_sent(Instant::now());
+                                if let Err(error) = send_websocket_frame(
+                                    &mut writer,
+                                    Message::Ping(Bytes::new()),
+                                    write_inner.options.connection_timeout,
+                                ).await {
+                                    terminal_error = Some(error);
+                                    break;
+                                }
+                                let mut liveness = write_inner
+                                    .liveness
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if liveness.outstanding_ping.is_some() {
+                                    liveness.ping_sent(Instant::now());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Err(error) =
+                close_websocket_writer(&mut writer, write_inner.options.connection_timeout).await
+                && terminal_error.is_none()
+            {
+                terminal_error = Some(error);
+            }
+            if let Some(error) = terminal_error {
+                write_inner.connection_lost(generation, Some(error)).await;
+            }
+        });
+
+        let read_inner = Arc::clone(self);
+        let read_task = tokio::spawn(async move {
+            let mut terminal_error = None;
+            while let Some(frame) = reader.next().await {
+                if read_inner.generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let message = match frame {
+                    Ok(message) => {
+                        read_inner
+                            .liveness
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .inbound_received(Instant::now());
+                        read_inner.liveness_changed.notify_one();
+                        message
+                    }
+                    Err(error) => {
+                        terminal_error = Some(ClientError::WebSocket(error));
+                        break;
+                    }
+                };
+                let text = match message {
+                    Message::Text(text) => Some(text.to_string()),
+                    Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
+                        Ok(text) => Some(text),
+                        Err(error) => {
+                            read_inner.emit_error(Arc::new(ClientError::Protocol(format!(
+                                "binary message is not UTF-8: {error}"
+                            ))));
+                            None
+                        }
+                    },
+                    Message::Close(frame) => {
+                        terminal_error = Some(ClientError::ConnectionLost(format!(
+                            "peer closed the websocket{}",
+                            frame.map_or_else(String::new, |frame| format!(": {}", frame.reason))
+                        )));
+                        break;
+                    }
+                    _ => None,
+                };
+                let Some(text) = text else {
+                    continue;
+                };
+                for (line_number, line) in text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .enumerate()
+                {
+                    match pondsocket_common::parse_channel_event(line) {
+                        Ok(event) => read_inner.route_event(event).await,
+                        Err(error) => {
+                            read_inner.emit_error(Arc::new(ClientError::Protocol(format!(
+                                "invalid server message at line {}: {error}",
+                                line_number + 1
+                            ))))
+                        }
+                    }
+                }
+            }
+            read_inner.connection_lost(generation, terminal_error).await;
+        });
+
+        *self.write_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(write_task);
+        *self.read_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(read_task);
+        attempt.finish();
+        if self.generation.load(Ordering::Acquire) == generation
+            && self.state() == ConnectionState::Connected
+        {
+            self.notify_channels(ConnectionState::Connected).await;
+        }
+        Ok(())
+    }
+
     async fn publish(&self, message: ClientMessage) -> Result<()> {
         let tx = self
             .outbound
@@ -325,12 +784,131 @@ impl ClientInner {
         }
     }
 
+    fn state(&self) -> ConnectionState {
+        *self.state.borrow()
+    }
+
     fn set_connection_state(&self, state: ConnectionState) {
-        let changed = *self.state.borrow() != state;
         self.state.send_replace(state);
-        if changed {
-            let _ = self.conn_events.send(state);
+    }
+
+    fn emit_error(&self, error: Arc<ClientError>) {
+        let _ = self.errors.send(error);
+    }
+
+    async fn notify_channels(&self, state: ConnectionState) {
+        let channels = self
+            .channels
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for channel in channels {
+            channel.on_connection_change(state).await;
         }
+    }
+
+    async fn connection_lost(self: &Arc<Self>, generation: u64, error: Option<ClientError>) {
+        if self
+            .generation
+            .compare_exchange(
+                generation,
+                generation.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        *self.outbound.lock().await = None;
+        self.set_connection_state(ConnectionState::Disconnected);
+        self.notify_channels(ConnectionState::Disconnected).await;
+        if let Some(error) = error {
+            self.emit_error(Arc::new(error));
+        }
+        self.schedule_reconnect();
+    }
+
+    fn schedule_reconnect(self: &Arc<Self>) {
+        if !self.desired_connected.load(Ordering::Acquire)
+            || self
+                .reconnecting
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let inner = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut attempt = 0_u32;
+            while inner.desired_connected.load(Ordering::Acquire) {
+                let delay = reconnect_delay(&inner.options, attempt);
+                tokio::time::sleep(delay).await;
+                if !inner.desired_connected.load(Ordering::Acquire) {
+                    break;
+                }
+                match inner.connect_once().await {
+                    Ok(()) if inner.state() == ConnectionState::Connected => break,
+                    Ok(()) => {}
+                    Err(error) => inner.emit_error(Arc::new(error)),
+                }
+                attempt = attempt.saturating_add(1);
+            }
+            inner.reconnecting.store(false, Ordering::Release);
+            // A connection can disappear after the success check above but
+            // before reconnecting is cleared. Re-arm here so that loss is not
+            // stranded by that small hand-off window.
+            if inner.desired_connected.load(Ordering::Acquire)
+                && inner.state() == ConnectionState::Disconnected
+            {
+                inner.schedule_reconnect();
+            }
+        });
+        *self
+            .reconnect_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+    }
+
+    async fn remove_channel(&self, name: &str, expected: &Arc<ChannelInner>) {
+        let mut channels = self.channels.lock().await;
+        if channels
+            .get(name)
+            .is_some_and(|channel| Arc::ptr_eq(&channel.inner, expected))
+        {
+            channels.remove(name);
+        }
+    }
+
+    fn abort_io_tasks(&self) {
+        abort_task(&self.read_task);
+        abort_task(&self.write_task);
+    }
+
+    fn abort_reconnect_task(&self) {
+        abort_task(&self.reconnect_task);
+    }
+
+    async fn cancel_reconnect_task(self: &Arc<Self>) {
+        let mut cancellation = ReconnectCancellationGuard::new(self);
+        let task = self
+            .reconnect_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        self.reconnecting.store(false, Ordering::Release);
+        cancellation.finish();
+    }
+
+    fn abort_background_tasks(&self) {
+        self.abort_reconnect_task();
+        self.abort_io_tasks();
     }
 }
 
@@ -370,9 +948,37 @@ impl Channel {
             return;
         }
         let message = self.join_message();
-        *self.inner.pending_join.lock().await = Some(message.request_id.clone());
+        let request_id = message.request_id.clone();
+        *self.inner.pending_join.lock().await = Some(request_id.clone());
         self.inner.state.send_replace(ChannelState::Joining);
-        let _ = self.enqueue_or_send(message).await;
+        let join_changed = self.inner.join_changed.notified();
+        tokio::pin!(join_changed);
+        join_changed.as_mut().enable();
+        // Arm the timeout before enqueue/publish, both of which can apply
+        // backpressure. If the caller cancels join while blocked, the channel
+        // still leaves Joining deterministically.
+        self.schedule_join_timeout(request_id.clone());
+        let enqueue_result = tokio::select! {
+            biased;
+            () = &mut join_changed => return,
+            result = self.enqueue_or_send(message) => result,
+        };
+        match enqueue_result {
+            Ok(()) => {}
+            Err(error) => {
+                let mut pending_join = self.inner.pending_join.lock().await;
+                if pending_join.as_deref() != Some(request_id.as_str()) {
+                    return;
+                }
+                *pending_join = None;
+                drop(pending_join);
+                self.inner.state.send_replace(ChannelState::Stalled);
+                self.abort_join_task();
+                if let Ok(client) = self.client() {
+                    client.emit_error(Arc::new(error));
+                }
+            }
+        }
     }
 
     pub async fn leave(&self) {
@@ -386,12 +992,18 @@ impl Channel {
             channel_name: self.inner.name.clone(),
             request_id: uuid(),
         };
-        let _ = self.inner.client.publish(message).await;
+        if let Ok(client) = self.client() {
+            let _ = client.publish(message).await;
+        }
         self.force_close().await;
     }
 
     pub async fn send_message(&self, event: impl Into<String>, payload: Option<PondMessage>) {
-        let _ = self.send_message_checked(event, payload).await;
+        if let Err(error) = self.send_message_checked(event, payload).await
+            && let Ok(client) = self.client()
+        {
+            client.emit_error(Arc::new(error));
+        }
     }
 
     pub async fn send_message_checked(
@@ -426,8 +1038,9 @@ impl Channel {
         self.inner
             .pending
             .lock()
-            .await
+            .unwrap_or_else(|error| error.into_inner())
             .insert(request_id.clone(), tx);
+        let _pending_guard = PendingRequestGuard::new(&self.inner, request_id.clone());
         let message = ClientMessage {
             action: ClientAction::Broadcast,
             event: event.into(),
@@ -435,23 +1048,16 @@ impl Channel {
             channel_name: self.inner.name.clone(),
             request_id: request_id.clone(),
         };
-        let timeout = timeout.unwrap_or(self.inner.client.options.response_timeout);
+        let timeout = timeout.unwrap_or(self.client()?.options.response_timeout);
         let started = tokio::time::Instant::now();
         let queued = tokio::time::timeout(timeout, self.enqueue_or_send(message)).await;
         match queued {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                self.inner.pending.lock().await.remove(&request_id);
-                return Err(error);
-            }
-            Err(_) => {
-                self.inner.pending.lock().await.remove(&request_id);
-                return Err(ClientError::ResponseTimeout);
-            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(ClientError::ResponseTimeout),
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         let result = tokio::time::timeout(remaining, rx).await;
-        self.inner.pending.lock().await.remove(&request_id);
         match result {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::ChannelClosed),
@@ -466,11 +1072,12 @@ impl Channel {
             }
 
             let send_guard = self.inner.send_lock.lock().await;
-            let connected = *self.inner.client.state.borrow() == ConnectionState::Connected;
+            let client = self.client()?;
+            let connected = client.state() == ConnectionState::Connected;
             let joined = self.state() == ChannelState::Joined;
             let is_join = message.action == ClientAction::JoinChannel;
             if connected && (joined || is_join) {
-                match self.inner.client.publish(message.clone()).await {
+                match client.publish(message.clone()).await {
                     Ok(()) => return Ok(()),
                     Err(ClientError::NotConnected) => {}
                     Err(error) => return Err(error),
@@ -483,7 +1090,7 @@ impl Channel {
                 queue.push_front(message);
                 return Ok(());
             }
-            if queue.len() < self.inner.client.options.max_queue_size {
+            if queue.len() < client.options.max_queue_size {
                 queue.push_back(message);
                 return Ok(());
             }
@@ -502,7 +1109,9 @@ impl Channel {
         }
         match state {
             ConnectionState::Disconnected => {
+                self.abort_join_task();
                 *self.inner.pending_join.lock().await = None;
+                self.inner.join_changed.notify_waiters();
                 if matches!(self.state(), ChannelState::Joined | ChannelState::Joining) {
                     self.inner.state.send_replace(ChannelState::Stalled);
                 }
@@ -557,6 +1166,8 @@ impl Channel {
                 }
                 *pending_join = None;
                 drop(pending_join);
+                self.inner.join_changed.notify_waiters();
+                self.abort_join_task();
                 self.acknowledge().await;
             }
             return;
@@ -579,7 +1190,13 @@ impl Channel {
             }
             return;
         }
-        if let Some(tx) = self.inner.pending.lock().await.remove(&message.request_id) {
+        if let Some(tx) = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&message.request_id)
+        {
             let _ = tx.send(Ok(message.payload));
             return;
         }
@@ -590,47 +1207,140 @@ impl Channel {
 
     async fn acknowledge(&self) {
         let _send_guard = self.inner.send_lock.lock().await;
+        let Ok(client) = self.client() else {
+            return;
+        };
         let mut queue = self.inner.queue.lock().await;
         queue.retain(|message| message.action != ClientAction::JoinChannel);
-        let mut pending: VecDeque<ClientMessage> = queue.drain(..).collect();
         self.inner.state.send_replace(ChannelState::Joined);
-        while let Some(message) = pending.pop_front() {
-            if self.inner.client.publish(message.clone()).await.is_err() {
-                queue.push_back(message);
-                queue.append(&mut pending);
-                self.inner.state.send_replace(ChannelState::Stalled);
+        let mut flush = AckFlushGuard::new(&self.inner);
+        while let Some(message) = queue.front().cloned() {
+            if client.publish(message.clone()).await.is_err() {
                 break;
             }
+            queue.pop_front();
+            self.inner.queue_space.notify_one();
+        }
+        if queue.is_empty() {
+            flush.finish();
         }
         drop(queue);
         self.inner.queue_space.notify_waiters();
     }
 
     async fn decline(&self, reason: PondMessage) {
+        self.abort_join_task();
+        self.inner.join_changed.notify_waiters();
         *self.inner.decline_reason.lock().await = Some(reason);
         self.inner.state.send_replace(ChannelState::Declined);
         self.inner.queue.lock().await.clear();
         self.inner.queue_space.notify_waiters();
-        let pending = std::mem::take(&mut *self.inner.pending.lock().await);
+        let pending = std::mem::take(
+            &mut *self
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
         for (_, response) in pending {
             let _ = response.send(Err(ClientError::ChannelDeclined));
+        }
+        if let Some(client) = self.inner.client.upgrade() {
+            client.remove_channel(&self.inner.name, &self.inner).await;
         }
     }
 
     async fn force_close(&self) {
+        self.abort_join_task();
         *self.inner.closed.lock().await = true;
         self.inner.state.send_replace(ChannelState::Closed);
         self.inner.queue.lock().await.clear();
         self.inner.queue_space.notify_waiters();
-        let pending = std::mem::take(&mut *self.inner.pending.lock().await);
+        let pending = std::mem::take(
+            &mut *self
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
         for (_, response) in pending {
             let _ = response.send(Err(ClientError::ChannelClosed));
         }
         *self.inner.pending_join.lock().await = None;
-        if let Some(handle) = self.inner.conn_task.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
+        self.inner.join_changed.notify_waiters();
+        if let Some(client) = self.inner.client.upgrade() {
+            client.remove_channel(&self.inner.name, &self.inner).await;
         }
+    }
+
+    fn client(&self) -> Result<Arc<ClientInner>> {
+        self.inner
+            .client
+            .upgrade()
+            .ok_or(ClientError::ChannelClosed)
+    }
+
+    fn schedule_join_timeout(&self, request_id: String) {
+        self.abort_join_task();
+        let weak = Arc::downgrade(&self.inner);
+        let timeout = self
+            .inner
+            .client
+            .upgrade()
+            .map_or(Duration::from_secs(10), |client| {
+                client.options.join_timeout
+            });
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let channel = Channel { inner };
+            channel.join_timed_out(&request_id).await;
+        });
+        *self
+            .inner
+            .join_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+    }
+
+    async fn join_timed_out(&self, request_id: &str) {
+        let mut pending_join = self.inner.pending_join.lock().await;
+        if pending_join.as_deref() != Some(request_id) {
+            return;
+        }
+        *pending_join = None;
+        drop(pending_join);
+        self.inner.join_changed.notify_waiters();
+        self.inner.state.send_replace(ChannelState::Declined);
+        let mut reason = Map::new();
+        reason.insert(
+            "message".to_owned(),
+            Value::String("channel join timed out".to_owned()),
+        );
+        reason.insert("status".to_owned(), Value::from(504));
+        *self.inner.decline_reason.lock().await = Some(reason);
+        self.inner.queue.lock().await.clear();
+        self.inner.queue_space.notify_waiters();
+        let pending = std::mem::take(
+            &mut *self
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for (_, response) in pending {
+            let _ = response.send(Err(ClientError::JoinTimeout));
+        }
+        if let Some(client) = self.inner.client.upgrade() {
+            client.emit_error(Arc::new(ClientError::JoinTimeout));
+            client.remove_channel(&self.inner.name, &self.inner).await;
+        }
+    }
+
+    fn abort_join_task(&self) {
+        abort_task(&self.inner.join_task);
     }
 
     fn join_message(&self) -> ClientMessage {
@@ -649,7 +1359,76 @@ impl Channel {
             return false;
         }
         *pending = None;
+        self.inner.join_changed.notify_waiters();
         true
+    }
+
+    async fn is_current_join(&self, request_id: &str) -> bool {
+        self.inner.pending_join.lock().await.as_deref() == Some(request_id)
+    }
+}
+
+fn abort_task(slot: &StdMutex<Option<JoinHandle<()>>>) {
+    if let Some(task) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        task.abort();
+    }
+}
+
+async fn send_websocket_frame<S>(writer: &mut S, message: Message, timeout: Duration) -> Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(timeout, writer.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(ClientError::WebSocket(error)),
+        Err(_) => Err(ClientError::ConnectionLost(
+            "websocket write timed out".to_owned(),
+        )),
+    }
+}
+
+async fn close_websocket_writer<S>(writer: &mut S, timeout: Duration) -> Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(timeout, writer.close()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(ClientError::WebSocket(error)),
+        Err(_) => Err(ClientError::ConnectionLost(
+            "websocket close timed out".to_owned(),
+        )),
+    }
+}
+
+fn reconnect_delay(options: &ClientOptions, attempt: u32) -> Duration {
+    let multiplier = 2_f64.powi(attempt.min(20) as i32);
+    let ceiling = options
+        .reconnect_initial_delay
+        .mul_f64(multiplier)
+        .min(options.max_reconnect_delay);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.subsec_nanos());
+    let jitter = 0.5 + (f64::from(nanos) / f64::from(u32::MAX)) * 0.5;
+    ceiling.mul_f64(jitter)
+}
+
+fn clone_error(error: &ClientError) -> ClientError {
+    match error {
+        ClientError::Url(error) => ClientError::Protocol(error.to_string()),
+        ClientError::UnsupportedScheme(scheme) => ClientError::UnsupportedScheme(scheme.clone()),
+        ClientError::WebSocket(error) => ClientError::ConnectionLost(error.to_string()),
+        ClientError::Serialization(error) => ClientError::Protocol(error.to_string()),
+        ClientError::ConnectionTimeout => ClientError::ConnectionTimeout,
+        ClientError::NotConnected => ClientError::NotConnected,
+        ClientError::ChannelClosed => ClientError::ChannelClosed,
+        ClientError::ChannelDeclined => ClientError::ChannelDeclined,
+        ClientError::ResponseTimeout => ClientError::ResponseTimeout,
+        ClientError::JoinTimeout => ClientError::JoinTimeout,
+        ClientError::ConnectionLost(message) => ClientError::ConnectionLost(message.clone()),
+        ClientError::Protocol(message) => ClientError::Protocol(message.clone()),
+        ClientError::InvalidQueueCapacity => ClientError::InvalidQueueCapacity,
+        ClientError::InvalidOption(message) => ClientError::InvalidOption(message.clone()),
     }
 }
 
@@ -698,6 +1477,97 @@ mod tests {
     use super::*;
     use pondsocket_common::{PondEvent, PondSchema, PresencePayload};
     use serde::{Deserialize, Serialize};
+
+    #[tokio::test(start_paused = true)]
+    async fn pong_or_other_inbound_frame_clears_the_outstanding_probe() {
+        let ping_interval = Duration::from_secs(30);
+        let pong_timeout = Duration::from_secs(5);
+        let mut liveness = LivenessState::new(Instant::now());
+
+        tokio::time::advance(ping_interval).await;
+        assert_eq!(
+            liveness.action(Instant::now(), ping_interval, pong_timeout),
+            HeartbeatAction::SendPing
+        );
+        liveness.ping_sent(Instant::now());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        liveness.inbound_received(Instant::now());
+        tokio::time::advance(Duration::from_secs(4)).await;
+
+        assert_eq!(
+            liveness.action(Instant::now(), ping_interval, pong_timeout),
+            HeartbeatAction::Wait,
+            "inbound activity must clear the old pong deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outstanding_ping_times_out_only_after_its_own_deadline() {
+        let ping_interval = Duration::from_secs(30);
+        let pong_timeout = Duration::from_secs(5);
+        let mut liveness = LivenessState::new(Instant::now());
+
+        tokio::time::advance(ping_interval).await;
+        assert_eq!(
+            liveness.action(Instant::now(), ping_interval, pong_timeout),
+            HeartbeatAction::SendPing
+        );
+        liveness.ping_sent(Instant::now());
+        tokio::time::advance(pong_timeout).await;
+
+        assert_eq!(
+            liveness.action(Instant::now(), ping_interval, pong_timeout),
+            HeartbeatAction::TimedOut
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pong_timeout_shorter_than_ping_interval_never_times_out_before_probe() {
+        let ping_interval = Duration::from_secs(30);
+        let pong_timeout = Duration::from_secs(5);
+        PondClient::with_options(
+            "ws://example.com/socket",
+            None,
+            ClientOptions {
+                ping_interval: Some(ping_interval),
+                pong_timeout,
+                ..ClientOptions::default()
+            },
+        )
+        .expect("a short pong deadline is valid because it starts after the ping is sent");
+        let liveness = LivenessState::new(Instant::now());
+
+        tokio::time::advance(pong_timeout).await;
+        assert_eq!(
+            liveness.action(Instant::now(), ping_interval, pong_timeout),
+            HeartbeatAction::Wait
+        );
+        tokio::time::advance(ping_interval - pong_timeout).await;
+        assert_eq!(
+            liveness.action(Instant::now(), ping_interval, pong_timeout),
+            HeartbeatAction::SendPing
+        );
+    }
+
+    #[test]
+    fn rejects_zero_heartbeat_durations() {
+        for options in [
+            ClientOptions {
+                ping_interval: Some(Duration::ZERO),
+                ..ClientOptions::default()
+            },
+            ClientOptions {
+                pong_timeout: Duration::ZERO,
+                ..ClientOptions::default()
+            },
+        ] {
+            assert!(matches!(
+                PondClient::with_options("ws://example.com/socket", None, options),
+                Err(ClientError::InvalidOption(_))
+            ));
+        }
+    }
 
     #[test]
     fn resolves_http_url_to_ws_with_params() {
@@ -973,7 +1843,16 @@ mod tests {
         });
 
         let url = format!("ws://{addr}/socket");
-        let client = PondClient::new(&url, None).unwrap();
+        let client = PondClient::with_options(
+            &url,
+            None,
+            ClientOptions {
+                reconnect_initial_delay: Duration::from_millis(10),
+                max_reconnect_delay: Duration::from_millis(25),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let channel = client.create_channel("room", None).await;
         let mut events = channel.subscribe_events();
@@ -986,7 +1865,6 @@ mod tests {
         kill.send(()).unwrap();
         wait_for_state(&channel, ChannelState::Stalled).await;
 
-        client.connect().await.unwrap();
         wait_for_state(&channel, ChannelState::Joined).await;
         assert_eq!(joins.load(Ordering::SeqCst), 2);
 
@@ -1079,7 +1957,16 @@ mod tests {
         });
 
         let url = format!("ws://{addr}/socket");
-        let client = PondClient::new(&url, None).unwrap();
+        let client = PondClient::with_options(
+            &url,
+            None,
+            ClientOptions {
+                reconnect_initial_delay: Duration::from_millis(10),
+                max_reconnect_delay: Duration::from_millis(25),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let channel = client.create_channel("room", None).await;
         channel.join().await;
@@ -1088,7 +1975,14 @@ mod tests {
         let reason = channel.decline_reason().await.unwrap();
         assert_eq!(reason.get("channel").and_then(Value::as_str), Some("room"));
         assert!(channel.inner.queue.lock().await.is_empty());
-        assert!(channel.inner.pending.lock().await.is_empty());
+        assert!(
+            channel
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1141,7 +2035,6 @@ mod tests {
         kill.send(()).unwrap();
         wait_for_state(&channel, ChannelState::Stalled).await;
 
-        client.connect().await.unwrap();
         wait_for_state(&channel, ChannelState::Joined).await;
         assert_eq!(joins.load(Ordering::SeqCst), 2);
         assert_eq!(recv_greeting(&mut events).await, 2);
@@ -1210,7 +2103,13 @@ mod tests {
         });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while channel.inner.pending.lock().await.is_empty() {
+        while channel
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+        {
             if tokio::time::Instant::now() > deadline {
                 panic!("pending request never registered");
             }
@@ -1224,7 +2123,14 @@ mod tests {
             .expect("send_for_response hung after decline instead of returning")
             .unwrap();
         assert!(matches!(joined, Err(ClientError::ChannelDeclined)));
-        assert!(channel.inner.pending.lock().await.is_empty());
+        assert!(
+            channel
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
         assert!(channel.inner.queue.lock().await.is_empty());
     }
 
@@ -1313,7 +2219,15 @@ mod tests {
     async fn wait_for_pending(channel: &Channel) -> String {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if let Some(id) = channel.inner.pending.lock().await.keys().next().cloned() {
+            if let Some(id) = channel
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .keys()
+                .next()
+                .cloned()
+            {
                 return id;
             }
             if tokio::time::Instant::now() > deadline {
@@ -1690,7 +2604,14 @@ mod tests {
         let result = channel.send_for_response("ask", None, None).await;
         assert!(matches!(result, Err(ClientError::ResponseTimeout)));
         assert!(started.elapsed() < Duration::from_millis(250));
-        assert!(channel.inner.pending.lock().await.is_empty());
+        assert!(
+            channel
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
         assert_eq!(channel.inner.queue.lock().await.len(), 1);
     }
 
@@ -1827,6 +2748,7 @@ mod tests {
         });
 
         let client = PondClient::new(format!("ws://{addr}/socket"), None).unwrap();
+        let mut errors = client.subscribe_errors();
         let channel = client.create_channel("room", None).await;
         channel.inner.state.send_replace(ChannelState::Joined);
         let mut events = channel.subscribe_events();
@@ -1842,6 +2764,11 @@ mod tests {
             };
             assert_eq!(message.request_id, expected.to_string());
         }
+        let error = tokio::time::timeout(Duration::from_secs(1), errors.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&*error, ClientError::Protocol(message) if message.contains("line 126")));
         client.disconnect().await;
         server.await.unwrap();
     }
@@ -1869,5 +2796,587 @@ mod tests {
             events.recv().await,
             Err(broadcast::error::RecvError::Lagged(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dropping_last_client_owner_releases_inner_and_invalidates_channels() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let weak = Arc::downgrade(&client.inner);
+        let channel = client.create_channel("room", None).await;
+
+        drop(client);
+        tokio::task::yield_now().await;
+
+        assert!(weak.upgrade().is_none());
+        assert!(matches!(
+            channel.send_message_checked("message", None).await,
+            Err(ClientError::ChannelClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_timeout_declines_and_removes_channel_without_leaking_queue() {
+        let client = PondClient::with_options(
+            "ws://example.com/socket",
+            None,
+            ClientOptions {
+                join_timeout: Duration::from_millis(20),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        let mut errors = client.subscribe_errors();
+        let channel = client.create_channel("room", None).await;
+        channel.join().await;
+
+        wait_for_state(&channel, ChannelState::Declined).await;
+
+        assert!(client.inner.channels.lock().await.get("room").is_none());
+        assert!(channel.inner.queue.lock().await.is_empty());
+        assert!(
+            channel
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        let error = errors.recv().await.unwrap();
+        assert!(matches!(&*error, ClientError::JoinTimeout));
+    }
+
+    #[tokio::test]
+    async fn leave_removes_closed_channel_from_client_registry() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+
+        channel.leave().await;
+
+        assert_eq!(channel.state(), ChannelState::Closed);
+        assert!(client.inner.channels.lock().await.get("room").is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_connection_generation_cannot_clear_replacement_outbound() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        client
+            .inner
+            .desired_connected
+            .store(true, Ordering::Release);
+        client.inner.generation.store(2, Ordering::Release);
+        client
+            .inner
+            .set_connection_state(ConnectionState::Connected);
+        let (tx, _rx) = mpsc::channel(1);
+        *client.inner.outbound.lock().await = Some(tx);
+
+        client.inner.connection_lost(1, None).await;
+
+        assert_eq!(client.state(), ConnectionState::Connected);
+        assert!(client.inner.outbound.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn ping_timeout_is_reported_and_disconnects_unresponsive_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _socket = accept_async(stream).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let client = PondClient::with_options(
+            format!("ws://{addr}/socket"),
+            None,
+            ClientOptions {
+                ping_interval: Some(Duration::from_millis(10)),
+                pong_timeout: Duration::from_millis(30),
+                reconnect_initial_delay: Duration::from_secs(1),
+                max_reconnect_delay: Duration::from_secs(1),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        let mut errors = client.subscribe_errors();
+        client.connect().await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let error = errors.recv().await.unwrap();
+                if matches!(&*error, ClientError::ConnectionLost(message) if message.contains("pong timeout"))
+                {
+                    break error;
+                }
+            }
+        })
+        .await
+        .expect("missing pong timeout error");
+
+        assert!(matches!(&*error, ClientError::ConnectionLost(_)));
+        assert_eq!(client.state(), ConnectionState::Disconnected);
+        client.disconnect().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_cancels_in_progress_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let client = PondClient::with_options(
+            format!("ws://{addr}/socket"),
+            None,
+            ClientOptions {
+                connection_timeout: Duration::from_secs(5),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        let connector = client.clone();
+        let connect = tokio::spawn(async move { connector.connect().await });
+        accepted_rx.await.unwrap();
+
+        tokio::time::timeout(Duration::from_millis(250), client.disconnect())
+            .await
+            .expect("disconnect waited for the handshake timeout");
+
+        assert!(matches!(
+            connect.await.unwrap(),
+            Err(ClientError::NotConnected)
+        ));
+        assert_eq!(client.state(), ConnectionState::Disconnected);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn disconnect_aborts_io_installed_after_the_prelock_abort() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _socket = accept_async(stream).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let client = PondClient::new(format!("ws://{addr}/socket"), None).unwrap();
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *client
+            .inner
+            .connect_install_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some((Arc::clone(&reached), Arc::clone(&resume)));
+
+        let connector = client.clone();
+        let connect = tokio::spawn(async move { connector.connect().await });
+        tokio::time::timeout(Duration::from_secs(1), reached.notified())
+            .await
+            .expect("connect did not reach the pre-install hook");
+
+        let disconnector = client.clone();
+        let disconnect = tokio::spawn(async move { disconnector.disconnect().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.inner.desired_connected.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect did not perform its pre-lock invalidation");
+
+        resume.notify_one();
+        connect.await.unwrap().unwrap();
+        disconnect.await.unwrap();
+
+        assert_eq!(client.state(), ConnectionState::Disconnected);
+        assert!(client.inner.outbound.lock().await.is_none());
+        assert!(
+            client
+                .inner
+                .read_task
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none()
+        );
+        assert!(
+            client
+                .inner
+                .write_task
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aborting_public_connect_restores_disconnected_and_reconnect_intent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _socket = accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = PondClient::with_options(
+            format!("ws://{addr}/socket"),
+            None,
+            ClientOptions {
+                reconnect_initial_delay: Duration::from_secs(3600),
+                max_reconnect_delay: Duration::from_secs(3600),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *client
+            .inner
+            .connect_install_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((Arc::clone(&reached), resume));
+
+        let connector = client.clone();
+        let connect = tokio::spawn(async move { connector.connect().await });
+        reached.notified().await;
+        connect.abort();
+        assert!(connect.await.unwrap_err().is_cancelled());
+        tokio::task::yield_now().await;
+
+        assert_eq!(client.state(), ConnectionState::Disconnected);
+        assert!(client.inner.outbound.lock().await.is_none());
+        assert!(client.inner.reconnecting.load(Ordering::Acquire));
+        client.disconnect().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_connect_safely_replaces_an_aborted_reconnect_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let first = accept_async(first).await.unwrap();
+            let (second, _) = listener.accept().await.unwrap();
+            let second = accept_async(second).await.unwrap();
+            let _sockets = (first, second);
+            std::future::pending::<()>().await;
+        });
+        let client = PondClient::with_options(
+            format!("ws://{addr}/socket"),
+            None,
+            ClientOptions {
+                reconnect_initial_delay: Duration::from_millis(1),
+                max_reconnect_delay: Duration::from_millis(1),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *client
+            .inner
+            .connect_install_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((Arc::clone(&reached), resume));
+        client
+            .inner
+            .desired_connected
+            .store(true, Ordering::Release);
+        client.inner.schedule_reconnect();
+        reached.notified().await;
+
+        tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("replacement connect remained stuck behind cancelled reconnect")
+            .unwrap();
+
+        assert_eq!(client.state(), ConnectionState::Connected);
+        assert!(client.inner.outbound.lock().await.is_some());
+        client.disconnect().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_response_wait_removes_pending_entry() {
+        let client = PondClient::with_options(
+            "ws://example.com/socket",
+            None,
+            ClientOptions {
+                max_queue_size: 1,
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        let channel = client.create_channel("room", None).await;
+        channel.inner.state.send_replace(ChannelState::Joined);
+        channel.inner.queue.lock().await.push_back(ClientMessage {
+            action: ClientAction::Broadcast,
+            event: "existing".to_owned(),
+            payload: Map::new(),
+            channel_name: "room".to_owned(),
+            request_id: "existing".to_owned(),
+        });
+
+        let sender = channel.clone();
+        let send = tokio::spawn(async move {
+            sender
+                .send_for_response("blocked", None, Some(Duration::from_secs(60)))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while channel
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        send.abort();
+        assert!(send.await.unwrap_err().is_cancelled());
+
+        assert!(
+            channel
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_blocked_join_keeps_armed_timeout() {
+        let client = PondClient::with_options(
+            "ws://example.com/socket",
+            None,
+            ClientOptions {
+                join_timeout: Duration::from_secs(5),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        client
+            .inner
+            .set_connection_state(ConnectionState::Connected);
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(ClientMessage {
+            action: ClientAction::Broadcast,
+            event: "fill".to_owned(),
+            payload: Map::new(),
+            channel_name: "room".to_owned(),
+            request_id: "fill".to_owned(),
+        })
+        .unwrap();
+        *client.inner.outbound.lock().await = Some(tx);
+        let channel = client.create_channel("room", None).await;
+
+        let joining = channel.clone();
+        let join = tokio::spawn(async move { joining.join().await });
+        while channel.state() != ChannelState::Joining {
+            tokio::task::yield_now().await;
+        }
+        join.abort();
+        assert!(join.await.unwrap_err().is_cancelled());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(channel.state(), ChannelState::Declined);
+        assert!(channel.inner.pending_join.lock().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_blocked_join_never_commits_a_stale_join() {
+        let client = PondClient::with_options(
+            "ws://example.com/socket",
+            None,
+            ClientOptions {
+                join_timeout: Duration::from_secs(5),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        client
+            .inner
+            .set_connection_state(ConnectionState::Connected);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(ClientMessage {
+            action: ClientAction::Broadcast,
+            event: "fill".to_owned(),
+            payload: Map::new(),
+            channel_name: "room".to_owned(),
+            request_id: "fill".to_owned(),
+        })
+        .unwrap();
+        *client.inner.outbound.lock().await = Some(tx);
+        let channel = client.create_channel("room", None).await;
+
+        let joining = channel.clone();
+        let join = tokio::spawn(async move { joining.join().await });
+        while channel.state() != ChannelState::Joining {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        join.await.unwrap();
+
+        assert_eq!(channel.state(), ChannelState::Declined);
+        assert_eq!(rx.recv().await.unwrap().request_id, "fill");
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_ack_flush_preserves_all_unsent_messages_in_order() {
+        let client = PondClient::new("ws://example.com/socket", None).unwrap();
+        client
+            .inner
+            .set_connection_state(ConnectionState::Connected);
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(ClientMessage {
+            action: ClientAction::Broadcast,
+            event: "fill".to_owned(),
+            payload: Map::new(),
+            channel_name: "room".to_owned(),
+            request_id: "fill".to_owned(),
+        })
+        .unwrap();
+        *client.inner.outbound.lock().await = Some(tx);
+        let channel = client.create_channel("room", None).await;
+        for request_id in ["first", "second"] {
+            channel.inner.queue.lock().await.push_back(ClientMessage {
+                action: ClientAction::Broadcast,
+                event: "queued".to_owned(),
+                payload: Map::new(),
+                channel_name: "room".to_owned(),
+                request_id: request_id.to_owned(),
+            });
+        }
+
+        let flushing = channel.clone();
+        let flush = tokio::spawn(async move { flushing.acknowledge().await });
+        while channel.state() != ChannelState::Joined {
+            tokio::task::yield_now().await;
+        }
+        flush.abort();
+        assert!(flush.await.unwrap_err().is_cancelled());
+        assert_eq!(channel.state(), ChannelState::Stalled);
+
+        let request_ids = channel
+            .inner
+            .queue
+            .lock()
+            .await
+            .iter()
+            .map(|message| message.request_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(request_ids, ["first".to_owned(), "second".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn websocket_write_and_close_are_timeout_bounded() {
+        struct PendingSink;
+
+        impl Sink<Message> for PendingSink {
+            type Error = tokio_tungstenite::tungstenite::Error;
+
+            fn poll_ready(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn start_send(
+                self: std::pin::Pin<&mut Self>,
+                _item: Message,
+            ) -> std::result::Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        let mut sink = PendingSink;
+        let write = send_websocket_frame(
+            &mut sink,
+            Message::Text("blocked".into()),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            write,
+            ClientError::ConnectionLost(message) if message.contains("write timed out")
+        ));
+
+        let close = close_websocket_writer(&mut sink, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            close,
+            ClientError::ConnectionLost(message) if message.contains("close timed out")
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_inbound_message_is_rejected_and_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let oversized = "x".repeat(1024);
+            socket.send(Message::Text(oversized.into())).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let client = PondClient::with_options(
+            format!("ws://{addr}/socket"),
+            None,
+            ClientOptions {
+                max_message_size: 128,
+                max_frame_size: 128,
+                reconnect_initial_delay: Duration::from_secs(1),
+                max_reconnect_delay: Duration::from_secs(1),
+                ..ClientOptions::default()
+            },
+        )
+        .unwrap();
+        let mut errors = client.subscribe_errors();
+        client.connect().await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), errors.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(&*error, ClientError::WebSocket(_)));
+        assert_eq!(client.state(), ConnectionState::Disconnected);
+        client.disconnect().await;
+        server.await.unwrap();
     }
 }
