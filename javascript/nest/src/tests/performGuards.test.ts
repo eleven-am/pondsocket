@@ -2,7 +2,14 @@ import 'reflect-metadata';
 import { manageParameters } from '../managers/parametres';
 
 jest.mock('../helpers/misc', () => ({
-    retrieveInstance: (_moduleRef: any, Guard: any) => new Guard(),
+    __contextIds: [] as any[],
+    retrieveInstance: (_moduleRef: any, Guard: any, contextId: any) => {
+        const mocked = jest.requireMock('../helpers/misc') as any;
+
+        mocked.__contextIds.push(contextId);
+
+        return new Guard();
+    },
 }));
 
 jest.mock('../managers/guards', () => {
@@ -28,6 +35,7 @@ async function importPerformAction() {
 function createModuleRef(): any {
     return {
         get: jest.fn(),
+        registerRequestByContextId: jest.fn(),
     };
 }
 
@@ -51,6 +59,7 @@ describe('performGuards (via performAction)', () => {
     beforeEach(() => {
         __setClassGuards([]);
         __setMethodGuards([]);
+        (jest.requireMock('../helpers/misc') as any).__contextIds.length = 0;
     });
 
     it('returns true and executes handler when no guards provided', async () => {
@@ -147,6 +156,74 @@ describe('performGuards (via performAction)', () => {
 
         expect(executionOrder).toEqual(['guard1', 'guard2']);
         expect(handler).not.toHaveBeenCalled();
+    });
+
+    it('runs each guard binding in global, class, and method scope order', async () => {
+        const calls: string[] = [];
+
+        class SharedGuard {
+            canActivate() {
+                calls.push('guard');
+                return true;
+            }
+        }
+
+        __setClassGuards([SharedGuard]);
+        __setMethodGuards([SharedGuard]);
+
+        const handler = jest.fn();
+        const instance = { constructor: class TestInstance {}, handler };
+        const { performAction } = await importPerformAction();
+
+        await performAction(
+            instance,
+            createModuleRef(),
+            [SharedGuard as any],
+            [],
+            handler,
+            'handler',
+            createJoinInput() as any,
+            'join',
+        );
+
+        expect(calls).toEqual(['guard', 'guard', 'guard']);
+    });
+
+    it('uses one Nest context id for request-scoped guards and parameters', async () => {
+        class RequestGuard {
+            canActivate() { return true; }
+        }
+
+        const handler = jest.fn();
+        const instance = { constructor: class TestInstance {}, handler };
+        let parameterContextId: unknown;
+
+        manageParameters(instance, 'handler').set(0, async (_context, _pipes, _moduleRef, contextId) => {
+            parameterContextId = contextId;
+            return 'value';
+        });
+
+        const moduleRef = createModuleRef();
+        const { performAction } = await importPerformAction();
+
+        await performAction(
+            instance,
+            moduleRef,
+            [RequestGuard as any],
+            [],
+            handler,
+            'handler',
+            createJoinInput() as any,
+            'join',
+        );
+
+        const guardContextId = (jest.requireMock('../helpers/misc') as any).__contextIds[0];
+
+        expect(parameterContextId).toBe(guardContextId);
+        expect(moduleRef.registerRequestByContextId).toHaveBeenCalledWith(
+            expect.anything(),
+            guardContextId,
+        );
     });
 
     it('replies when a guard rejects an event', async () => {

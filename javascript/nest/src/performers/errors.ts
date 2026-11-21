@@ -16,18 +16,28 @@ export function performErrors (
     let status: number;
 
     if (error instanceof HttpException) {
-        message = error.message;
         status = error.getStatus();
-        data = (error.getResponse() as any)?.message;
+        const response = error.getResponse();
+
+        if (status < 500) {
+            message = error.message;
+            data = typeof response === 'object' && response !== null
+                ? (response as { message?: unknown }).message
+                : response;
+        } else {
+            message = 'Internal server error';
+        }
     } else if (error instanceof Error) {
-        message = error.message;
+        message = 'Internal server error';
         status = 500;
     } else {
-        message = 'An unknown error occurred';
+        message = 'Internal server error';
         status = 500;
     }
 
-    logger.error(message, error instanceof Error ? error.stack : undefined);
+    const logMessage = error instanceof Error ? error.message : String(error);
+
+    logger.error(logMessage, error instanceof Error ? error.stack : undefined);
 
     if (lifecycle === 'event') {
         return (response as EventContext<string>).reply(ErrorTypes.INTERNAL_SERVER_ERROR, {

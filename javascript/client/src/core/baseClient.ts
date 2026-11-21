@@ -19,11 +19,36 @@ import {
 } from '@eleven-am/pondsocket-common';
 
 import { Channel } from './channel';
-import { ClientMessage, ClientOptions, ConnectionState } from '../types';
+import { ClientOptions, ConnectionState, Publisher, utf8ByteLength } from '../types';
 
 const DEFAULT_CONNECTION_TIMEOUT = 10000;
 const DEFAULT_JOIN_TIMEOUT = 10000;
 const DEFAULT_MAX_RECONNECT_DELAY = 30000;
+const DEFAULT_MAX_QUEUE_SIZE = 100;
+const DEFAULT_MAX_QUEUE_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_CHANNELS = 100;
+const DEFAULT_MAX_MESSAGE_SIZE = 1024 * 1024;
+const DEFAULT_MAX_BUFFERED_AMOUNT = 1024 * 1024;
+const DEFAULT_MAX_PENDING_REQUESTS = 100;
+const DEFAULT_REQUEST_TIMEOUT = 10000;
+
+const requirePositiveFiniteOption = (name: string, value: number) => {
+    if (!Number.isFinite(value) || value <= 0) {
+        throw new RangeError(`${name} must be a positive finite number`);
+    }
+
+    return value;
+};
+
+const requirePositiveIntegerOption = (name: string, value: number) => {
+    requirePositiveFiniteOption(name, value);
+
+    if (!Number.isSafeInteger(value)) {
+        throw new RangeError(`${name} must be a positive safe integer`);
+    }
+
+    return value;
+};
 
 type DefinedJoinOptions<Definition extends AnyPondChannelDefinition> =
     Record<never, never> extends JoinParamsOf<SchemaOf<Definition>>
@@ -64,17 +89,29 @@ export abstract class BaseClient {
 
     readonly #channels: Map<string, Channel>;
 
+    readonly #queueBudget: { usedBytes: number; maxBytes: number };
+
     constructor (endpoint: string, params: Record<string, any> = {}, options: ClientOptions = {}) {
         this._address = this._resolveAddress(endpoint, params);
         this._disconnecting = false;
         this._reconnectAttempts = 0;
         this._options = {
-            connectionTimeout: options.connectionTimeout ?? DEFAULT_CONNECTION_TIMEOUT,
-            joinTimeout: options.joinTimeout ?? DEFAULT_JOIN_TIMEOUT,
-            maxReconnectDelay: options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY,
-            pingInterval: options.pingInterval,
+            connectionTimeout: requirePositiveFiniteOption('connectionTimeout', options.connectionTimeout ?? DEFAULT_CONNECTION_TIMEOUT),
+            joinTimeout: requirePositiveFiniteOption('joinTimeout', options.joinTimeout ?? DEFAULT_JOIN_TIMEOUT),
+            maxReconnectDelay: requirePositiveFiniteOption('maxReconnectDelay', options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY),
+            pingInterval: options.pingInterval === undefined
+                ? undefined
+                : requirePositiveFiniteOption('pingInterval', options.pingInterval),
+            maxQueueSize: requirePositiveIntegerOption('maxQueueSize', options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE),
+            maxQueueBytes: requirePositiveIntegerOption('maxQueueBytes', options.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES),
+            maxChannels: requirePositiveIntegerOption('maxChannels', options.maxChannels ?? DEFAULT_MAX_CHANNELS),
+            maxMessageSize: requirePositiveIntegerOption('maxMessageSize', options.maxMessageSize ?? DEFAULT_MAX_MESSAGE_SIZE),
+            maxBufferedAmount: requirePositiveIntegerOption('maxBufferedAmount', options.maxBufferedAmount ?? DEFAULT_MAX_BUFFERED_AMOUNT),
+            maxPendingRequests: requirePositiveIntegerOption('maxPendingRequests', options.maxPendingRequests ?? DEFAULT_MAX_PENDING_REQUESTS),
+            requestTimeout: requirePositiveFiniteOption('requestTimeout', options.requestTimeout ?? DEFAULT_REQUEST_TIMEOUT),
         };
         this.#channels = new Map();
+        this.#queueBudget = { usedBytes: 0, maxBytes: this._options.maxQueueBytes };
         this._broadcaster = new Subject<ChannelEvent>();
         this._connectionState = new BehaviorSubject<ConnectionState>(ConnectionState.DISCONNECTED);
         this._errorSubject = new Subject<Error>();
@@ -146,11 +183,17 @@ export abstract class BaseClient {
         const definitionOptions = definition ? paramsOrOptions as DefinedChannelOptions<AnyPondChannelDefinition> : null;
         const name: string = definition ? buildPondRoute(definition.path, definitionOptions?.params ?? {}) : nameOrDefinition as string;
         const params = definition ? definitionOptions?.joinParams ?? {} : paramsOrOptions as JoinParamsOf<Schema>;
-        const joinTimeout = definitionOptions?.joinTimeout ?? this._options.joinTimeout;
+        const joinTimeout = requirePositiveFiniteOption(
+            'joinTimeout',
+            definitionOptions?.joinTimeout ?? this._options.joinTimeout,
+        );
         const channel = this.#channels.get(name);
 
         if (channel && channel.channelState !== ChannelState.CLOSED) {
             return channel;
+        }
+        if (this.#channels.size >= this._options.maxChannels) {
+            throw new Error(`Client channel capacity of ${this._options.maxChannels} was exceeded`);
         }
 
         const publisher = this._createPublisher();
@@ -159,8 +202,15 @@ export abstract class BaseClient {
             this._connectionState,
             name,
             params as JoinParamsOf<Schema>,
-            100,
+            this._options.maxQueueSize,
             joinTimeout,
+            () => {
+                if (this.#channels.get(name) === newChannel) {
+                    this.#channels.delete(name);
+                }
+            },
+            this._options.maxMessageSize,
+            this.#queueBudget,
         );
 
         this.#channels.set(name, newChannel);
@@ -168,15 +218,15 @@ export abstract class BaseClient {
         return newChannel;
     }
 
-    public onConnectionChange (callback: (state: ConnectionState) => void): Unsubscribe {
+    public onConnectionChange (callback: (state: ConnectionState) => void | Promise<void>): Unsubscribe {
         return this._connectionState.subscribe(callback);
     }
 
-    public onError (callback: (error: Error) => void): Unsubscribe {
+    public onError (callback: (error: Error) => void | Promise<void>): Unsubscribe {
         return this._errorSubject.subscribe(callback);
     }
 
-    protected abstract _createPublisher (): (message: ClientMessage) => void;
+    protected abstract _createPublisher (): Publisher;
 
     protected _parseMessages (data: string): ChannelEvent[] {
         const events: ChannelEvent[] = [];
@@ -198,6 +248,22 @@ export abstract class BaseClient {
         }
 
         return events;
+    }
+
+    protected _acceptInboundData (data: string) {
+        if (!this._exceedsMessageSize(data)) {
+            return true;
+        }
+
+        this._errorSubject.publish(new Error(
+            `Inbound message exceeds maximum size of ${this._options.maxMessageSize} bytes`,
+        ));
+
+        return false;
+    }
+
+    protected _exceedsMessageSize (data: string) {
+        return utf8ByteLength(data) > this._options.maxMessageSize;
     }
 
     protected _clearChannels () {
@@ -229,7 +295,9 @@ export abstract class BaseClient {
                 details: payload.details,
             };
 
-            channel.decline(normalized, message.requestId);
+            if (message.event !== 'destroyed' || channel.channelState !== ChannelState.JOINED) {
+                channel.decline(normalized, message.requestId);
+            }
         }
     }
 
@@ -240,6 +308,7 @@ export abstract class BaseClient {
             } else if (message.action === ServerActions.ERROR || message.event === Events.UNAUTHORIZED) {
                 this.#handleError(message);
             } else if (message.event === Events.CONNECTION && message.action === ServerActions.CONNECT) {
+                this._clearConnectionTimeout();
                 this._reconnectAttempts = 0;
                 this._clearReconnectTimeout();
                 this._connectionState.publish(ConnectionState.CONNECTED);

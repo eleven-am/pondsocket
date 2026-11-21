@@ -11,6 +11,7 @@ import {
     GetEventParams,
     GetEventPayload,
 } from '../decorators';
+import { managePipes } from '../managers/pipes';
 import { performAction } from '../performers/action';
 
 function createModuleRef (): any {
@@ -125,5 +126,46 @@ describe('PondSocket parameter decorators', () => {
         )).rejects.toThrow(
             'Controller.handler parameter at index 0 must use a PondSocket parameter decorator',
         );
+    });
+
+    it('runs each pipe binding across global, class, and method scopes', async () => {
+        const calls: unknown[] = [];
+
+        class SharedPipe {
+            transform (value: unknown) {
+                calls.push(value);
+
+                return value;
+            }
+        }
+
+        class Controller {
+            handler (@GetEventPayload() _payload: Record<string, unknown>) {}
+        }
+
+        const controller = new Controller();
+        managePipes(Controller).set([SharedPipe]);
+        managePipes(controller, 'handler').set([SharedPipe]);
+        const moduleRef = {
+            get: jest.fn((Type: typeof SharedPipe) => new Type()),
+            registerRequestByContextId: jest.fn(),
+        };
+
+        await performAction(
+            controller,
+            moduleRef as any,
+            [],
+            [SharedPipe],
+            controller.handler,
+            'handler',
+            createEventInput() as any,
+            'event',
+        );
+
+        expect(calls).toEqual([
+            { text: 'hello' },
+            { text: 'hello' },
+            { text: 'hello' },
+        ]);
     });
 });

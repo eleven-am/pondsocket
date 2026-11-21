@@ -42,6 +42,14 @@ pond.listen(3000);
 
 Connection and join handlers must call `accept()`, `decline()`, or delegate with `next()`. A handler that completes without deciding is declined instead of leaving the client pending.
 
+Connection authorization is bounded by `connectionTimeout` (10 seconds by default). If a matched handler remains pending without accepting, declining, or delegating, PondSocket sends an HTTP 408 response and destroys that upgrade socket.
+
+Channel join authorization is independently bounded by `joinTimeout` (10 seconds by default). Socket input serialization prevents overlapping join authorizations, while the bounded inbound queue limits waiting requests. Timed-out, declined, failed, and disconnected joins release their authorization state and remove unused concrete channels.
+
+Inbound work is serialized per socket and bounded by `maxPendingMessagesPerSocket` and `maxPendingBytesPerSocket`. Event work exceeding `eventTimeout` closes and cleans up the offending connection. Outbound channel delivery is serialized per user and bounded by `maxPendingMessagesPerUser` and `maxPendingBytesPerUser`; a stalled or overflowing consumer is removed and its transport is closed instead of retaining an unbounded backlog.
+
+`exclusiveServer` defaults to `true`, so unmatched upgrades receive an HTTP 404 response. Set it to `false` only when another `upgrade` listener is guaranteed to accept or reject every unmatched request. PondSocket relinquishes unmatched sockets in non-exclusive mode and deliberately does not apply its authorization timeout to them; destroying those sockets could terminate an upgrade already owned by another protocol handler.
+
 ## Shared schema
 
 Schemas are optional. A definition can be shared by Core, the Nest adapter, and the client without repeating route literals as generic arguments.
@@ -101,6 +109,8 @@ import { PondSocket, RedisDistributedBackend } from '@eleven-am/pondsocket';
 const backend = new RedisDistributedBackend({
     url: process.env.REDIS_URL,
     namespace: 'my-app',
+    initializationTimeoutMs: 10_000,
+    cleanupTimeoutMs: 5_000,
 });
 
 const pond = new PondSocket({ distributedBackend: backend });
@@ -112,7 +122,7 @@ Distributed messages use the PondSocket v1 protocol shared by the supported serv
 
 ## Lifecycle
 
-`ready()` reports distributed-backend initialization failures. `isHealthy()` reports backend/server health. `closeAsync()` stops heartbeat work, closes WebSockets, unsubscribes from the backend, and optionally closes the HTTP server.
+`ready()` reports distributed-backend initialization failures, including a bounded Redis startup timeout. `isHealthy()` reports backend/server health. `closeAsync()` stops heartbeat work, closes WebSockets, terminates Redis commands within the configured cleanup deadline, and optionally closes the HTTP server.
 
 When PondSocket uses a framework-owned HTTP server, pass `closeHttpServerOnShutdown: false`.
 

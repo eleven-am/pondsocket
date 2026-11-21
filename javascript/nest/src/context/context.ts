@@ -20,7 +20,7 @@ export class Context<
     Path extends string = string,
     EventName extends Extract<keyof EventsOf<Schema>, string> = Extract<keyof EventsOf<Schema>, string>,
 > {
-    readonly #data: Record<string, unknown> = {};
+    readonly #data = new Map<string, unknown>();
 
     readonly #context: NestContext<Schema, Path, EventName>;
 
@@ -312,11 +312,11 @@ export class Context<
     }
 
     addData (key: string, value: unknown) {
-        this.#data[key] = value;
+        this.#data.set(key, value);
     }
 
     getData (key: string) {
-        return this.#data[key] ?? null;
+        return this.#data.get(key) ?? null;
     }
 
     #getChannelContext (method: string) {

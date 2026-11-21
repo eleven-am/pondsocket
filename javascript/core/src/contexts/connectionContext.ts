@@ -15,6 +15,7 @@ import { WebSocketServer } from 'ws';
 import { ConnectionParams, SocketCache, ConnectionResponseOptions } from '../abstracts/types';
 import { EndpointEngine } from '../engines/endpointEngine';
 import { HttpError } from '../errors/httpError';
+import { rejectUpgrade } from '../server/rejectUpgrade';
 
 /**
  * ConnectionContext combines IncomingConnection data with ConnectionResponse functionality.
@@ -149,6 +150,9 @@ export class ConnectionContext<Path extends string> {
             this.assign(assigns);
         }
         this.#performChecks();
+        if (this.#params.settle && !this.#params.settle()) {
+            throw new HttpError(408, 'Connection authorization has expired');
+        }
 
         this.#webSocketServer.handleUpgrade(
             this.#params.request,
@@ -176,12 +180,14 @@ export class ConnectionContext<Path extends string> {
      */
     decline (message?: string, errorCode?: number): ConnectionContext<Path> {
         this.#performChecks();
+        if (this.#params.settle && !this.#params.settle()) {
+            throw new HttpError(408, 'Connection authorization has expired');
+        }
         const code = errorCode || 400;
         const { socket } = this.#params;
         const newMessage = message || 'Unauthorized connection';
 
-        socket.write(`HTTP/1.1 ${code} ${newMessage}\r\n\r\n`);
-        socket.destroy();
+        rejectUpgrade(socket, code, newMessage);
 
         return this;
     }

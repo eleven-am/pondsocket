@@ -22,8 +22,13 @@ export function manageProperty<A> (key: symbol, target: any) {
         Reflect.defineMetadata(key, value, target);
     }
 
+    function clear () {
+        Reflect.deleteMetadata(key, target);
+    }
+
     return {
         build,
+        clear,
         set,
     };
 }

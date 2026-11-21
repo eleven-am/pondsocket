@@ -1,19 +1,13 @@
 import { ClientMessage } from '@eleven-am/pondsocket-common';
 
 import { BaseClient } from './baseClient';
-import { ConnectionState } from '../types';
+import { ConnectionState, TransportPublishError, utf8ByteLength } from '../types';
 
 const SOCKET_CONNECTING = 0;
 const SOCKET_OPEN = 1;
 
 export abstract class WebSocketClient extends BaseClient {
     protected _socket: WebSocket | undefined;
-
-    protected _pingIntervalId: ReturnType<typeof setInterval> | undefined;
-
-    protected _pongTimeoutId: ReturnType<typeof setTimeout> | undefined;
-
-    protected _lastMessageTime: number = 0;
 
     public connect () {
         if (!this._disconnecting && this._socket &&
@@ -35,7 +29,7 @@ export abstract class WebSocketClient extends BaseClient {
         }
 
         this._connectionTimeoutId = setTimeout(() => {
-            if (this._socket === socket && socket.readyState === SOCKET_CONNECTING) {
+            if (this._socket === socket && this._connectionState.value !== ConnectionState.CONNECTED) {
                 const error = new Error('Connection timeout');
 
                 this._errorSubject.publish(error);
@@ -49,14 +43,9 @@ export abstract class WebSocketClient extends BaseClient {
                 return;
             }
 
-            this._clearConnectionTimeout();
-            this._clearPingInterval();
-            this._clearPongTimeout();
-            this._lastMessageTime = Date.now();
-
-            if (this._options.pingInterval) {
-                this._schedulePongTimeout(socket);
-            }
+            // Browser WebSocket APIs do not expose ping/pong control frames.
+            // Liveness is therefore owned by the server transport rather than
+            // inferred from application-message silence.
         };
 
         socket.onmessage = (message) => {
@@ -64,8 +53,20 @@ export abstract class WebSocketClient extends BaseClient {
                 return;
             }
 
-            this._lastMessageTime = Date.now();
-            const events = this._parseMessages(String(message.data));
+            if (typeof message.data !== 'string') {
+                this._errorSubject.publish(new Error('WebSocket protocol requires UTF-8 text messages'));
+                socket.close(1003, 'Text messages required');
+
+                return;
+            }
+
+            if (!this._acceptInboundData(message.data)) {
+                socket.close(1009, 'Message too large');
+
+                return;
+            }
+
+            const events = this._parseMessages(message.data);
 
             for (const event of events) {
                 this._broadcaster.publish(event);
@@ -90,8 +91,6 @@ export abstract class WebSocketClient extends BaseClient {
 
             this._socket = undefined;
             this._clearConnectionTimeout();
-            this._clearPingInterval();
-            this._clearPongTimeout();
             this._connectionState.publish(ConnectionState.DISCONNECTED);
             this._scheduleReconnect();
         };
@@ -102,8 +101,6 @@ export abstract class WebSocketClient extends BaseClient {
     public disconnect () {
         this._clearConnectionTimeout();
         this._clearReconnectTimeout();
-        this._clearPingInterval();
-        this._clearPongTimeout();
         this._disconnecting = true;
         this._connectionState.publish(ConnectionState.DISCONNECTED);
         const socket = this._socket;
@@ -118,49 +115,48 @@ export abstract class WebSocketClient extends BaseClient {
     }
 
     protected _createPublisher () {
-        return (message: ClientMessage) => {
+        return (message: ClientMessage, serialized?: { data: string; byteLength: number }) => {
             const socket = this._socket;
 
             if (this._connectionState.value !== ConnectionState.CONNECTED || !socket || socket.readyState !== SOCKET_OPEN) {
-                throw new Error('Cannot send message while the WebSocket is not connected');
+                throw new TransportPublishError('Cannot send message while the WebSocket is not connected', true);
             }
 
-            socket.send(JSON.stringify(message));
+            let data: string;
+
+            try {
+                data = serialized?.data ?? JSON.stringify(message);
+            } catch (error) {
+                throw new TransportPublishError('Message cannot be serialized as JSON', false, error);
+            }
+            const byteLength = serialized?.byteLength ?? utf8ByteLength(data);
+
+            if (byteLength > this._options.maxMessageSize) {
+                throw new TransportPublishError(
+                    `Outbound message exceeds maximum size of ${this._options.maxMessageSize} bytes`,
+                    false,
+                );
+            }
+            if (byteLength > this._options.maxBufferedAmount) {
+                throw new TransportPublishError(
+                    `Outbound message exceeds WebSocket buffer limit of ${this._options.maxBufferedAmount} bytes`,
+                    false,
+                );
+            }
+            if (socket.bufferedAmount + byteLength > this._options.maxBufferedAmount) {
+                socket.close(1013, 'Backpressure limit exceeded');
+                throw new TransportPublishError(
+                    `WebSocket buffered data would exceed ${this._options.maxBufferedAmount} bytes`,
+                    true,
+                );
+            }
+
+            try {
+                socket.send(data);
+            } catch (error) {
+                socket.close(1013, 'Send failed');
+                throw new TransportPublishError('WebSocket send failed before delivery', true, error);
+            }
         };
-    }
-
-    private _clearPingInterval () {
-        if (this._pingIntervalId) {
-            clearInterval(this._pingIntervalId);
-            this._pingIntervalId = undefined;
-        }
-    }
-
-    private _clearPongTimeout () {
-        if (this._pongTimeoutId) {
-            clearTimeout(this._pongTimeoutId);
-            this._pongTimeoutId = undefined;
-        }
-    }
-
-    private _schedulePongTimeout (socket: WebSocket) {
-        this._clearPongTimeout();
-        const timeout = this._options.pingInterval! * 2;
-
-        this._pongTimeoutId = setTimeout(() => {
-            if (this._socket !== socket) {
-                return;
-            }
-
-            if (Date.now() - this._lastMessageTime >= timeout) {
-                this._errorSubject.publish(new Error('Connection lost: no response from server'));
-                socket.close();
-
-                return;
-            }
-
-            this._schedulePongTimeout(socket);
-        }, timeout);
-        this._unrefTimer(this._pongTimeoutId);
     }
 }

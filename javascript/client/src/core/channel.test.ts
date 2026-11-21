@@ -12,7 +12,7 @@ import {
 } from '@eleven-am/pondsocket-common';
 
 import { Channel } from './channel';
-import { ClientMessage, ConnectionState } from '../types';
+import { ClientMessage, ConnectionState, TransportPublishError } from '../types';
 
 const createChannel = (params: JoinParams = {}) => {
     const publisher = jest.fn();
@@ -153,6 +153,62 @@ describe('Channel', () => {
         expect(channel.channelState).toBe(ChannelState.JOINED);
     });
 
+    it('ignores an acknowledgement from a join attempt invalidated by disconnect', () => {
+        const { channel, publisher, receiver, state } = createChannel();
+
+        channel.join();
+        const staleRequestId = publisher.mock.calls[0][0].requestId;
+
+        state.publish(ConnectionState.DISCONNECTED);
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+
+        channel.acknowledge(receiver, staleRequestId);
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+
+        state.publish(ConnectionState.CONNECTED);
+        const currentRequestId = publisher.mock.calls[1][0].requestId;
+
+        channel.acknowledge(receiver, staleRequestId);
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+        channel.acknowledge(receiver, currentRequestId);
+        expect(channel.channelState).toBe(ChannelState.JOINED);
+    });
+
+    it('does not resurrect an explicitly closed channel', () => {
+        const { channel, publisher } = createChannel();
+
+        channel.leave();
+        publisher.mockClear();
+        channel.join();
+
+        expect(channel.channelState).toBe(ChannelState.CLOSED);
+        expect(publisher).not.toHaveBeenCalled();
+    });
+
+    it('completes local cleanup when sending LEAVE fails', () => {
+        const publisher = jest.fn((message: ClientMessage) => {
+            if (message.action === ClientActions.LEAVE_CHANNEL) {
+                throw new Error('leave write failed');
+            }
+        });
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
+        const receiver = new Subject<ChannelEvent>();
+        const onClose = jest.fn();
+        const errorListener = jest.fn();
+        const channel = new Channel(publisher, state, 'test', {}, 100, 10000, onClose);
+
+        channel.onError(errorListener);
+        channel.join();
+        channel.acknowledge(receiver);
+        channel.leave();
+
+        expect(channel.channelState).toBe(ChannelState.CLOSED);
+        expect(onClose).toHaveBeenCalledTimes(1);
+        expect(errorListener).toHaveBeenCalledWith(expect.objectContaining({
+            message: 'leave write failed',
+        }));
+    });
+
     it('should correctly send a message', () => {
         const { channel, publisher, receiver, state } = createChannel();
 
@@ -179,6 +235,7 @@ describe('Channel', () => {
                     test: 'test',
                 },
             }),
+            expect.objectContaining({ data: expect.any(String), byteLength: expect.any(Number) }),
         );
 
         publisher.mockClear();
@@ -225,6 +282,7 @@ describe('Channel', () => {
                     test: 'test stalling',
                 },
             }),
+            expect.objectContaining({ data: expect.any(String), byteLength: expect.any(Number) }),
         );
 
         expect(publisher).toHaveBeenCalledTimes(1);
@@ -1121,6 +1179,230 @@ describe('Channel', () => {
         await expect(promise).rejects.toThrow(/Channel "test" was closed/);
     });
 
+    it('rejects a pending response immediately when the server returns a request error', async () => {
+        const { channel, publisher, receiver } = createChannel();
+
+        channel.join();
+        channel.acknowledge(receiver);
+        publisher.mockClear();
+        // @ts-expect-error - exercising request-error cleanup
+        const promise = channel.sendForResponse('WAITING', { data: 'test' }, 30000);
+        const requestId = publisher.mock.calls[0][0].requestId;
+
+        channel.decline({
+            code: ErrorTypes.CHANNEL_ERROR,
+            message: 'request rejected',
+            status: 400,
+            statusCode: 400,
+        }, requestId);
+
+        await expect(promise).rejects.toThrow('request rejected');
+        expect(channel.channelState).toBe(ChannelState.JOINED);
+    });
+
+    it('invalidates a joined channel after a server channel-unavailable error and permits a clean rejoin', async () => {
+        const { channel, publisher, receiver } = createChannel();
+        let resolveDelivery: (() => void) | undefined;
+
+        channel.join();
+        channel.acknowledge(receiver);
+        publisher.mockClear();
+        publisher.mockImplementationOnce(() => new Promise<void>((resolve) => {
+            resolveDelivery = resolve;
+        }));
+
+        // @ts-expect-error exercising lifecycle cleanup with a generic test schema
+        const response = channel.sendForResponse('WAITING', { data: 'test' }, 30_000);
+        const requestId = publisher.mock.calls[0][0].requestId;
+
+        channel.sendMessage('unsafe-queued', { data: 'must not replay' });
+        expect(publisher).toHaveBeenCalledTimes(1);
+        channel.decline({
+            code: ErrorTypes.CHANNEL_ERROR,
+            message: 'Distributed channel unavailable',
+            status: 503,
+            statusCode: 503,
+        }, requestId);
+
+        await expect(response).rejects.toThrow(/became unavailable/);
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+        expect(channel.joinError).toEqual(expect.objectContaining({ status: 503 }));
+        expect(channel.presence).toEqual([]);
+
+        resolveDelivery?.();
+        await Promise.resolve();
+        publisher.mockImplementation(() => undefined);
+        publisher.mockClear();
+        channel.sendMessage('safe-after-failure', { data: 'replay after rejoin' });
+        expect(publisher).not.toHaveBeenCalled();
+
+        channel.join();
+        expect(publisher).toHaveBeenCalledTimes(1);
+        expect(publisher.mock.calls[0][0].action).toBe(ClientActions.JOIN_CHANNEL);
+        channel.acknowledge(receiver);
+
+        expect(publisher.mock.calls.map(([message]) => message.event)).toEqual([
+            ClientActions.JOIN_CHANNEL,
+            'safe-after-failure',
+        ]);
+        expect(publisher.mock.calls.some(([message]) => message.event === 'unsafe-queued')).toBe(false);
+    });
+
+    it.each([
+        {
+            action: ServerActions.SYSTEM,
+            event: 'kicked_out',
+            payload: { message: 'Policy violation', code: 403 },
+            status: 403,
+        },
+        {
+            action: ServerActions.ERROR,
+            event: 'destroyed',
+            payload: { message: 'Channel retired' },
+            status: 410,
+        },
+    ])('ends membership on $event, preserves notification, and allows an explicit rejoin', async ({
+        action,
+        event,
+        payload,
+        status,
+    }) => {
+        const { channel, publisher, receiver } = createChannel();
+        const messageListener = jest.fn();
+        const errorListener = jest.fn();
+        let resolveDelivery: (() => void) | undefined;
+
+        channel.join();
+        channel.acknowledge(receiver);
+        channel.onMessage(messageListener);
+        channel.onError(errorListener);
+        receiver.publish({
+            requestId: 'presence',
+            action: ServerActions.PRESENCE,
+            event: PresenceEventTypes.UPDATE,
+            channelName: 'test',
+            payload: {
+                changed: { id: 'user', status: 'online' },
+                presence: [{ id: 'user', status: 'online' }],
+            },
+        });
+        expect(channel.presence).toHaveLength(1);
+        publisher.mockClear();
+        publisher.mockImplementationOnce(() => new Promise<void>((resolve) => {
+            resolveDelivery = resolve;
+        }));
+
+        // @ts-expect-error exercising terminal membership cleanup with a generic schema
+        const response = channel.sendForResponse('WAITING', { data: 'test' }, 30_000);
+        channel.sendMessage('unsafe-queued', { data: 'must not replay' });
+        receiver.publish({
+            requestId: `terminal-${event}`,
+            action,
+            event,
+            channelName: 'test',
+            payload,
+        });
+
+        await expect(response).rejects.toThrow(/membership ended/);
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+        expect(channel.joinError).toEqual(expect.objectContaining({ status }));
+        expect(channel.presence).toEqual([]);
+        expect(messageListener).toHaveBeenCalledWith(event, payload);
+        expect(errorListener).toHaveBeenCalledWith(expect.objectContaining({ status }));
+        expect(() => channel.sendMessage('blocked', {})).toThrow(/Cannot send messages/);
+        expect(publisher.mock.calls.filter(([message]) => message.action === ClientActions.LEAVE_CHANNEL)).toHaveLength(
+            event === 'destroyed' ? 1 : 0,
+        );
+
+        resolveDelivery?.();
+        await Promise.resolve();
+        publisher.mockImplementation(() => undefined);
+        publisher.mockClear();
+        channel.join();
+        expect(publisher.mock.calls[0][0].action).toBe(ClientActions.JOIN_CHANNEL);
+        channel.acknowledge(receiver);
+        channel.sendMessage('after-rejoin', { ok: true });
+
+        expect(publisher.mock.calls.map(([message]) => message.event)).toEqual([
+            ClientActions.JOIN_CHANNEL,
+            'after-rejoin',
+        ]);
+        expect(publisher.mock.calls.some(([message]) => message.event === 'unsafe-queued')).toBe(false);
+    });
+
+    it('contains a failed best-effort leave after channel destruction', async () => {
+        const { channel, publisher, receiver } = createChannel();
+        const errorListener = jest.fn();
+
+        channel.join();
+        channel.acknowledge(receiver);
+        channel.onError(errorListener);
+        publisher.mockClear();
+        publisher.mockRejectedValueOnce(new Error('transport already gone'));
+        receiver.publish({
+            requestId: 'destroyed',
+            action: ServerActions.ERROR,
+            event: 'destroyed',
+            channelName: 'test',
+            payload: { message: 'Channel retired' },
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+        expect(publisher).toHaveBeenCalledWith(expect.objectContaining({
+            action: ClientActions.LEAVE_CHANNEL,
+        }));
+        expect(errorListener).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects an in-flight response when the joined transport disconnects', async () => {
+        const { channel, receiver, state } = createChannel();
+
+        channel.join();
+        channel.acknowledge(receiver);
+        // @ts-expect-error - exercising connection-loss cleanup
+        const promise = channel.sendForResponse('WAITING', { data: 'test' }, 30000);
+
+        state.publish(ConnectionState.DISCONNECTED);
+
+        await expect(promise).rejects.toThrow(/connection was lost/);
+    });
+
+    it('preserves later FIFO entries when a synchronous response removes the current entry', async () => {
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.DISCONNECTED);
+        const receiver = new Subject<ChannelEvent>();
+        const published: ClientMessage[] = [];
+        const publisher = (message: ClientMessage) => {
+            published.push(message);
+            if (message.event === 'WAITING') {
+                receiver.publish({
+                    requestId: message.requestId,
+                    action: ServerActions.BROADCAST,
+                    event: 'response',
+                    channelName: 'test',
+                    payload: { ok: true },
+                });
+            }
+        };
+        const channel = new Channel(publisher, state, 'test', {});
+
+        channel.join();
+        // @ts-expect-error - exercising reentrant response delivery
+        const response = channel.sendForResponse('WAITING', { data: 'test' }, 30000);
+        channel.sendMessage('AFTER', { data: 'after' });
+        state.publish(ConnectionState.CONNECTED);
+        const joinRequest = published.find((message) => message.event === ClientActions.JOIN_CHANNEL)!;
+
+        channel.acknowledge(receiver, joinRequest.requestId);
+
+        await expect(response).resolves.toEqual({ ok: true });
+        expect(published.map((message) => message.event)).toEqual([
+            ClientActions.JOIN_CHANNEL,
+            'WAITING',
+            'AFTER',
+        ]);
+    });
+
     it('rejects new response requests when the bounded queue is full without reordering queued work', async () => {
         const publisher = jest.fn();
         const state = new BehaviorSubject<ConnectionState>(ConnectionState.CONNECTED);
@@ -1213,7 +1495,7 @@ describe('Channel', () => {
         expect(publisher).toHaveBeenCalledWith(expect.objectContaining({
             event: 'message/message%201',
             payload: { text: 'hello' },
-        }));
+        }), expect.objectContaining({ data: expect.any(String), byteLength: expect.any(Number) }));
 
         receiver.publish({
             requestId: 'request-1',
@@ -1227,5 +1509,111 @@ describe('Channel', () => {
             params: { messageId: 'message 2' },
             query: { source: 'history' },
         });
+    });
+
+    it('drops a permanently invalid queue head and continues in FIFO order', () => {
+        const { channel, publisher, receiver } = createChannel();
+
+        channel.join();
+        channel.acknowledge(receiver);
+        publisher.mockClear();
+        publisher
+            .mockImplementationOnce(() => {
+                throw new TransportPublishError('permanently invalid', false);
+            })
+            .mockImplementation(() => undefined);
+
+        expect(() => channel.sendMessage('first', { value: 1 })).toThrow('permanently invalid');
+        expect(channel.channelState).toBe(ChannelState.JOINED);
+        expect(() => channel.sendMessage('second', { value: 2 })).not.toThrow();
+        expect(publisher.mock.calls.map(([message]) => message.event)).toEqual(['first', 'second']);
+    });
+
+    it('waits for asynchronous delivery and rejects failed response requests promptly', async () => {
+        const { channel, publisher, receiver } = createChannel();
+        let rejectDelivery: ((error: Error) => void) | undefined;
+
+        channel.join();
+        channel.acknowledge(receiver);
+        publisher.mockClear();
+        publisher.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+            rejectDelivery = reject;
+        }));
+
+        // @ts-expect-error generic test channel intentionally has no response schema
+        const response = channel.sendForResponse('first', { value: 1 }, 30_000);
+        channel.sendMessage('second', { value: 2 });
+        expect(publisher).toHaveBeenCalledTimes(1);
+
+        rejectDelivery?.(new TransportPublishError('ambiguous delivery', false));
+        await expect(response).rejects.toThrow('ambiguous delivery');
+        await Promise.resolve();
+
+        expect(publisher).toHaveBeenCalledTimes(2);
+        expect(publisher.mock.calls[1][0].event).toBe('second');
+    });
+
+    it('continues flushing after an in-flight response request times out', async () => {
+        jest.useFakeTimers();
+        const { channel, publisher, receiver } = createChannel();
+        let resolveDelivery: (() => void) | undefined;
+
+        channel.join();
+        channel.acknowledge(receiver);
+        publisher.mockClear();
+        publisher.mockImplementationOnce(() => new Promise<void>((resolve) => {
+            resolveDelivery = resolve;
+        }));
+
+        // @ts-expect-error generic test channel intentionally has no response schema
+        const response = channel.sendForResponse('first', { value: 1 }, 10);
+        const rejectedResponse = expect(response).rejects.toThrow(/timed out/);
+        channel.sendMessage('second', { value: 2 });
+        await jest.advanceTimersByTimeAsync(10);
+        await rejectedResponse;
+        expect(publisher).toHaveBeenCalledTimes(1);
+
+        resolveDelivery?.();
+        await Promise.resolve();
+        expect(publisher).toHaveBeenCalledTimes(2);
+        expect(publisher.mock.calls[1][0].event).toBe('second');
+        jest.useRealTimers();
+    });
+
+    it('rejects oversized messages before they can consume a disconnected queue', () => {
+        const publisher = jest.fn();
+        const state = new BehaviorSubject<ConnectionState>(ConnectionState.DISCONNECTED);
+        const channel = new Channel(publisher, state, 'bounded', {}, 100, 10_000, undefined, 128);
+
+        expect(() => channel.sendMessage('large', { value: 'x'.repeat(1000) })).toThrow(/maximum size/);
+        channel.join();
+        state.publish(ConnectionState.CONNECTED);
+
+        expect(publisher).toHaveBeenCalledTimes(1);
+        expect(publisher.mock.calls[0][0].action).toBe(ClientActions.JOIN_CHANNEL);
+    });
+
+    it('returns async observer promises so rejections are contained by Subject', async () => {
+        const { channel, receiver } = createChannel();
+        const unhandled = jest.fn();
+        const handler = (reason: unknown) => unhandled(reason);
+
+        process.on('unhandledRejection', handler);
+        channel.join();
+        channel.acknowledge(receiver);
+        channel.onMessage(async () => {
+            throw new Error('observer failed');
+        });
+        receiver.publish({
+            requestId: 'async-observer',
+            action: ServerActions.BROADCAST,
+            event: 'message',
+            channelName: 'test',
+            payload: {},
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        process.off('unhandledRejection', handler);
+
+        expect(unhandled).not.toHaveBeenCalled();
     });
 });

@@ -333,5 +333,16 @@ describe('Context', () => {
 
             expect(ctx.getData('nonexistent')).toBeNull();
         });
+
+        it('treats prototype-looking keys as ordinary isolated data', () => {
+            const nestCtx = createJoinNestContext();
+            const ctx = new Context(nestCtx, new TestInstance(), 'handler');
+            const value = { safe: true };
+
+            ctx.addData('__proto__', value);
+
+            expect(ctx.getData('__proto__')).toBe(value);
+            expect(({} as { safe?: boolean }).safe).toBeUndefined();
+        });
     });
 });

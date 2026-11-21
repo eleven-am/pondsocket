@@ -100,9 +100,12 @@ try {
         "require('@eleven-am/pondsocket-common')",
         "require('@eleven-am/pondsocket')",
         "require('@eleven-am/pondsocket/types')",
-        "require('@eleven-am/pondsocket-client')",
-        "require('@eleven-am/pondsocket-client/browser')",
-        "require('@eleven-am/pondsocket-client/node')",
+        "const client = require('@eleven-am/pondsocket-client')",
+        "const browserClient = require('@eleven-am/pondsocket-client/browser')",
+        "const nodeClient = require('@eleven-am/pondsocket-client/node')",
+        "if (typeof client.PondClient !== 'function' || typeof client.SSEClient !== 'function') throw new Error('client root exports are incomplete')",
+        "if (typeof browserClient.PondClient !== 'function' || typeof browserClient.SSEClient !== 'function') throw new Error('browser client exports are incomplete')",
+        "if (typeof nodeClient.PondClient !== 'function' || typeof nodeClient.SSEClient !== 'function') throw new Error('node client exports are incomplete')",
         "require('@eleven-am/pondsocket-express')",
         "require('@eleven-am/pondsocket-nest')",
     ].join(';');
@@ -112,6 +115,47 @@ try {
         stdio: 'inherit',
     });
     process.stdout.write('verified package installation and public runtime exports\n');
+
+    const typeSmokeTest = [
+        "import type { PondSocketOptions } from '@eleven-am/pondsocket/types';",
+        "import type { SSEClient as RootSSEClient } from '@eleven-am/pondsocket-client';",
+        "import type { ClientOptions as BrowserClientOptions } from '@eleven-am/pondsocket-client/browser';",
+        "import type { ClientOptions as NodeClientOptions, SSEClient as NodeSSEClient } from '@eleven-am/pondsocket-client/node';",
+        'declare const serverOptions: PondSocketOptions;',
+        'declare const rootSSEClient: RootSSEClient;',
+        'declare const browserOptions: BrowserClientOptions;',
+        'declare const nodeOptions: NodeClientOptions;',
+        'declare const nodeSSEClient: NodeSSEClient;',
+        'void serverOptions;',
+        'void rootSSEClient;',
+        'void browserOptions;',
+        'void nodeOptions;',
+        'void nodeSSEClient;',
+    ].join('\n');
+    writeFileSync(join(packDirectory, 'consumer.ts'), typeSmokeTest);
+
+    for (const moduleResolution of ['node', 'node16']) {
+        writeFileSync(join(packDirectory, 'tsconfig.json'), JSON.stringify({
+            compilerOptions: {
+                module: moduleResolution === 'node16' ? 'Node16' : 'commonjs',
+                moduleResolution,
+                noEmit: true,
+                skipLibCheck: false,
+                strict: true,
+                target: 'ES2022',
+            },
+            files: ['consumer.ts'],
+        }));
+        run(process.execPath, [
+            join(workingDirectory, 'node_modules', 'typescript', 'bin', 'tsc'),
+            '--project',
+            'tsconfig.json',
+        ], {
+            cwd: packDirectory,
+            stdio: 'inherit',
+        });
+        process.stdout.write(`verified packed declarations with ${moduleResolution} module resolution\n`);
+    }
 } finally {
     rmSync(packDirectory, { force: true, recursive: true });
 }

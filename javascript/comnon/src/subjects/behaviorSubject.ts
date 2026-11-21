@@ -22,7 +22,6 @@ export class BehaviorSubject<T> extends Subject<T> {
      * @param message - The message to publish
      */
     publish (message: T) {
-        this.#lastMessage = message;
         super.publish(message);
     }
 
@@ -31,10 +30,16 @@ export class BehaviorSubject<T> extends Subject<T> {
      * @param observer - The observer to subscribe
      */
     subscribe (observer: Subscriber<T>): Unsubscribe {
+        const unsubscribe = super.subscribe(observer);
+
         if (this.#lastMessage !== undefined) {
             this.notifyObserver(observer, this.#lastMessage);
         }
 
-        return super.subscribe(observer);
+        return unsubscribe;
+    }
+
+    protected beforePublish (message: T): void {
+        this.#lastMessage = message;
     }
 }

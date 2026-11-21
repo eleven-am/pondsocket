@@ -1,6 +1,6 @@
 {
   "name": "@eleven-am/pondsocket-common",
-  "version": "0.0.41",
+  "version": "0.0.42",
   "description": "Shared protocol, schema, routing, and observable primitives for PondSocket.",
   "keywords": [
     "pondsocket",

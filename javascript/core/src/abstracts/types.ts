@@ -1,6 +1,6 @@
 import { IncomingHttpHeaders } from 'http';
 import { IncomingMessage } from 'node:http';
-import internal from 'node:stream';
+import { Duplex } from 'node:stream';
 
 import {
     ChannelEvent,
@@ -56,9 +56,10 @@ export type OutgoingEventHandler<Path extends string, Schema extends AnyPondSche
 
 export interface ConnectionParams {
     head: Buffer;
-    socket: internal.Duplex;
+    socket: Duplex;
     request: IncomingMessage;
     requestId: string;
+    settle?: () => boolean;
 }
 
 export interface SocketCache {
@@ -67,6 +68,8 @@ export interface SocketCache {
     assigns: PondAssigns;
     subscriptions: Set<Unsubscribe>;
     channelSubscriptions?: Map<string, Unsubscribe>;
+    pendingJoinAuthorizations?: Set<Unsubscribe>;
+    completeJoinAuthorization?: () => void;
 }
 
 export interface ConnectionResponseOptions {

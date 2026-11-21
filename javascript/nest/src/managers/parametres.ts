@@ -1,6 +1,6 @@
 import 'reflect-metadata';
-import type { PipeTransform } from '@nestjs/common';
-import type { ModuleRef } from '@nestjs/core';
+import type { PipeTransform } from '@nestjs/common' with { 'resolution-mode': 'import' };
+import type { ContextId, ModuleRef } from '@nestjs/core' with { 'resolution-mode': 'import' };
 
 import { parametersKey } from '../constants';
 import { Context } from '../context/context';
@@ -18,7 +18,12 @@ export function manageParameters (target: any, propertyKey: string) {
         get () {
             return get() || [];
         },
-        set (index: number, callback: (context: Context, globalPipes: Constructor<PipeTransform>[], moduleRef: ModuleRef) => Promise<unknown>) {
+        set (index: number, callback: (
+            context: Context,
+            globalPipes: Constructor<PipeTransform>[],
+            moduleRef: ModuleRef,
+            contextId?: ContextId,
+        ) => Promise<unknown>) {
             const handlers = get() || [];
 
             set([

@@ -1,5 +1,5 @@
 import { IncomingHttpHeaders, IncomingMessage, Server as HTTPServer } from 'http';
-import internal from 'node:stream';
+import { Duplex } from 'node:stream';
 
 import {
     compilePondRoute,
@@ -18,6 +18,7 @@ import { EndpointEngine } from '../engines/endpointEngine';
 import { parseAddress } from '../matcher/matcher';
 import { IDistributedBackend, PondSocketOptions } from '../types';
 import { Endpoint } from '../wrappers/endpoint';
+import { rejectUpgrade } from './rejectUpgrade';
 
 export class PondSocket {
     readonly #server: HTTPServer;
@@ -32,11 +33,47 @@ export class PondSocket {
 
     readonly #maxMessageSize: number;
 
+    readonly #maxBufferedAmount: number;
+
     readonly #heartbeatMs: number;
+
+    readonly #connectionTimeout: number;
+
+    readonly #joinTimeout: number;
+
+    readonly #maxPendingJoins: number;
+
+    readonly #maxPendingMessagesPerUser: number;
+
+    readonly #maxPendingBytesPerUser: number;
+
+    readonly #maxPendingMessagesPerSocket: number;
+
+    readonly #maxPendingBytesPerSocket: number;
+
+    readonly #eventTimeout: number;
 
     readonly #closeHttpServerOnShutdown: boolean;
 
-    readonly #upgradeHandler: (req: IncomingMessage, socket: internal.Duplex, head: Buffer) => void;
+    readonly #onError: ((error: Error) => void) | null;
+
+    readonly #upgradeHandler: (req: IncomingMessage, socket: Duplex, head: Buffer) => void;
+
+    readonly #serverErrorHandler = (error: Error) => {
+        this.#serverError = error;
+
+        if (this.#heartbeatTimer) {
+            clearInterval(this.#heartbeatTimer);
+            this.#heartbeatTimer = null;
+        }
+    };
+
+    readonly #serverCloseHandler = () => {
+        if (this.#heartbeatTimer) {
+            clearInterval(this.#heartbeatTimer);
+            this.#heartbeatTimer = null;
+        }
+    };
 
     #heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -48,6 +85,8 @@ export class PondSocket {
 
     #shutdownPromise: Promise<void> | null = null;
 
+    readonly #endpoints: Map<string, EndpointEngine> = new Map();
+
     constructor ({
         server,
         socketServer,
@@ -55,16 +94,67 @@ export class PondSocket {
         exclusiveServer = true,
         distributedBackend,
         maxMessageSize = 1024 * 1024,
+        maxBufferedAmount = maxMessageSize * 4,
         heartbeatInterval = 30000,
+        connectionTimeout = 10_000,
+        joinTimeout = 10_000,
+        maxPendingJoins = 32,
+        maxPendingMessagesPerUser = 256,
+        maxPendingBytesPerUser = maxBufferedAmount,
+        maxPendingMessagesPerSocket = 64,
+        maxPendingBytesPerSocket = maxMessageSize * 4,
+        eventTimeout = 10_000,
+        onError,
     }: PondSocketOptions = {}) {
+        if (!Number.isSafeInteger(maxMessageSize) || maxMessageSize <= 0) {
+            throw new TypeError('maxMessageSize must be a positive safe integer');
+        }
+        if (!Number.isSafeInteger(maxBufferedAmount) || maxBufferedAmount <= 0) {
+            throw new TypeError('maxBufferedAmount must be a positive safe integer');
+        }
+        if (!Number.isSafeInteger(heartbeatInterval) || heartbeatInterval <= 0) {
+            throw new TypeError('heartbeatInterval must be a positive safe integer');
+        }
+        if (!Number.isSafeInteger(connectionTimeout) || connectionTimeout <= 0) {
+            throw new TypeError('connectionTimeout must be a positive safe integer');
+        }
+        if (!Number.isSafeInteger(joinTimeout) || joinTimeout <= 0) {
+            throw new TypeError('joinTimeout must be a positive safe integer');
+        }
+        if (!Number.isSafeInteger(maxPendingJoins) || maxPendingJoins <= 0) {
+            throw new TypeError('maxPendingJoins must be a positive safe integer');
+        }
+        for (const [name, value] of Object.entries({
+            maxPendingMessagesPerUser,
+            maxPendingBytesPerUser,
+            maxPendingMessagesPerSocket,
+            maxPendingBytesPerSocket,
+            eventTimeout,
+        })) {
+            if (!Number.isSafeInteger(value) || value <= 0) {
+                throw new TypeError(`${name} must be a positive safe integer`);
+            }
+        }
+
         this.#middleware = new Middleware();
         this.#exclusiveServer = exclusiveServer;
         this.#server = server ?? new HTTPServer();
         this.#backend = distributedBackend ?? null;
         this.#maxMessageSize = maxMessageSize;
+        this.#maxBufferedAmount = maxBufferedAmount;
         this.#heartbeatMs = heartbeatInterval;
+        this.#connectionTimeout = connectionTimeout;
+        this.#joinTimeout = joinTimeout;
+        this.#maxPendingJoins = maxPendingJoins;
+        this.#maxPendingMessagesPerUser = maxPendingMessagesPerUser;
+        this.#maxPendingBytesPerUser = maxPendingBytesPerUser;
+        this.#maxPendingMessagesPerSocket = maxPendingMessagesPerSocket;
+        this.#maxPendingBytesPerSocket = maxPendingBytesPerSocket;
+        this.#eventTimeout = eventTimeout;
         this.#closeHttpServerOnShutdown = closeHttpServerOnShutdown;
-        this.#socketServer = socketServer ?? new WebSocketServer({ noServer: true });
+        this.#onError = onError ?? null;
+        this.#socketServer = socketServer ?? new WebSocketServer({ noServer: true,
+            maxPayload: maxMessageSize });
         this.#upgradeHandler = this.#handleUpgrade.bind(this);
         this.#init();
     }
@@ -106,7 +196,9 @@ export class PondSocket {
     }
 
     isHealthy (): boolean {
-        return this.#backendError === null && this.#serverError === null && this.#shutdownPromise === null;
+        const backendHealthy = this.#backend?.isHealthy?.() ?? true;
+
+        return this.#backendError === null && this.#serverError === null && this.#shutdownPromise === null && backendHealthy;
     }
 
     async #shutdown (timeout: number): Promise<void> {
@@ -116,6 +208,13 @@ export class PondSocket {
         }
 
         this.#server.off('upgrade', this.#upgradeHandler);
+        this.#server.off('error', this.#serverErrorHandler);
+        this.#server.off('close', this.#serverCloseHandler);
+
+        const endpoints = [...this.#endpoints.values()];
+
+        this.#endpoints.clear();
+        endpoints.forEach((endpoint) => endpoint.close());
 
         this.#socketServer.clients.forEach((socket) => {
             if (socket.readyState === WebSocket.OPEN) {
@@ -145,9 +244,9 @@ export class PondSocket {
                 resolve();
             }
         });
-        const cleanupBackend = (this.#backendReady ?? Promise.resolve())
-            .catch(() => {})
-            .then(() => this.#backend?.cleanup());
+        const cleanupBackend = this.#backend
+            ? Promise.resolve().then(() => this.#backend!.cleanup())
+            : Promise.resolve();
         const closeHttpServer = this.#closeHttpServerOnShutdown && this.#server.listening
             ? new Promise<void>((resolve, reject) => {
                 this.#server.close((error) => error ? reject(error) : resolve());
@@ -165,13 +264,36 @@ export class PondSocket {
     createEndpoint<Path extends string> (path: PondPath<Path>, handler: ConnectionHandler<Path>): Endpoint;
 
     createEndpoint<Path extends string> (pathOrDefinition: PondPath<Path> | PondEndpointDefinition<Path>, handler: ConnectionHandler<Path>) {
+        if (this.#shutdownPromise) {
+            throw new Error('Cannot create an endpoint after shutdown has started');
+        }
+
         const path = isPondEndpointDefinition(pathOrDefinition) ? pathOrDefinition.path as Path : pathOrDefinition;
 
         if (typeof path === 'string') {
             compilePondRoute(path);
         }
 
-        const endpoint = new EndpointEngine(String(path), this.#backend, this.#maxMessageSize);
+        const endpointPath = String(path);
+
+        if (this.#endpoints.has(endpointPath)) {
+            throw new Error(`Endpoint ${endpointPath} is already registered`);
+        }
+
+        const endpoint = new EndpointEngine(
+            endpointPath,
+            this.#backend,
+            this.#maxMessageSize,
+            this.#maxBufferedAmount,
+            this.#onError,
+            this.#joinTimeout,
+            this.#maxPendingJoins,
+            this.#maxPendingMessagesPerUser,
+            this.#maxPendingBytesPerUser,
+            this.#maxPendingMessagesPerSocket,
+            this.#maxPendingBytesPerSocket,
+            this.#eventTimeout,
+        );
 
         this.#middleware.use((req, params, next) => {
             const event = parseAddress(path, req.address);
@@ -210,14 +332,39 @@ export class PondSocket {
             });
         });
 
+        this.#endpoints.set(endpointPath, endpoint);
+
         return new Endpoint(endpoint);
     }
 
     /**
      * Handle WebSocket upgrade requests
      */
-    #handleUpgrade (req: IncomingMessage, socket: internal.Duplex, head: Buffer) {
+    #handleUpgrade (req: IncomingMessage, socket: Duplex, head: Buffer) {
         const clientId = uuid();
+        let settled = false;
+        let handleSocketClose = () => {};
+        const settle = () => {
+            if (settled) {
+                return false;
+            }
+            settled = true;
+            clearTimeout(timeout);
+            socket.off?.('close', handleSocketClose);
+
+            return true;
+        };
+        const timeout = setTimeout(() => {
+            if (settle()) {
+                rejectUpgrade(socket, 408, 'Connection authorization timed out');
+            }
+        }, this.#connectionTimeout);
+
+        timeout.unref?.();
+        handleSocketClose = () => {
+            settle();
+        };
+        socket.once?.('close', handleSocketClose);
         const request: SocketRequest = {
             id: clientId,
             headers: req.headers,
@@ -229,18 +376,26 @@ export class PondSocket {
             socket,
             request: req,
             requestId: uuid(),
+            settle,
         };
 
         this.#middleware.run(request, params, (error) => {
+            if (!settle()) {
+                return;
+            }
+
             if (error) {
                 const code = error?.statusCode || 400;
-                const message = error?.message || 'Unauthorized connection';
+                const isInternal = code >= 500;
+                const message = isInternal ? 'Internal server error' : error?.message || 'Unauthorized connection';
 
-                socket.write(`HTTP/1.1 ${code} ${message}\r\n\r\n`);
-                socket.destroy();
+                if (isInternal) {
+                    this.#reportError(error, 'Internal connection handler error');
+                }
+
+                rejectUpgrade(socket, code, message);
             } else if (this.#exclusiveServer) {
-                socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-                socket.destroy();
+                rejectUpgrade(socket, 404, 'Not Found');
             }
         });
     }
@@ -280,21 +435,8 @@ export class PondSocket {
             this.#backendError = error instanceof Error ? error : new Error(String(error));
         }) ?? null;
 
-        this.#server.on('error', (error) => {
-            this.#serverError = error;
-
-            if (this.#heartbeatTimer) {
-                clearInterval(this.#heartbeatTimer);
-                this.#heartbeatTimer = null;
-            }
-        });
-
-        this.#server.on('close', () => {
-            if (this.#heartbeatTimer) {
-                clearInterval(this.#heartbeatTimer);
-                this.#heartbeatTimer = null;
-            }
-        });
+        this.#server.on('error', this.#serverErrorHandler);
+        this.#server.on('close', this.#serverCloseHandler);
 
         this.#server.on('upgrade', this.#upgradeHandler);
     }
@@ -309,8 +451,8 @@ export class PondSocket {
             return {};
         }
 
-        return cookieHeader.split(';')
-            .reduce((cookies, cookie) => {
+        const entries = cookieHeader.split(';')
+            .reduce<Array<[string, string]>>((cookies, cookie) => {
                 const trimmed = cookie.trim();
                 const eqIndex = trimmed.indexOf('=');
 
@@ -322,12 +464,28 @@ export class PondSocket {
                 const value = trimmed.slice(eqIndex + 1);
 
                 try {
-                    cookies[name] = decodeURIComponent(value);
+                    cookies.push([name, decodeURIComponent(value)]);
                 } catch {
-                    cookies[name] = value;
+                    cookies.push([name, value]);
                 }
 
                 return cookies;
-            }, {} as Record<string, string>);
+            }, []);
+
+        return Object.fromEntries(entries);
+    }
+
+    #reportError (error: unknown, context: string): void {
+        if (!this.#onError) {
+            return;
+        }
+
+        const cause = error instanceof Error ? error.message : String(error);
+
+        try {
+            this.#onError(new Error(`${context}: ${cause}`));
+        } catch (_) {
+            void 0;
+        }
     }
 }

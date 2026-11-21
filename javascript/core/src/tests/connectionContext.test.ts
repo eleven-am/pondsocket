@@ -133,6 +133,19 @@ describe('ConnectionContext', () => {
             connectionContext.accept();
             expect(() => connectionContext.accept()).toThrow(HttpError);
         });
+
+        it('does not upgrade after authorization ownership has expired', () => {
+            mockParams.settle = jest.fn(() => false);
+            connectionContext = new ConnectionContext(mockConnectionData, {
+                engine: mockEngine,
+                params: mockParams,
+                webSocketServer: mockWebSocketServer,
+            });
+
+            expect(() => connectionContext.accept()).toThrow(/expired/);
+            expect(mockWebSocketServer.handleUpgrade).not.toHaveBeenCalled();
+            expect(mockEngine.manageSocket).not.toHaveBeenCalled();
+        });
     });
 
     describe('decline', () => {
@@ -141,7 +154,9 @@ describe('ConnectionContext', () => {
             const destroySpy = jest.spyOn(mockParams.socket, 'destroy');
 
             connectionContext.decline('Unauthorized', 401);
-            expect(writeSpy).toHaveBeenCalledWith('HTTP/1.1 401 Unauthorized\r\n\r\n');
+            expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('HTTP/1.1 401 Unauthorized\r\n'));
+            expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('Content-Length: 12\r\n'));
+            expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('\r\n\r\nUnauthorized'));
             expect(destroySpy).toHaveBeenCalled();
         });
 

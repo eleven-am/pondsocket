@@ -1,4 +1,4 @@
-import { Subject, Unsubscribe } from '@eleven-am/pondsocket-common';
+import { ServerActions, Subject, Unsubscribe, uuid } from '@eleven-am/pondsocket-common';
 import { createClient, RedisClientType } from 'redis';
 
 import {
@@ -12,8 +12,13 @@ const DISTRIBUTED_PROTOCOL = 'pondsocket.distributed';
 const DISTRIBUTED_VERSION = 1;
 
 function distributedId (): string {
-    return `${Date.now().toString(36)}-${Math.random().toString(36)
-        .slice(2)}`;
+    return uuid();
+}
+
+type ChannelHandler = (message: DistributedChannelMessage) => void;
+
+function isRecord (value: unknown): value is Record<string, any> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export class RedisDistributedBackend implements IDistributedBackend {
@@ -35,7 +40,33 @@ export class RedisDistributedBackend implements IDistributedBackend {
 
     readonly #onError: ((error: Error) => void) | null;
 
+    readonly #maxMessageSize: number;
+
+    readonly #maxMessageAgeMs: number;
+
+    readonly #maxFutureSkewMs: number;
+
+    readonly #dedupeWindowSize: number;
+
+    readonly #initializationTimeoutMs: number;
+
+    readonly #cleanupTimeoutMs: number;
+
+    readonly #channelHandlers: Map<string, Set<ChannelHandler>> = new Map();
+
+    readonly #subscribedKeys: Set<string> = new Set();
+
+    readonly #keyOperations: Map<string, Promise<void>> = new Map();
+
+    readonly #seenMessageIds: Map<string, true> = new Map();
+
     #isConnected: boolean = false;
+
+    #closed: boolean = false;
+
+    #initializePromise: Promise<void> | null = null;
+
+    #cleanupPromise: Promise<void> | null = null;
 
     #heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -45,6 +76,10 @@ export class RedisDistributedBackend implements IDistributedBackend {
 
     get heartbeatTimeoutMs (): number {
         return this.#heartbeatTimeoutMs;
+    }
+
+    isHealthy (): boolean {
+        return !this.#closed && this.#isConnected && this.#publishClient.isReady && this.#subscribeClient.isReady;
     }
 
     constructor (options: RedisDistributedBackendOptions = {}) {
@@ -58,16 +93,45 @@ export class RedisDistributedBackend implements IDistributedBackend {
             namespace = 'default',
             heartbeatIntervalMs = 30_000,
             heartbeatTimeoutMs = 90_000,
+            maxMessageSize = 1024 * 1024,
+            maxMessageAgeMs = 5 * 60_000,
+            maxFutureSkewMs = 30_000,
+            dedupeWindowSize = 4096,
+            initializationTimeoutMs = 10_000,
+            cleanupTimeoutMs = 5_000,
             onError = null,
         } = options;
+
+        for (const [name, value] of Object.entries({
+            heartbeatIntervalMs,
+            heartbeatTimeoutMs,
+            maxMessageSize,
+            maxMessageAgeMs,
+            maxFutureSkewMs,
+            dedupeWindowSize,
+            initializationTimeoutMs,
+            cleanupTimeoutMs,
+        })) {
+            if (!Number.isSafeInteger(value) || value <= 0) {
+                throw new TypeError(`${name} must be a positive safe integer`);
+            }
+        }
+        if (heartbeatTimeoutMs < heartbeatIntervalMs) {
+            throw new TypeError('heartbeatTimeoutMs must be greater than or equal to heartbeatIntervalMs');
+        }
 
         this.#keyPrefix = keyPrefix;
         this.#namespace = namespace;
         this.#heartbeatIntervalMs = heartbeatIntervalMs;
         this.#heartbeatTimeoutMs = heartbeatTimeoutMs;
+        this.#maxMessageSize = maxMessageSize;
+        this.#maxMessageAgeMs = maxMessageAgeMs;
+        this.#maxFutureSkewMs = maxFutureSkewMs;
+        this.#dedupeWindowSize = dedupeWindowSize;
+        this.#initializationTimeoutMs = initializationTimeoutMs;
+        this.#cleanupTimeoutMs = cleanupTimeoutMs;
         this.#onError = onError;
-        this.#nodeId = Math.random().toString(36)
-            .substring(2, 15);
+        this.#nodeId = uuid();
         this.#heartbeatSubject = new Subject<string>();
 
         const reconnectStrategy = (retries: number) => {
@@ -95,28 +159,59 @@ export class RedisDistributedBackend implements IDistributedBackend {
     }
 
     async subscribeToChannel (endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Promise<Unsubscribe> {
+        await this.initialize();
+        this.#ensureOpen();
         const key = this.#buildKey(endpointName, channelName);
+        const normalizedEndpointName = this.#normalizeTopicPart(endpointName);
+        let handlers = this.#channelHandlers.get(key);
 
-        const listener = (message: string) => {
-            try {
-                const parsedMessage: DistributedChannelMessage & { nodeId?: string } = JSON.parse(message);
+        if (!handlers) {
+            handlers = new Set();
+            this.#channelHandlers.set(key, handlers);
+        }
+        handlers.add(handler);
 
-                if (!this.#isValidMessage(parsedMessage)) {
+        try {
+            await this.#enqueueKeyOperation(key, async () => {
+                if (this.#subscribedKeys.has(key)) {
                     return;
                 }
 
-                if (parsedMessage.sourceNodeId !== this.#nodeId) {
-                    handler(parsedMessage);
-                }
-            } catch (_) {
-                void 0;
+                await this.#subscribeClient.subscribe(key, (message) => {
+                    this.#dispatchChannelMessage(key, normalizedEndpointName, channelName, message);
+                });
+                this.#subscribedKeys.add(key);
+            });
+        } catch (error) {
+            handlers.delete(handler);
+            if (handlers.size === 0) {
+                this.#channelHandlers.delete(key);
             }
-        };
+            throw error;
+        }
 
-        await this.#subscribeClient.subscribe(key, listener);
+        let active = true;
 
         return () => {
-            this.#subscribeClient.unsubscribe(key).catch(() => {});
+            if (!active) {
+                return;
+            }
+            active = false;
+
+            const current = this.#channelHandlers.get(key);
+
+            current?.delete(handler);
+            if (current?.size === 0) {
+                this.#channelHandlers.delete(key);
+            }
+
+            void this.#enqueueKeyOperation(key, async () => {
+                if (this.#channelHandlers.has(key) || !this.#subscribedKeys.has(key)) {
+                    return;
+                }
+                await this.#subscribeClient.unsubscribe(key);
+                this.#subscribedKeys.delete(key);
+            }).catch((error) => this.#reportError(error, `Failed to unsubscribe ${key}`));
         };
     }
 
@@ -125,6 +220,8 @@ export class RedisDistributedBackend implements IDistributedBackend {
     }
 
     async broadcast (endpointName: string, channelName: string, message: DistributedChannelMessage): Promise<void> {
+        await this.initialize();
+        this.#ensureOpen();
         if (!this.#isConnected) {
             throw new Error('Redis backend is not connected');
         }
@@ -143,50 +240,135 @@ export class RedisDistributedBackend implements IDistributedBackend {
 
         const serializedMessage = JSON.stringify(distributedMessage);
 
-        await this.#publishClient.publish(key, serializedMessage);
+        if (Buffer.byteLength(serializedMessage) > this.#maxMessageSize) {
+            throw new RangeError(`Distributed message exceeds the ${this.#maxMessageSize} byte limit`);
+        }
+
+        try {
+            await this.#publishClient.publish(key, serializedMessage);
+        } catch (error) {
+            this.#reportError(error, `Failed to publish ${key}`);
+            throw error;
+        }
     }
 
-    async cleanup (): Promise<void> {
+    cleanup (): Promise<void> {
+        if (this.#cleanupPromise) {
+            return this.#cleanupPromise;
+        }
+
+        this.#closed = true;
+        this.#cleanupPromise = this.#performCleanup();
+
+        return this.#cleanupPromise;
+    }
+
+    async #performCleanup (): Promise<void> {
         if (this.#heartbeatTimer) {
             clearInterval(this.#heartbeatTimer);
             this.#heartbeatTimer = null;
         }
 
         this.#heartbeatSubject.close();
+        this.#channelHandlers.clear();
+        const pending = [
+            ...this.#keyOperations.values(),
+            ...(this.#initializePromise ? [this.#initializePromise] : []),
+        ];
 
-        if (this.#subscribeClient.isOpen) {
-            await this.#subscribeClient.quit();
-        }
+        // Terminal cleanup does not need Redis' QUIT handshake. Destroying the
+        // sockets first rejects real node-redis commands immediately and also
+        // interrupts an infinite reconnect loop.
+        this.#destroyClients();
 
-        if (this.#publishClient.isOpen) {
-            await this.#publishClient.quit();
+        if (pending.length > 0) {
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            const deadline = new Promise<void>((resolve) => {
+                timeout = setTimeout(resolve, this.#cleanupTimeoutMs);
+            });
+
+            await Promise.race([Promise.allSettled(pending), deadline]);
+            if (timeout) {
+                clearTimeout(timeout);
+            }
         }
+        this.#keyOperations.clear();
+        this.#subscribedKeys.clear();
+        this.#seenMessageIds.clear();
 
         this.#isConnected = false;
     }
 
-    async initialize (): Promise<void> {
-        await Promise.all([
-            this.#publishClient.connect(),
-            this.#subscribeClient.connect(),
-        ]);
+    initialize (): Promise<void> {
+        this.#ensureOpen();
+        if (this.#initializePromise) {
+            return this.#initializePromise;
+        }
 
-        const heartbeatKey = this.#buildKey('__heartbeat__', '__heartbeat__');
+        this.#initializePromise = this.#performInitialize();
 
-        await this.#subscribeClient.subscribe(heartbeatKey, (message) => {
-            this.#handleHeartbeatMessage(message);
-        });
+        return this.#initializePromise;
+    }
 
-        this.#isConnected = true;
-        this.#startHeartbeat();
+    async #performInitialize (): Promise<void> {
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+
+        try {
+            const initialize = (async () => {
+                await Promise.all([
+                    this.#publishClient.isOpen ? Promise.resolve() : this.#publishClient.connect(),
+                    this.#subscribeClient.isOpen ? Promise.resolve() : this.#subscribeClient.connect(),
+                ]);
+
+                const heartbeatKey = this.#buildKey('__heartbeat__', '__heartbeat__');
+
+                await this.#subscribeClient.subscribe(heartbeatKey, (message) => {
+                    this.#handleHeartbeatMessage(message);
+                });
+            })();
+            const timedOut = new Promise<never>((_resolve, reject) => {
+                timeout = setTimeout(() => {
+                    const error = new Error(
+                        `Redis backend initialization timed out after ${this.#initializationTimeoutMs}ms`,
+                    );
+
+                    reject(error);
+                    this.#destroyClients();
+                }, this.#initializationTimeoutMs);
+            });
+
+            await Promise.race([initialize, timedOut]);
+
+            if (this.#closed) {
+                return;
+            }
+            this.#isConnected = true;
+            this.#startHeartbeat();
+        } catch (error) {
+            this.#isConnected = false;
+            this.#initializePromise = null;
+            throw error;
+        } finally {
+            if (timeout) {
+                clearTimeout(timeout);
+            }
+        }
+    }
+
+    #destroyClients (): void {
+        for (const client of [this.#subscribeClient, this.#publishClient]) {
+            try {
+                client.destroy();
+            } catch (_) {
+                void 0;
+            }
+        }
     }
 
     #attachEventHandlers (client: RedisClientType, label: string): void {
         client.on('error', (err: Error) => {
             this.#isConnected = false;
-            if (this.#onError) {
-                this.#onError(new Error(`Redis ${label} client error: ${err.message}`));
-            }
+            this.#reportError(err, `Redis ${label} client error`);
         });
 
         client.on('ready', () => {
@@ -206,6 +388,7 @@ export class RedisDistributedBackend implements IDistributedBackend {
         this.#heartbeatTimer = setInterval(() => {
             this.#publishHeartbeat();
         }, this.#heartbeatIntervalMs);
+        this.#heartbeatTimer.unref?.();
     }
 
     #publishHeartbeat (): void {
@@ -228,48 +411,182 @@ export class RedisDistributedBackend implements IDistributedBackend {
         const key = this.#buildKey('__heartbeat__', '__heartbeat__');
 
         this.#publishClient.publish(key, JSON.stringify(heartbeatMessage)).catch((err: Error) => {
-            if (this.#onError) {
-                this.#onError(new Error(`Failed to publish heartbeat: ${err.message}`));
-            }
+            this.#reportError(err, 'Failed to publish heartbeat');
         });
     }
 
     #handleHeartbeatMessage (message: string): void {
         try {
+            if (Buffer.byteLength(message) > this.#maxMessageSize) {
+                return;
+            }
             const parsedMessage = JSON.parse(message);
 
-            if (this.#isValidMessage(parsedMessage) && parsedMessage.type === DistributedMessageType.NODE_HEARTBEAT && parsedMessage.sourceNodeId && parsedMessage.sourceNodeId !== this.#nodeId) {
-                this.#heartbeatSubject.publish(parsedMessage.sourceNodeId);
+            if (this.#isValidMessage(parsedMessage, '__heartbeat__', '__heartbeat__') && parsedMessage.type === DistributedMessageType.NODE_HEARTBEAT && parsedMessage.sourceNodeId !== this.#nodeId && this.#markUnseen(parsedMessage)) {
+                this.#heartbeatSubject.publish(parsedMessage.nodeId);
             }
         } catch (_) {
             void 0;
         }
     }
 
-    #isValidMessage (message: any): message is DistributedChannelMessage {
-        return (
-            typeof message === 'object' &&
+    #isValidMessage (message: any, endpointName?: string, channelName?: string): message is DistributedChannelMessage {
+        if (!(
+            isRecord(message) &&
             message.protocol === DISTRIBUTED_PROTOCOL &&
             message.version === DISTRIBUTED_VERSION &&
             typeof message.type === 'string' &&
-            Object.values(DistributedMessageType).includes(message.type) &&
+            Object.values(DistributedMessageType).includes(message.type as DistributedMessageType) &&
             typeof message.messageId === 'string' &&
             typeof message.endpointName === 'string' &&
             typeof message.channelName === 'string' &&
             typeof message.sourceNodeId === 'string' &&
-            typeof message.timestamp === 'number'
-        );
+            Number.isFinite(message.timestamp)
+        )) {
+            return false;
+        }
+
+        if (endpointName !== undefined && message.endpointName !== endpointName) {
+            return false;
+        }
+        if (channelName !== undefined && message.channelName !== channelName) {
+            return false;
+        }
+
+        const now = Date.now();
+
+        if (message.timestamp < now - this.#maxMessageAgeMs || message.timestamp > now + this.#maxFutureSkewMs) {
+            return false;
+        }
+
+        const string = (value: unknown) => typeof value === 'string';
+        const record = (value: unknown) => isRecord(value);
+        const user = (value: unknown) => isRecord(value) && string(value.id) && record(value.assigns) && record(value.presence);
+
+        switch (message.type) {
+            case DistributedMessageType.STATE_REQUEST:
+                return string(message.fromNode);
+            case DistributedMessageType.STATE_RESPONSE:
+                return Array.isArray(message.users) && message.users.every(user);
+            case DistributedMessageType.USER_JOINED:
+                return string(message.userId) && record(message.assigns) && record(message.presence);
+            case DistributedMessageType.USER_LEFT:
+            case DistributedMessageType.PRESENCE_REMOVED:
+            case DistributedMessageType.USER_REMOVE:
+                return string(message.userId);
+            case DistributedMessageType.USER_MESSAGE:
+                return string(message.fromUserId) && string(message.event) && string(message.requestId) && record(message.payload) &&
+                    (message.action === undefined || (
+                        Object.values(ServerActions).includes(message.action as ServerActions) &&
+                        message.action !== ServerActions.PRESENCE
+                    )) && (
+                    string(message.recipientDescriptor) ||
+                    (Array.isArray(message.recipientDescriptor) && message.recipientDescriptor.every(string))
+                );
+            case DistributedMessageType.PRESENCE_UPDATE:
+                return string(message.userId) && record(message.presence);
+            case DistributedMessageType.ASSIGNS_UPDATE:
+                return string(message.userId) && (message.assigns === undefined || record(message.assigns));
+            case DistributedMessageType.EVICT_USER:
+                return string(message.userId) && string(message.reason);
+            case DistributedMessageType.USER_GET_REQUEST:
+                return string(message.userId) && string(message.requestId) && string(message.fromNode);
+            case DistributedMessageType.USER_GET_RESPONSE:
+                return string(message.userId) && string(message.requestId) && record(message.assigns) && record(message.presence);
+            case DistributedMessageType.NODE_HEARTBEAT:
+                return string(message.nodeId) && message.nodeId === message.sourceNodeId;
+            default:
+                return false;
+        }
     }
 
     #buildKey (endpointName: string, channelName: string): string {
+        const encode = (value: string) => encodeURIComponent(value);
+        const prefix = `${encode(this.#keyPrefix)}:v1:${encode(this.#namespace)}`;
+
         if (endpointName === '__heartbeat__' && channelName === '__heartbeat__') {
-            return `${this.#keyPrefix}:v1:${this.#namespace}:__heartbeat__`;
+            return `${prefix}:__heartbeat__`;
         }
 
-        return `${this.#keyPrefix}:v1:${this.#namespace}:${this.#normalizeTopicPart(endpointName)}:${channelName}`;
+        return `${prefix}:${encode(this.#normalizeTopicPart(endpointName))}:${encode(channelName)}`;
     }
 
     #normalizeTopicPart (value: string): string {
         return value.replace(/^\/+/, '');
+    }
+
+    #dispatchChannelMessage (key: string, endpointName: string, channelName: string, message: string): void {
+        try {
+            if (Buffer.byteLength(message) > this.#maxMessageSize) {
+                return;
+            }
+            const parsedMessage = JSON.parse(message);
+
+            if (!this.#isValidMessage(parsedMessage, endpointName, channelName) || parsedMessage.sourceNodeId === this.#nodeId || !this.#markUnseen(parsedMessage)) {
+                return;
+            }
+
+            for (const handler of [...(this.#channelHandlers.get(key) ?? [])]) {
+                try {
+                    handler(parsedMessage);
+                } catch (error) {
+                    this.#reportError(error, `Distributed handler failed for ${key}`);
+                }
+            }
+        } catch (_) {
+            void 0;
+        }
+    }
+
+    #markUnseen (message: DistributedChannelMessage): boolean {
+        const id = message.messageId!;
+
+        if (this.#seenMessageIds.has(id)) {
+            return false;
+        }
+        this.#seenMessageIds.set(id, true);
+        if (this.#seenMessageIds.size > this.#dedupeWindowSize) {
+            const oldest = this.#seenMessageIds.keys().next().value as string | undefined;
+
+            if (oldest !== undefined) {
+                this.#seenMessageIds.delete(oldest);
+            }
+        }
+
+        return true;
+    }
+
+    #enqueueKeyOperation (key: string, operation: () => Promise<void>): Promise<void> {
+        const previous = this.#keyOperations.get(key) ?? Promise.resolve();
+        const next = previous.catch(() => {}).then(operation);
+
+        this.#keyOperations.set(key, next);
+        void next.finally(() => {
+            if (this.#keyOperations.get(key) === next) {
+                this.#keyOperations.delete(key);
+            }
+        }).catch(() => {});
+
+        return next;
+    }
+
+    #ensureOpen (): void {
+        if (this.#closed) {
+            throw new Error('Redis backend is closed');
+        }
+    }
+
+    #reportError (error: unknown, context: string): void {
+        if (!this.#onError) {
+            return;
+        }
+
+        const cause = error instanceof Error ? error.message : String(error);
+
+        try {
+            this.#onError(new Error(`${context}: ${cause}`));
+        } catch (_) {
+            void 0;
+        }
     }
 }

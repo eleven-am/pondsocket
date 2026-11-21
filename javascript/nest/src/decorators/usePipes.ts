@@ -1,4 +1,4 @@
-import type { PipeTransform } from '@nestjs/common';
+import type { PipeTransform } from '@nestjs/common' with { 'resolution-mode': 'import' };
 
 import { managePipes } from '../managers/pipes';
 import { Constructor } from '../types';

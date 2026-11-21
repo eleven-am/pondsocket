@@ -1,6 +1,6 @@
 {
   "name": "@eleven-am/pondsocket-nest",
-  "version": "0.0.138",
+  "version": "0.0.139",
   "description": "NestJS decorators and dependency-injection integration for PondSocket.",
   "keywords": [
     "pondsocket",
@@ -44,19 +44,25 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "npm run clean && tsc --project tsconfig.json",
-    "test": "jest --runInBand",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest --runInBand",
     "lint": "eslint src --max-warnings=0",
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@eleven-am/pondsocket": "^0.1.219",
-    "@eleven-am/pondsocket-common": "^0.0.41",
+    "@eleven-am/pondsocket": "^0.1.220",
+    "@eleven-am/pondsocket-common": "^0.0.42",
     "reflect-metadata": "^0.2.2"
   },
   "peerDependencies": {
-    "@nestjs/common": "^10.0.0 || ^11.0.0",
-    "@nestjs/core": "^10.0.0 || ^11.0.0",
-    "rxjs": "^7.1.0"
+    "@nestjs/common": "^10.0.0 || ^11.0.0 || ^12.0.0",
+    "@nestjs/core": "^10.0.0 || ^11.0.0 || ^12.0.0",
+    "rxjs": "^7.1.0",
+    "typescript": ">=5.3 <6"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
   },
   "jest": {
     "moduleFileExtensions": [

@@ -27,6 +27,8 @@ class MockWebSocket {
 
     readyState = MockWebSocket.CONNECTING;
 
+    bufferedAmount = 0;
+
     constructor (readonly url: string) {}
 }
 
@@ -216,6 +218,57 @@ describe('PondClient', () => {
         expect(mockExistingChannel).toBe(mockChannel);
     });
 
+    test('removes a closed channel from the client registry', () => {
+        const first = pondClient.createChannel('exampleChannel');
+
+        first.leave();
+        const replacement = pondClient.createChannel('exampleChannel');
+
+        expect(replacement).not.toBe(first);
+        expect(replacement.channelState).toBe(ChannelState.IDLE);
+    });
+
+    test.each([
+        ['connectionTimeout', 0],
+        ['joinTimeout', Number.NaN],
+        ['maxReconnectDelay', -1],
+        ['pingInterval', 0],
+        ['maxQueueSize', 1.5],
+        ['maxQueueBytes', 0],
+        ['maxChannels', 0],
+        ['maxMessageSize', Number.POSITIVE_INFINITY],
+        ['maxBufferedAmount', 0],
+        ['maxPendingRequests', 0],
+        ['requestTimeout', -1],
+    ] as const)('rejects an invalid %s option', (option, value) => {
+        expect(() => new PondClient('ws://example.com', {}, {
+            [option]: value,
+        })).toThrow(RangeError);
+    });
+
+    test('enforces one queued-byte budget across disconnected channels', () => {
+        const boundedClient = new PondClient('ws://example.com', {}, {
+            maxQueueBytes: 250,
+            maxMessageSize: 1024,
+        });
+        const first = boundedClient.createChannel('first');
+        const second = boundedClient.createChannel('second');
+
+        expect(() => first.sendMessage('event', { value: 'x'.repeat(50) })).not.toThrow();
+        expect(() => second.sendMessage('event', { value: 'x'.repeat(50) })).toThrow(/byte capacity/);
+        first.leave();
+        expect(() => second.sendMessage('event', { value: 'x'.repeat(50) })).not.toThrow();
+    });
+
+    test('bounds the number of live channel registries and reclaims closed slots', () => {
+        const boundedClient = new PondClient('ws://example.com', {}, { maxChannels: 1 });
+        const first = boundedClient.createChannel('first');
+
+        expect(() => boundedClient.createChannel('second')).toThrow(/channel capacity/);
+        first.leave();
+        expect(() => boundedClient.createChannel('second')).not.toThrow();
+    });
+
     test('createChannel builds a channel name from a shared definition', () => {
         interface Schema extends PondSchema<{ message: { text: string } }, {}, {}, { token: string }> {}
 
@@ -267,6 +320,137 @@ describe('PondClient', () => {
 
         expect(channel.channelState).toBe(ChannelState.DECLINED);
         expect(channel.joinError?.message).toBe('Missing channel');
+    });
+
+    test('channel-unavailable server errors invalidate an already joined channel', () => {
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket']! as any;
+        const channel = pondClient.createChannel('distributed');
+
+        mockWebSocket.readyState = MockWebSocket.OPEN;
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: Events.CONNECTION,
+                action: ServerActions.CONNECT,
+                channelName: 'ENDPOINT',
+                requestId: 'connection',
+                payload: {},
+            }),
+        });
+        channel.join();
+        const joinRequest = JSON.parse(mockWebSocket.send.mock.calls[0][0]);
+
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: Events.ACKNOWLEDGE,
+                action: ServerActions.SYSTEM,
+                channelName: 'distributed',
+                requestId: joinRequest.requestId,
+                payload: {},
+            }),
+        });
+        expect(channel.channelState).toBe(ChannelState.JOINED);
+
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: ErrorTypes.CHANNEL_ERROR,
+                action: ServerActions.ERROR,
+                channelName: 'distributed',
+                requestId: joinRequest.requestId,
+                payload: {
+                    code: ErrorTypes.CHANNEL_ERROR,
+                    message: 'Distributed channel unavailable',
+                    status: 503,
+                    statusCode: 503,
+                },
+            }),
+        });
+
+        expect(channel.channelState).toBe(ChannelState.STALLED);
+        expect(channel.joinError).toEqual(expect.objectContaining({ status: 503 }));
+    });
+
+    test('preserves a destroyed notification while terminating channel membership', () => {
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket']! as any;
+        const channel = pondClient.createChannel('ephemeral');
+        const messageListener = jest.fn();
+        const errorListener = jest.fn();
+
+        channel.onMessage(messageListener);
+        channel.onError(errorListener);
+        mockWebSocket.readyState = MockWebSocket.OPEN;
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: Events.CONNECTION,
+                action: ServerActions.CONNECT,
+                channelName: 'ENDPOINT',
+                requestId: 'connection',
+                payload: {},
+            }),
+        });
+        channel.join();
+        const joinRequest = JSON.parse(mockWebSocket.send.mock.calls[0][0]);
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: Events.ACKNOWLEDGE,
+                action: ServerActions.SYSTEM,
+                channelName: 'ephemeral',
+                requestId: joinRequest.requestId,
+                payload: {},
+            }),
+        });
+
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: 'destroyed',
+                action: ServerActions.ERROR,
+                channelName: 'ephemeral',
+                requestId: 'destroyed',
+                payload: { message: 'No longer available' },
+            }),
+        });
+
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+        expect(messageListener).toHaveBeenCalledWith('destroyed', { message: 'No longer available' });
+        expect(errorListener).toHaveBeenCalledWith(expect.objectContaining({
+            code: 'destroyed',
+            status: 410,
+        }));
+    });
+
+    test('treats destroyed as a terminal decline when it races a pending join', () => {
+        pondClient.connect();
+        const mockWebSocket = pondClient['_socket']! as any;
+        const channel = pondClient.createChannel('joining-when-destroyed');
+
+        mockWebSocket.readyState = MockWebSocket.OPEN;
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: Events.CONNECTION,
+                action: ServerActions.CONNECT,
+                channelName: 'ENDPOINT',
+                requestId: 'connection',
+                payload: {},
+            }),
+        });
+        channel.join();
+        const joinRequest = JSON.parse(mockWebSocket.send.mock.calls[0][0]);
+        mockWebSocket.onmessage({
+            data: JSON.stringify({
+                event: 'destroyed',
+                action: ServerActions.ERROR,
+                channelName: 'joining-when-destroyed',
+                requestId: joinRequest.requestId,
+                payload: { message: 'Gone during join' },
+            }),
+        });
+
+        expect(channel.channelState).toBe(ChannelState.DECLINED);
+        expect(channel.joinError).toEqual(expect.objectContaining({
+            code: 'destroyed',
+            message: 'Gone during join',
+        }));
     });
 
     test('onConnectionChange method should subscribe to connection state changes', () => {
@@ -399,7 +583,79 @@ describe('PondClient', () => {
         jest.useRealTimers();
     });
 
-    test('ping interval should close when no server messages arrive', async () => {
+    test('connection timeout remains armed until the protocol acknowledgement', () => {
+        jest.useFakeTimers();
+        const clientWithTimeout = new PondClient('ws://example.com', {}, { connectionTimeout: 5000 });
+        const errorCallback = jest.fn();
+
+        clientWithTimeout.onError(errorCallback);
+        clientWithTimeout.connect();
+        const mockWebSocket = clientWithTimeout['_socket']! as unknown as MockWebSocket;
+
+        mockWebSocket.readyState = MockWebSocket.OPEN;
+        mockWebSocket.onopen?.(new Event('open'));
+        jest.advanceTimersByTime(5000);
+
+        expect(errorCallback).toHaveBeenCalledWith(expect.objectContaining({ message: 'Connection timeout' }));
+        expect(mockWebSocket.close).toHaveBeenCalled();
+        clientWithTimeout.disconnect();
+        jest.useRealTimers();
+    });
+
+    test('rejects binary and oversized inbound frames', () => {
+        const clientWithLimit = new PondClient('ws://example.com', {}, { maxMessageSize: 32 });
+        const errorCallback = jest.fn();
+
+        clientWithLimit.onError(errorCallback);
+        clientWithLimit.connect();
+        const binarySocket = clientWithLimit['_socket']! as any;
+
+        binarySocket.onmessage({ data: new ArrayBuffer(1) });
+        expect(binarySocket.close).toHaveBeenCalledWith(1003, 'Text messages required');
+
+        binarySocket.readyState = MockWebSocket.CLOSED;
+        clientWithLimit.connect();
+        const oversizedSocket = clientWithLimit['_socket']! as any;
+
+        oversizedSocket.onmessage({ data: 'x'.repeat(33) });
+        expect(oversizedSocket.close).toHaveBeenCalledWith(1009, 'Message too large');
+        expect(errorCallback).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Inbound message exceeds maximum size'),
+        }));
+        clientWithLimit.disconnect();
+    });
+
+    test('bounds WebSocket buffered data and outbound message size', () => {
+        const clientWithLimits = new PondClient('ws://example.com', {}, {
+            maxBufferedAmount: 256,
+            maxMessageSize: 128,
+        });
+
+        clientWithLimits.connect();
+        const socket = clientWithLimits['_socket']! as unknown as MockWebSocket;
+        const publisher = clientWithLimits['_createPublisher']();
+        const message = {
+            action: ClientActions.BROADCAST,
+            channelName: 'test',
+            requestId: 'request',
+            event: 'event',
+            payload: {},
+        };
+
+        socket.readyState = MockWebSocket.OPEN;
+        clientWithLimits['_connectionState'].publish(ConnectionState.CONNECTED);
+        socket.bufferedAmount = 200;
+        expect(() => publisher(message)).toThrow(/buffered data would exceed/);
+
+        socket.bufferedAmount = 0;
+        expect(() => publisher({
+            ...message,
+            payload: { value: 'x'.repeat(200) },
+        })).toThrow(/Outbound message exceeds/);
+        clientWithLimits.disconnect();
+    });
+
+    test('does not treat a quiet connection as dead when pingInterval is configured', async () => {
         jest.useFakeTimers();
         const clientWithPing = new PondClient('ws://example.com', {}, { pingInterval: 1000 });
         const errorCallback = jest.fn();
@@ -416,10 +672,8 @@ describe('PondClient', () => {
         jest.advanceTimersByTime(2000);
 
         expect(mockWebSocket.send).not.toHaveBeenCalledWith(JSON.stringify({ action: 'ping' }));
-        expect(errorCallback).toHaveBeenCalledWith(expect.objectContaining({
-            message: 'Connection lost: no response from server',
-        }));
-        expect(mockWebSocket.close).toHaveBeenCalled();
+        expect(errorCallback).not.toHaveBeenCalled();
+        expect(mockWebSocket.close).not.toHaveBeenCalled();
         jest.useRealTimers();
     });
 

@@ -41,13 +41,19 @@ import {
 } from '../types';
 
 function mapToObject<T> (map: Map<string, T>): Record<string, T> {
-    const result: Record<string, T> = {};
+    return Object.fromEntries(map);
+}
 
-    for (const [key, value] of map) {
-        result[key] = value;
-    }
+interface QueuedDelivery {
+    event: ChannelEvent;
+    membershipToken: symbol;
+    bytes: number;
+}
 
-    return result;
+interface DeliveryQueue {
+    items: QueuedDelivery[];
+    bytes: number;
+    running: boolean;
 }
 
 export class ChannelEngine {
@@ -63,19 +69,31 @@ export class ChannelEngine {
 
     #userSubscriptions: Map<string, Unsubscribe> = new Map();
 
+    #membershipTokens: Map<string, symbol> = new Map();
+
+    #deliveryQueues: Map<string, DeliveryQueue> = new Map();
+
+    #messageHandlers: Map<string, (event: ChannelEvent) => void> = new Map();
+
+    #overflowHandlers: Map<string, () => void> = new Map();
+
+    #removedHandlers: Map<string, () => void> = new Map();
+
+    readonly #maxPendingMessagesPerUser: number;
+
+    readonly #maxPendingBytesPerUser: number;
+
+    readonly #deliveryTimeout: number;
+
     #publisher: Subject<InternalChannelEvent> = new Subject();
 
     #distributedSubscription: Unsubscribe | null = null;
 
-    #heartbeatSubscription: Unsubscribe | null = null;
-
-    #nodeLastSeen: Map<string, number> = new Map();
+    #livenessSubscription: Unsubscribe | null = null;
 
     #nodeUsers: Map<string, Set<string>> = new Map();
 
     #pendingUserGets: Map<string, { resolve: (data: UserData | null) => void, timer: ReturnType<typeof setTimeout> }> = new Map();
-
-    #staleNodeTimer: ReturnType<typeof setInterval> | null = null;
 
     readonly #name: string;
 
@@ -83,15 +101,27 @@ export class ChannelEngine {
 
     #distributedReady: Promise<void> | null = null;
 
-    constructor (public parent: LobbyEngine, name: string, backend: IDistributedBackend | null = null) {
+    #distributedFailure: Error | null = null;
+
+    #closeHandlers: Set<(error: Error | null) => void> = new Set();
+
+    constructor (public parent: LobbyEngine, name: string, backend: IDistributedBackend | null = null, maxPendingMessagesPerUser: number = 256, maxPendingBytesPerUser: number = 4 * 1024 * 1024, deliveryTimeout: number = 10_000) {
         this.#name = name;
         this.#backend = backend;
         this.#nodeId = uuid();
         this.#endpointId = parent.parent.path;
+        this.#maxPendingMessagesPerUser = maxPendingMessagesPerUser;
+        this.#maxPendingBytesPerUser = maxPendingBytesPerUser;
+        this.#deliveryTimeout = deliveryTimeout;
 
         if (this.#backend) {
-            this.#distributedReady = this.#setupDistributedSubscription().catch(() => {});
-            this.#setupHeartbeatTracking();
+            this.#livenessSubscription = this.parent.registerNodeLiveness(this.#backend, (nodeId) => {
+                this.#handleStaleNode(nodeId);
+            });
+            this.#distributedReady = this.#setupDistributedSubscription();
+            void this.#distributedReady.catch((error) => {
+                this.#failDistributed(error);
+            });
         }
     }
 
@@ -103,7 +133,30 @@ export class ChannelEngine {
         return new Set(this.#assignsCache.keys());
     }
 
-    addUser (userId: string, assigns: PondAssigns, onMessage: (event: ChannelEvent) => void, requestId = uuid()): Unsubscribe {
+    ready (): Promise<void> {
+        return this.#distributedReady ?? Promise.resolve();
+    }
+
+    closeIfUnused (): void {
+        if (this.#userSubscriptions.size === 0) {
+            this.close();
+        }
+    }
+
+    onClose (handler: (error: Error | null) => void): Unsubscribe {
+        if (this.#closed) {
+            handler(this.#distributedFailure);
+
+            return () => {};
+        }
+
+        this.#closeHandlers.add(handler);
+
+        return () => this.#closeHandlers.delete(handler);
+    }
+
+    addUser (userId: string, assigns: PondAssigns, onMessage: (event: ChannelEvent) => void, requestId = uuid(), onOverflow: () => void = () => {}, onRemoved: () => void = () => {}): Unsubscribe {
+        this.#ensureOpen();
         if (this.users.has(userId)) {
             const message = `ChannelEngine: User with id ${userId} already exists in channel ${this.name}`;
 
@@ -121,7 +174,21 @@ export class ChannelEngine {
         });
 
         this.#assignsCache.set(userId, assigns);
-        this.#buildSubscriber(userId, onMessage);
+        this.#membershipTokens.set(userId, Symbol(userId));
+        this.#messageHandlers.set(userId, onMessage);
+        this.#overflowHandlers.set(userId, onOverflow);
+        this.#removedHandlers.set(userId, onRemoved);
+        try {
+            this.#buildSubscriber(userId, onMessage);
+        } catch (error) {
+            this.#assignsCache.delete(userId);
+            this.#membershipTokens.delete(userId);
+            this.#messageHandlers.delete(userId);
+            this.#overflowHandlers.delete(userId);
+            this.#removedHandlers.delete(userId);
+            this.#discardDeliveryQueue(userId);
+            throw error;
+        }
         if (isFirstUser && this.#backend) {
             this.#afterDistributedReady(() => this.#requestChannelState());
         }
@@ -178,10 +245,11 @@ export class ChannelEngine {
             payload,
             requestId,
             recipientDescriptor: recipient,
+            action,
         });
     }
 
-    broadcastMessage (userId: string, message: ClientMessage): void {
+    broadcastMessage (userId: string, message: ClientMessage): Promise<void> {
         if (!this.users.has(userId)) {
             const messageText = `ChannelEngine: User with id ${userId} does not exist in channel ${this.name}`;
 
@@ -194,7 +262,7 @@ export class ChannelEngine {
             action: ServerActions.BROADCAST,
         };
 
-        this.parent.middleware.run(responseEvent, this, (error) => {
+        return this.parent.middleware.runAsync(responseEvent, this, (error) => {
             this.sendMessage(
                 SystemSender.CHANNEL,
                 [userId],
@@ -287,10 +355,27 @@ export class ChannelEngine {
     }
 
     kickUser (userId: string, reason: string): void {
-        this.sendMessage(SystemSender.CHANNEL, [userId], ServerActions.SYSTEM, 'kicked_out', {
-            message: reason,
-            code: 403,
-        });
+        const locallyOwned = this.#userSubscriptions.has(userId);
+        const onMessage = this.#messageHandlers.get(userId);
+
+        if (onMessage) {
+            const event: ChannelEvent = {
+                channelName: this.#name,
+                requestId: uuid(),
+                action: ServerActions.SYSTEM,
+                event: 'kicked_out',
+                payload: { message: reason,
+                    code: 403 },
+            };
+
+            try {
+                void Promise.resolve(onMessage(event)).catch((error) => {
+                    this.parent.parent.reportError(error, `Channel ${this.name} kick delivery failed`);
+                });
+            } catch (error) {
+                this.parent.parent.reportError(error, `Channel ${this.name} kick delivery failed`);
+            }
+        }
 
         this.sendMessage(SystemSender.CHANNEL, ChannelReceiver.ALL_USERS, ServerActions.SYSTEM, 'kicked', {
             userId,
@@ -305,7 +390,9 @@ export class ChannelEngine {
             reason,
         });
 
-        this.removeUser(userId, true);
+        if (locallyOwned) {
+            this.removeUser(userId, true);
+        }
     }
 
     requestUserRemoval (userId: string): void {
@@ -318,8 +405,12 @@ export class ChannelEngine {
     }
 
     getUserAcrossNodes (userId: string, timeoutMs = 5_000): Promise<UserData | null> {
-        if (!this.#backend) {
+        if (!this.#backend || this.#closed) {
             return Promise.resolve(null);
+        }
+
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+            return Promise.reject(new TypeError('timeoutMs must be greater than zero'));
         }
 
         const requestId = uuid();
@@ -359,8 +450,34 @@ export class ChannelEngine {
     }
 
     destroy (reason?: string): void {
-        this.sendMessage(SystemSender.CHANNEL, ChannelReceiver.ALL_USERS, ServerActions.ERROR, 'destroyed', {
-            message: reason ?? 'Channel has been destroyed',
+        const event: ChannelEvent = {
+            channelName: this.#name,
+            requestId: uuid(),
+            action: ServerActions.ERROR,
+            event: 'destroyed',
+            payload: { message: reason ?? 'Channel has been destroyed' },
+        };
+
+        this.#messageHandlers.forEach((onMessage) => {
+            try {
+                void Promise.resolve(onMessage(event)).catch((error) => {
+                    this.parent.parent.reportError(error, `Channel ${this.name} destroy delivery failed`);
+                });
+            } catch (error) {
+                this.parent.parent.reportError(error, `Channel ${this.name} destroy delivery failed`);
+            }
+        });
+
+        this.#broadcastToNodes({
+            type: DistributedMessageType.USER_MESSAGE,
+            endpointName: this.#endpointId,
+            channelName: this.#name,
+            fromUserId: SystemSender.CHANNEL,
+            event: event.event,
+            payload: event.payload,
+            requestId: event.requestId,
+            recipientDescriptor: ChannelReceiver.ALL_USERS,
+            action: event.action,
         });
 
         this.close();
@@ -375,16 +492,8 @@ export class ChannelEngine {
             return;
         }
 
-        const unsubscribe = this.#userSubscriptions.get(userId);
-
         try {
-            this.#assignsCache.delete(userId);
-            this.#safeRemovePresence(userId);
-
-            if (unsubscribe) {
-                unsubscribe();
-                this.#userSubscriptions.delete(userId);
-            }
+            this.#cleanupLocalUser(userId);
 
             if (!skipDistributedBroadcast) {
                 this.#broadcastToNodes({
@@ -398,7 +507,7 @@ export class ChannelEngine {
             void 0;
         }
 
-        if (this.users.size === 0) {
+        if (this.#userSubscriptions.size === 0) {
             this.close();
         }
 
@@ -434,11 +543,30 @@ export class ChannelEngine {
     }
 
     close (): void {
+        if (this.#closed) {
+            return;
+        }
+
         this.#closed = true;
-        this.#userSubscriptions.forEach((unsubscribe) => unsubscribe());
+        this.#userSubscriptions.forEach((unsubscribe) => {
+            try {
+                unsubscribe();
+            } catch (_) {
+                void 0;
+            }
+        });
         this.#userSubscriptions.clear();
 
         this.#assignsCache.clear();
+        this.#membershipTokens.clear();
+        this.#messageHandlers.clear();
+        this.#overflowHandlers.clear();
+        this.#removedHandlers.clear();
+        this.#deliveryQueues.forEach((queue) => {
+            queue.items.length = 0;
+            queue.bytes = 0;
+        });
+        this.#deliveryQueues.clear();
 
         if (this.#presenceEngine) {
             this.#presenceEngine.close();
@@ -446,29 +574,50 @@ export class ChannelEngine {
         }
 
         if (this.#distributedSubscription) {
-            this.#distributedSubscription();
+            try {
+                this.#distributedSubscription();
+            } catch (_) {
+                void 0;
+            }
             this.#distributedSubscription = null;
         }
 
-        if (this.#heartbeatSubscription) {
-            this.#heartbeatSubscription();
-            this.#heartbeatSubscription = null;
+        if (this.#livenessSubscription) {
+            try {
+                this.#livenessSubscription();
+            } catch (_) {
+                void 0;
+            }
+            this.#livenessSubscription = null;
         }
 
-        if (this.#staleNodeTimer) {
-            clearInterval(this.#staleNodeTimer);
-            this.#staleNodeTimer = null;
-        }
-
-        this.#pendingUserGets.forEach((pending) => clearTimeout(pending.timer));
+        this.#pendingUserGets.forEach((pending) => {
+            clearTimeout(pending.timer);
+            pending.resolve(null);
+        });
         this.#pendingUserGets.clear();
 
-        this.#nodeLastSeen.clear();
+        for (const nodeId of this.#nodeUsers.keys()) {
+            if (this.#backend) {
+                this.parent.untrackDistributedNode(this.#backend, nodeId);
+            }
+        }
         this.#nodeUsers.clear();
 
         this.#publisher.close();
 
         this.parent.deleteChannel(this.name);
+
+        const closeHandlers = [...this.#closeHandlers];
+
+        this.#closeHandlers.clear();
+        closeHandlers.forEach((handler) => {
+            try {
+                handler(this.#distributedFailure);
+            } catch (_) {
+                void 0;
+            }
+        });
     }
 
     #safeRemovePresence (userId: string): void {
@@ -481,22 +630,154 @@ export class ChannelEngine {
         }
     }
 
+    #cleanupLocalUser (userId: string): void {
+        const onRemoved = this.#removedHandlers.get(userId);
+
+        this.#assignsCache.delete(userId);
+        this.#membershipTokens.delete(userId);
+        this.#messageHandlers.delete(userId);
+        this.#overflowHandlers.delete(userId);
+        this.#removedHandlers.delete(userId);
+        this.#discardDeliveryQueue(userId);
+        this.#safeRemovePresence(userId);
+
+        const unsubscribe = this.#userSubscriptions.get(userId);
+
+        this.#userSubscriptions.delete(userId);
+        if (unsubscribe) {
+            try {
+                unsubscribe();
+            } catch (_) {
+                void 0;
+            }
+        }
+        try {
+            onRemoved?.();
+        } catch (_) {
+            void 0;
+        }
+    }
+
     #buildSubscriber (userId: string, onMessage: (event: ChannelEvent) => void): void {
-        const subscription = this.#publisher.subscribe(async ({ recipients, ...event }) => {
-            if (recipients.includes(userId)) {
-                if (event.action === ServerActions.PRESENCE) {
-                    return onMessage(event);
-                }
+        const membershipToken = this.#membershipTokens.get(userId);
 
-                const newEvent = await this.parent.processOutgoingEvents(event, this, userId);
+        if (!membershipToken) {
+            throw new Error(`Channel membership for ${userId} was not initialized`);
+        }
 
-                if (newEvent) {
-                    onMessage(newEvent);
-                }
+        const subscription = this.#publisher.subscribe(({ recipients, ...event }) => {
+            if (this.#membershipTokens.get(userId) !== membershipToken || !recipients.includes(userId)) {
+                return;
+            }
+
+            let bytes: number;
+
+            try {
+                bytes = Buffer.byteLength(JSON.stringify(event));
+            } catch (_) {
+                bytes = this.#maxPendingBytesPerUser + 1;
+            }
+
+            let queue = this.#deliveryQueues.get(userId);
+
+            if (!queue) {
+                queue = { items: [],
+                    bytes: 0,
+                    running: false };
+                this.#deliveryQueues.set(userId, queue);
+            }
+
+            if (queue.items.length >= this.#maxPendingMessagesPerUser || queue.bytes + bytes > this.#maxPendingBytesPerUser) {
+                const error = new Error(`Channel delivery backlog exceeded for user ${userId}`);
+
+                this.parent.parent.reportError(error, `Channel ${this.name} overflow`);
+                const overflow = this.#overflowHandlers.get(userId);
+
+                this.removeUser(userId);
+                overflow?.();
+
+                return;
+            }
+
+            queue.items.push({ event,
+                membershipToken,
+                bytes });
+            queue.bytes += bytes;
+            if (!queue.running) {
+                queue.running = true;
+                void this.#drainDeliveryQueue(userId, queue, onMessage);
             }
         });
 
         this.#userSubscriptions.set(userId, subscription);
+    }
+
+    async #drainDeliveryQueue (userId: string, queue: DeliveryQueue, onMessage: (event: ChannelEvent) => void): Promise<void> {
+        try {
+            while (queue.items.length > 0) {
+                const item = queue.items.shift()!;
+
+                queue.bytes -= item.bytes;
+                if (this.#membershipTokens.get(userId) !== item.membershipToken) {
+                    continue;
+                }
+
+                let timeout: ReturnType<typeof setTimeout> | null = null;
+
+                try {
+                    const delivery = (async () => {
+                        if (item.event.action === ServerActions.PRESENCE) {
+                            await Promise.resolve(onMessage(item.event));
+
+                            return;
+                        }
+
+                        const event = await this.parent.processOutgoingEvents(item.event, this, userId);
+
+                        if (event && this.#membershipTokens.get(userId) === item.membershipToken) {
+                            await Promise.resolve(onMessage(event));
+                        }
+                    })();
+                    const deadline = new Promise<boolean>((resolve) => {
+                        timeout = setTimeout(() => resolve(true), this.#deliveryTimeout);
+                        timeout.unref?.();
+                    });
+                    const timedOut = await Promise.race([delivery.then(() => false), deadline]);
+
+                    if (timedOut) {
+                        const error = new Error(`Channel delivery timed out for user ${userId}`);
+                        const overflow = this.#overflowHandlers.get(userId);
+
+                        this.parent.parent.reportError(error, `Channel ${this.name} delivery timeout`);
+                        this.removeUser(userId);
+                        overflow?.();
+                        break;
+                    }
+                } catch (error) {
+                    this.parent.parent.reportError(error, `Channel ${this.name} delivery failed`);
+                } finally {
+                    if (timeout) {
+                        clearTimeout(timeout);
+                    }
+                }
+            }
+        } finally {
+            queue.running = false;
+            if (this.#deliveryQueues.get(userId) === queue && queue.items.length === 0) {
+                this.#deliveryQueues.delete(userId);
+            }
+        }
+    }
+
+    #discardDeliveryQueue (userId: string): void {
+        const queue = this.#deliveryQueues.get(userId);
+
+        if (!queue) {
+            return;
+        }
+        queue.items.length = 0;
+        queue.bytes = 0;
+        this.#deliveryQueues.delete(userId);
     }
 
     #getOrCreatePresenceEngine (): PresenceEngine {
@@ -634,13 +915,13 @@ export class ChannelEngine {
     }
 
     #handleStateRequest (_message: StateRequest): void {
-        if (this.users.size === 0) {
+        if (this.#userSubscriptions.size === 0) {
             return;
         }
 
-        const users = Array.from(this.#assignsCache.entries()).map(([id, assigns]) => ({
+        const users = Array.from(this.#userSubscriptions.keys()).map((id) => ({
             id,
-            assigns,
+            assigns: this.#assignsCache.get(id) || {},
             presence: this.#presenceEngine?.getPresence(id) || {},
         }));
 
@@ -690,6 +971,7 @@ export class ChannelEngine {
         this.#assignsCache.delete(message.userId);
         this.#untrackNodeUser(message.sourceNodeId, message.userId);
         this.#safeRemovePresence(message.userId);
+        this.#closeIfEmpty();
     }
 
     #handleRemoteMessage (message: UserMessage): void {
@@ -710,10 +992,35 @@ export class ChannelEngine {
             return;
         }
 
+        if (message.action === ServerActions.ERROR && message.event === 'destroyed') {
+            recipients.forEach((userId) => {
+                const onMessage = this.#messageHandlers.get(userId);
+
+                if (onMessage) {
+                    try {
+                        void Promise.resolve(onMessage({
+                            channelName: this.#name,
+                            requestId: message.requestId,
+                            action: ServerActions.ERROR,
+                            event: message.event,
+                            payload: message.payload,
+                        })).catch((error) => this.parent.parent.reportError(error, `Channel ${this.name} remote destroy delivery failed`));
+                    } catch (error) {
+                        this.parent.parent.reportError(error, `Channel ${this.name} remote destroy delivery failed`);
+                    }
+                }
+            });
+
+            return;
+        }
+
+        const action = message.action === ServerActions.PRESENCE
+            ? ServerActions.BROADCAST
+            : message.action ?? ServerActions.BROADCAST;
         const internalEvent: InternalChannelEvent = {
             channelName: this.#name,
             requestId: message.requestId,
-            action: ServerActions.BROADCAST,
+            action,
             event: message.event,
             payload: message.payload,
             recipients,
@@ -754,8 +1061,11 @@ export class ChannelEngine {
     }
 
     #handleRemoteEvictUser (message: EvictUser): void {
-        if (this.#userSubscriptions.has(message.userId)) {
-            const kickedOutEvent: InternalChannelEvent = {
+        const locallyOwned = this.#userSubscriptions.has(message.userId);
+        const onMessage = this.#messageHandlers.get(message.userId);
+
+        if (onMessage) {
+            const kickedOutEvent: ChannelEvent = {
                 channelName: this.#name,
                 requestId: uuid(),
                 action: ServerActions.SYSTEM,
@@ -764,21 +1074,27 @@ export class ChannelEngine {
                     message: message.reason,
                     code: 403,
                 },
-                recipients: [message.userId],
             };
 
-            this.#publisher.publish(kickedOutEvent);
+            try {
+                void Promise.resolve(onMessage(kickedOutEvent)).catch((error) => {
+                    this.parent.parent.reportError(error, `Channel ${this.name} eviction delivery failed`);
+                });
+            } catch (error) {
+                this.parent.parent.reportError(error, `Channel ${this.name} eviction delivery failed`);
+            }
+        }
+
+        if (locallyOwned) {
+            this.removeUser(message.userId);
+
+            return;
         }
 
         this.#assignsCache.delete(message.userId);
         this.#safeRemovePresence(message.userId);
-
-        const unsubscribe = this.#userSubscriptions.get(message.userId);
-
-        if (unsubscribe) {
-            unsubscribe();
-            this.#userSubscriptions.delete(message.userId);
-        }
+        this.#untrackNodeUser(message.sourceNodeId, message.userId);
+        this.#closeIfEmpty();
     }
 
     #handleRemoteUserRemove (message: UserRemove): void {
@@ -791,6 +1107,7 @@ export class ChannelEngine {
         this.#assignsCache.delete(message.userId);
         this.#safeRemovePresence(message.userId);
         this.#untrackNodeUser(message.sourceNodeId, message.userId);
+        this.#closeIfEmpty();
     }
 
     #handleRemoteUserGetRequest (message: UserGetRequest): void {
@@ -826,47 +1143,23 @@ export class ChannelEngine {
         });
     }
 
-    #setupHeartbeatTracking (): void {
-        if (!this.#backend) {
+    #handleStaleNode (nodeId: string): void {
+        const users = this.#nodeUsers.get(nodeId);
+
+        if (!users) {
             return;
         }
 
-        this.#heartbeatSubscription = this.#backend.subscribeToHeartbeats((nodeId) => {
-            this.#nodeLastSeen.set(nodeId, Date.now());
-        });
-
-        this.#staleNodeTimer = setInterval(() => {
-            this.#cleanupStaleNodes();
-        }, this.#backend.heartbeatTimeoutMs);
-    }
-
-    #cleanupStaleNodes (): void {
-        if (!this.#backend) {
-            return;
+        for (const userId of users) {
+            this.#assignsCache.delete(userId);
+            this.#safeRemovePresence(userId);
         }
-
-        const now = Date.now();
-        const timeout = this.#backend.heartbeatTimeoutMs;
-
-        for (const [nodeId, lastSeen] of this.#nodeLastSeen) {
-            if (now - lastSeen >= timeout) {
-                const users = this.#nodeUsers.get(nodeId);
-
-                if (users) {
-                    for (const userId of users) {
-                        this.#assignsCache.delete(userId);
-                        this.#safeRemovePresence(userId);
-                    }
-                    this.#nodeUsers.delete(nodeId);
-                }
-
-                this.#nodeLastSeen.delete(nodeId);
-            }
-        }
+        this.#nodeUsers.delete(nodeId);
+        this.#closeIfEmpty();
     }
 
     #trackNodeUser (sourceNodeId: string | undefined, userId: string): void {
-        if (!sourceNodeId) {
+        if (!sourceNodeId || !this.#backend) {
             return;
         }
 
@@ -875,13 +1168,10 @@ export class ChannelEngine {
         if (!users) {
             users = new Set();
             this.#nodeUsers.set(sourceNodeId, users);
+            this.parent.trackDistributedNode(this.#backend, sourceNodeId);
         }
 
         users.add(userId);
-
-        if (!this.#nodeLastSeen.has(sourceNodeId)) {
-            this.#nodeLastSeen.set(sourceNodeId, Date.now());
-        }
     }
 
     #untrackNodeUser (sourceNodeId: string | undefined, userId: string): void {
@@ -895,6 +1185,9 @@ export class ChannelEngine {
             users.delete(userId);
             if (users.size === 0) {
                 this.#nodeUsers.delete(sourceNodeId);
+                if (this.#backend) {
+                    this.parent.untrackDistributedNode(this.#backend, sourceNodeId);
+                }
             }
         }
     }
@@ -909,8 +1202,33 @@ export class ChannelEngine {
                 return;
             }
             await this.#backend.broadcast(this.#endpointId, this.#name, message);
-        } catch (_) {
-            void 0;
+        } catch (error) {
+            this.#failDistributed(error);
+        }
+    }
+
+    #closeIfEmpty (): void {
+        if (this.#assignsCache.size === 0) {
+            this.close();
+        }
+    }
+
+    #failDistributed (error: unknown): void {
+        if (this.#closed) {
+            return;
+        }
+
+        this.#distributedFailure = error instanceof Error ? error : new Error(String(error));
+        this.parent.parent.reportError(this.#distributedFailure, `Distributed channel ${this.name} failed`);
+        this.close();
+    }
+
+    #ensureOpen (): void {
+        if (this.#distributedFailure) {
+            throw new HttpError(503, `Distributed channel ${this.name} is unavailable: ${this.#distributedFailure.message}`);
+        }
+        if (this.#closed) {
+            throw new HttpError(410, `Channel ${this.name} is closed`);
         }
     }
 }

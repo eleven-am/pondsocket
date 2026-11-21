@@ -5,6 +5,7 @@ import {
     PondAssigns,
     PondMessage,
     PondPresence,
+    ServerActions,
     Unsubscribe,
 } from '@eleven-am/pondsocket-common';
 import { WebSocketServer } from 'ws';
@@ -19,6 +20,12 @@ export interface RedisDistributedBackendOptions {
     namespace?: string;
     heartbeatIntervalMs?: number;
     heartbeatTimeoutMs?: number;
+    maxMessageSize?: number;
+    maxMessageAgeMs?: number;
+    maxFutureSkewMs?: number;
+    dedupeWindowSize?: number;
+    initializationTimeoutMs?: number;
+    cleanupTimeoutMs?: number;
     onError?: (error: Error) => void;
 }
 
@@ -29,7 +36,17 @@ export interface PondSocketOptions {
     exclusiveServer?: boolean;
     distributedBackend?: IDistributedBackend;
     maxMessageSize?: number;
+    maxBufferedAmount?: number;
     heartbeatInterval?: number;
+    connectionTimeout?: number;
+    joinTimeout?: number;
+    maxPendingJoins?: number;
+    maxPendingMessagesPerUser?: number;
+    maxPendingBytesPerUser?: number;
+    maxPendingMessagesPerSocket?: number;
+    maxPendingBytesPerSocket?: number;
+    eventTimeout?: number;
+    onError?: (error: Error) => void;
 }
 
 export enum DistributedMessageType {
@@ -92,6 +109,7 @@ export interface UserMessage extends DistributedMessage {
     payload: PondMessage;
     requestId: string;
     recipientDescriptor: ChannelReceivers;
+    action?: ServerActions;
 }
 
 export interface PresenceUpdate extends DistributedMessage {
@@ -162,6 +180,7 @@ export type DistributedChannelMessage =
 export interface IDistributedBackend {
     readonly nodeId: string;
     readonly heartbeatTimeoutMs: number;
+    isHealthy?(): boolean;
     initialize(): Promise<void>;
     broadcast(endpointName: string, channelName: string, message: DistributedChannelMessage): Promise<void>;
     subscribeToChannel(endpointName: string, channelName: string, handler: (message: DistributedChannelMessage) => void): Promise<Unsubscribe>;

@@ -142,7 +142,7 @@ describe('JoinContext', () => {
             const addUserSpy = jest.spyOn(mockChannelEngine, 'addUser');
 
             joinContext.accept();
-            expect(addUserSpy).toHaveBeenCalledWith('user1', { role: 'user' }, expect.any(Function), 'request-123');
+            expect(addUserSpy).toHaveBeenCalledWith('user1', { role: 'user' }, expect.any(Function), 'request-123', expect.any(Function), expect.any(Function));
         });
 
         it('should throw an error if already executed', () => {
@@ -184,7 +184,7 @@ describe('JoinContext', () => {
 
             joinContext.assign(newAssigns);
             joinContext.accept();
-            expect(mockChannelEngine.addUser).toHaveBeenCalledWith('user1', { role: 'admin' }, expect.any(Function), 'request-123');
+            expect(mockChannelEngine.addUser).toHaveBeenCalledWith('user1', { role: 'admin' }, expect.any(Function), 'request-123', expect.any(Function), expect.any(Function));
         });
 
         it('should call updateAssigns on channel engine if already accepted', () => {

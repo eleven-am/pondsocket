@@ -67,7 +67,7 @@ describe('performErrors', () => {
 
             expect(ctx.reply).toHaveBeenCalledWith('INTERNAL_SERVER_ERROR', {
                 code: 'INTERNAL_SERVER_ERROR',
-                message: 'Something broke',
+                message: 'Internal server error',
                 data: undefined,
                 status: 500,
             });
@@ -80,7 +80,7 @@ describe('performErrors', () => {
 
             expect(ctx.reply).toHaveBeenCalledWith('INTERNAL_SERVER_ERROR', {
                 code: 'INTERNAL_SERVER_ERROR',
-                message: 'An unknown error occurred',
+                message: 'Internal server error',
                 data: undefined,
                 status: 500,
             });
@@ -103,7 +103,7 @@ describe('performErrors', () => {
 
             performErrors(error, ctx as any, 'connection');
 
-            expect(ctx.decline).toHaveBeenCalledWith('Connection failed', 500);
+            expect(ctx.decline).toHaveBeenCalledWith('Internal server error', 500);
         });
 
         it('does not call decline if hasResponded is true', () => {
@@ -152,6 +152,23 @@ describe('performErrors', () => {
                 status: 400,
                 data: ['field1 is required', 'field2 must be a string'],
             }));
+        });
+
+        it('does not expose server-side exception details to the client', () => {
+            const ctx = createEventContext();
+            const error = new HttpException(
+                { message: 'database password leaked' },
+                HttpStatus.INTERNAL_SERVER_ERROR,
+            );
+
+            performErrors(error, ctx as any, 'event');
+
+            expect(ctx.reply).toHaveBeenCalledWith('INTERNAL_SERVER_ERROR', {
+                code: 'INTERNAL_SERVER_ERROR',
+                message: 'Internal server error',
+                data: undefined,
+                status: 500,
+            });
         });
     });
 });

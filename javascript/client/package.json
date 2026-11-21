@@ -1,6 +1,6 @@
 {
   "name": "@eleven-am/pondsocket-client",
-  "version": "0.0.41",
+  "version": "0.0.42",
   "description": "Typed browser and Node.js client for PondSocket.",
   "keywords": [
     "pondsocket",
@@ -28,6 +28,16 @@
   "main": "./dist/node-entry.js",
   "browser": "./dist/browser-entry.js",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "browser": [
+        "./dist/browser-entry.d.ts"
+      ],
+      "node": [
+        "./dist/node-entry.d.ts"
+      ]
+    }
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -63,8 +73,8 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@eleven-am/pondsocket-common": "^0.0.41",
-    "ws": "^8.21.0"
+    "@eleven-am/pondsocket-common": "^0.0.42",
+    "ws": "^8.23.0"
   },
   "jest": {
     "moduleFileExtensions": [

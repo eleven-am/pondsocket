@@ -1,4 +1,4 @@
-import type { DynamicModule, Provider } from '@nestjs/common';
+import type { DynamicModule, Provider } from '@nestjs/common' with { 'resolution-mode': 'import' };
 import { DiscoveryModule, DiscoveryService, HttpAdapterHost, ModuleRef } from '@nestjs/core';
 
 import { getLocalGuards } from '../managers/guards';
@@ -16,10 +16,19 @@ export class PondSocketModule {
                 adapterHost,
                 metadata.guards ?? [],
                 metadata.pipes ?? [],
-                metadata.isExclusiveSocketServer ?? false,
+                metadata.isExclusiveSocketServer ?? true,
                 metadata.backend,
                 metadata.maxMessageSize,
                 metadata.heartbeatInterval,
+                metadata.maxBufferedAmount,
+                metadata.connectionTimeout,
+                metadata.joinTimeout,
+                metadata.maxPendingJoins,
+                metadata.maxPendingMessagesPerUser,
+                metadata.maxPendingBytesPerUser,
+                metadata.maxPendingMessagesPerSocket,
+                metadata.maxPendingBytesPerSocket,
+                metadata.eventTimeout,
             ),
             inject: [ModuleRef, HttpAdapterHost, DiscoveryService],
         };
@@ -39,10 +48,19 @@ export class PondSocketModule {
                     adapterHost,
                     metadata.guards ?? [],
                     metadata.pipes ?? [],
-                    metadata.isExclusiveSocketServer ?? false,
+                    metadata.isExclusiveSocketServer ?? true,
                     resolvedMetadata.backend,
                     resolvedMetadata.maxMessageSize,
                     resolvedMetadata.heartbeatInterval,
+                    resolvedMetadata.maxBufferedAmount,
+                    resolvedMetadata.connectionTimeout,
+                    resolvedMetadata.joinTimeout,
+                    resolvedMetadata.maxPendingJoins,
+                    resolvedMetadata.maxPendingMessagesPerUser,
+                    resolvedMetadata.maxPendingBytesPerUser,
+                    resolvedMetadata.maxPendingMessagesPerSocket,
+                    resolvedMetadata.maxPendingBytesPerSocket,
+                    resolvedMetadata.eventTimeout,
                 );
             },
             inject: [ModuleRef, HttpAdapterHost, DiscoveryService, ...(metadata.inject || [])],

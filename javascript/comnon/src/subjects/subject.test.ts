@@ -72,6 +72,20 @@ describe('Subject', () => {
         expect(second).toHaveBeenCalledWith(42);
     });
 
+    it('should report rejected async subscribers without an unhandled rejection', async () => {
+        const onError = jest.fn();
+        const subject = new Subject<number>(onError);
+        const error = new Error('async subscriber failed');
+
+        subject.subscribe(async () => {
+            throw error;
+        });
+        subject.publish(42);
+        await Promise.resolve();
+
+        expect(onError).toHaveBeenCalledWith(error, expect.any(Function));
+    });
+
     it('should handle double unsubscribe gracefully', () => {
         const newObserver = jest.fn();
         const unsub = testSubject.subscribe(newObserver);
@@ -94,5 +108,44 @@ describe('Subject', () => {
         expect(sub.size).toBe(1);
         unsub2();
         expect(sub.size).toBe(0);
+    });
+
+    it('should defer subscribers added during publication until the next publication', () => {
+        const subject = new Subject<number>();
+        const lateObserver = jest.fn();
+
+        subject.subscribe(() => {
+            subject.subscribe(lateObserver);
+        });
+        subject.publish(1);
+        expect(lateObserver).not.toHaveBeenCalled();
+
+        subject.publish(2);
+        expect(lateObserver).toHaveBeenCalledTimes(1);
+        expect(lateObserver).toHaveBeenCalledWith(2);
+    });
+
+    it('should preserve observer order when a subscriber publishes reentrantly', () => {
+        const subject = new Subject<number>();
+        const received: string[] = [];
+
+        subject.subscribe((message) => {
+            received.push(`first:${message}`);
+            if (message === 1) {
+                subject.publish(2);
+            }
+        });
+        subject.subscribe((message) => {
+            received.push(`second:${message}`);
+        });
+
+        subject.publish(1);
+
+        expect(received).toEqual([
+            'first:1',
+            'second:1',
+            'first:2',
+            'second:2',
+        ]);
     });
 });

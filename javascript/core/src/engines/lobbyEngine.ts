@@ -1,6 +1,7 @@
-import { AnyPondSchema, compilePondRoute, Event, EventsOf, PondPath } from '@eleven-am/pondsocket-common';
+import { AnyPondSchema, compilePondRoute, Event, EventsOf, PondPath, Unsubscribe } from '@eleven-am/pondsocket-common';
 
 import { ChannelEngine } from './channelEngine';
+import { DistributedNodeTracker } from './distributedNodeTracker';
 import { EndpointEngine } from './endpointEngine';
 import { Middleware } from '../abstracts/middleware';
 import { BroadcastEvent, EventHandler, LeaveCallback, OutgoingEventHandler } from '../abstracts/types';
@@ -23,11 +24,24 @@ export class LobbyEngine {
 
     readonly #channels: Map<string, ChannelEngine>;
 
-    constructor (public parent: EndpointEngine, backend: IDistributedBackend | null) {
+    readonly #maxPendingMessagesPerUser: number;
+
+    readonly #maxPendingBytesPerUser: number;
+
+    readonly #deliveryTimeout: number;
+
+    readonly #nodeTrackers: Map<IDistributedBackend, DistributedNodeTracker> = new Map();
+
+    #closed: boolean = false;
+
+    constructor (public parent: EndpointEngine, backend: IDistributedBackend | null, maxPendingMessagesPerUser: number = 256, maxPendingBytesPerUser: number = 4 * 1024 * 1024, deliveryTimeout: number = 10_000) {
         this.middleware = new Middleware();
         this.outgoing = new Middleware();
         this.#channels = new Map();
         this.#backend = backend;
+        this.#maxPendingMessagesPerUser = maxPendingMessagesPerUser;
+        this.#maxPendingBytesPerUser = maxPendingBytesPerUser;
+        this.#deliveryTimeout = deliveryTimeout;
     }
 
     /**
@@ -112,6 +126,7 @@ export class LobbyEngine {
      * Gets or creates a channel by name
      */
     getOrCreateChannel (channelName: string) {
+        this.#ensureOpen();
         const oldChannel = this.#getChannel(channelName);
 
         if (oldChannel) {
@@ -126,6 +141,7 @@ export class LobbyEngine {
      * @throws HttpError if a channel not found
      */
     getChannel (channelName: string): ChannelEngine {
+        this.#ensureOpen();
         const channel = this.#channels.get(channelName);
 
         if (!channel) {
@@ -154,6 +170,32 @@ export class LobbyEngine {
         }
     }
 
+    registerNodeLiveness (backend: IDistributedBackend, handler: (nodeId: string) => void): Unsubscribe {
+        return this.#getNodeTracker(backend).subscribe(handler);
+    }
+
+    trackDistributedNode (backend: IDistributedBackend, nodeId: string): void {
+        this.#getNodeTracker(backend).track(nodeId);
+    }
+
+    untrackDistributedNode (backend: IDistributedBackend, nodeId: string): void {
+        this.#nodeTrackers.get(backend)?.untrack(nodeId);
+    }
+
+    close (): void {
+        if (this.#closed) {
+            return;
+        }
+
+        this.#closed = true;
+        const channels = [...this.#channels.values()];
+
+        this.#channels.clear();
+        channels.forEach((channel) => channel.close());
+        this.#nodeTrackers.forEach((tracker) => tracker.close());
+        this.#nodeTrackers.clear();
+    }
+
     /**
      * Gets a channel by name or null if not found
      */
@@ -165,10 +207,29 @@ export class LobbyEngine {
      * Creates a new channel
      */
     #createChannel (channelName: string) {
-        const channel = new ChannelEngine(this, channelName, this.#backend);
+        this.#ensureOpen();
+        const channel = new ChannelEngine(this, channelName, this.#backend, this.#maxPendingMessagesPerUser, this.#maxPendingBytesPerUser, this.#deliveryTimeout);
 
         this.#channels.set(channelName, channel);
 
         return channel;
+    }
+
+    #ensureOpen (): void {
+        if (this.#closed) {
+            throw new HttpError(503, 'Channel lobby is closed');
+        }
+    }
+
+    #getNodeTracker (backend: IDistributedBackend): DistributedNodeTracker {
+        this.#ensureOpen();
+        let tracker = this.#nodeTrackers.get(backend);
+
+        if (!tracker) {
+            tracker = new DistributedNodeTracker(backend);
+            this.#nodeTrackers.set(backend, tracker);
+        }
+
+        return tracker;
     }
 }

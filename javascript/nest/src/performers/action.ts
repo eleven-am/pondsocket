@@ -13,8 +13,9 @@ import {
     pondParameterMetadataKey,
 } from '@eleven-am/pondsocket-common';
 import type { PondParameterDefinition } from '@eleven-am/pondsocket-common';
-import type { PipeTransform } from '@nestjs/common';
-import type { ModuleRef } from '@nestjs/core';
+import type { PipeTransform } from '@nestjs/common' with { 'resolution-mode': 'import' };
+import { ContextIdFactory } from '@nestjs/core';
+import type { ContextId, ModuleRef } from '@nestjs/core' with { 'resolution-mode': 'import' };
 
 import { Context } from '../context/context';
 import { retrieveInstance } from '../helpers/misc';
@@ -31,6 +32,7 @@ async function retrieveParameters (
     globalPipes: Constructor<PipeTransform>[],
     moduleRef: ModuleRef,
     activeDefinition?: HandlerDefinition,
+    contextId?: ContextId,
 ) {
     const managedParameters = manageParameters(context.getInstance(), context.getMethod()).get();
     const boundParameters = (
@@ -83,7 +85,7 @@ async function retrieveParameters (
     const values: unknown[] = Array.from({ length: parameterCount });
     const resolved = await Promise.all(parameters.map(async ({ callback, index }) => ({
         index,
-        value: await callback(context, globalPipes, moduleRef),
+        value: await callback(context, globalPipes, moduleRef, contextId),
     })));
 
     resolved.forEach(({ index, value }) => {
@@ -93,12 +95,16 @@ async function retrieveParameters (
     return values;
 }
 
-async function performGuards (moduleRef: ModuleRef, globalGuards: Constructor<CanActivate>[], context: Context) {
+async function performGuards (
+    moduleRef: ModuleRef,
+    globalGuards: Constructor<CanActivate>[],
+    context: Context,
+    contextId: ContextId,
+) {
     const classGuards = manageGuards(context.getClass()).get();
     const methodGuards = manageGuards(context.getInstance(), context.getMethod()).get();
-    const guards = await Promise.all(globalGuards
-        .concat(classGuards, methodGuards)
-        .map((Guard) => retrieveInstance(moduleRef, Guard)));
+    const guards = await Promise.all(globalGuards.concat(classGuards, methodGuards)
+        .map((Guard) => retrieveInstance(moduleRef, Guard, contextId)));
 
     for (const guard of guards) {
         if (!await guard.canActivate(context)) {
@@ -152,7 +158,11 @@ export async function performAction (
     activeDefinition?: HandlerDefinition,
 ) {
     const context = new Context(getNestContext(input, lifecycle), instance, propertyKey);
-    const canProceed = await performGuards(moduleRef, globalGuards, context);
+    const contextId = ContextIdFactory.create();
+
+    moduleRef.registerRequestByContextId?.(context, contextId);
+
+    const canProceed = await performGuards(moduleRef, globalGuards, context, contextId);
 
     if (!canProceed) {
         rejectGuard(input, lifecycle);
@@ -162,7 +172,7 @@ export async function performAction (
 
     const data = await originalMethod.apply(
         instance,
-        await retrieveParameters(context, globalPipes, moduleRef, activeDefinition),
+        await retrieveParameters(context, globalPipes, moduleRef, activeDefinition, contextId),
     );
 
     if (lifecycle === 'outgoing') {

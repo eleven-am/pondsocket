@@ -9,6 +9,7 @@ import {
 } from '@eleven-am/pondsocket-common';
 
 import { ChannelEngine } from '../engines/channelEngine';
+import { LobbyEngine } from '../engines/lobbyEngine';
 import { HttpError } from '../errors/httpError';
 import {
     DistributedChannelMessage,
@@ -16,11 +17,15 @@ import {
     IDistributedBackend,
 } from '../types';
 import { MockLobbyEngine } from './mocks/lobbyEngine';
+import { MockEndpointEngine } from './mocks/endpointEngine';
 
 class MockDistributedBackend implements IDistributedBackend {
     readonly nodeId = 'mock-node-id';
     readonly heartbeatTimeoutMs = 500;
     broadcastCalls: DistributedChannelMessage[] = [];
+    heartbeatSubscribeCalls = 0;
+    heartbeatUnsubscribeCalls = 0;
+    subscriptionError: Error | null = null;
     private subscribeHandler: ((message: DistributedChannelMessage) => void) | null = null;
     private heartbeatHandler: ((nodeId: string) => void) | null = null;
 
@@ -31,6 +36,9 @@ class MockDistributedBackend implements IDistributedBackend {
     }
 
     async subscribeToChannel (_endpointName: string, _channelName: string, handler: (message: DistributedChannelMessage) => void): Promise<Unsubscribe> {
+        if (this.subscriptionError) {
+            throw this.subscriptionError;
+        }
         this.subscribeHandler = handler;
 
         return () => {
@@ -39,9 +47,11 @@ class MockDistributedBackend implements IDistributedBackend {
     }
 
     subscribeToHeartbeats (handler: (nodeId: string) => void): Unsubscribe {
+        this.heartbeatSubscribeCalls += 1;
         this.heartbeatHandler = handler;
 
         return () => {
+            this.heartbeatUnsubscribeCalls += 1;
             this.heartbeatHandler = null;
         };
     }
@@ -219,13 +229,13 @@ describe('ChannelEngine', () => {
                 action: ClientActions.BROADCAST,
             };
 
-            // Spy on middleware.run
-            const middlewareRunSpy = jest.spyOn(mockLobbyEngine.middleware, 'run');
+            // Spy on middleware.runAsync
+            const middlewareRunSpy = jest.spyOn(mockLobbyEngine.middleware, 'runAsync');
 
             // Broadcast the message
             channelEngine.broadcastMessage(userId, clientMessage);
 
-            // Check that middleware.run was called
+            // Check that middleware.runAsync was called
             expect(middlewareRunSpy).toHaveBeenCalledWith(
                 expect.objectContaining({
                     sender: userId,
@@ -409,56 +419,56 @@ describe('ChannelEngine', () => {
 
     describe('kickUser', () => {
         const userId = 'user1';
+        let onMessage: jest.Mock;
 
         beforeEach(() => {
-            // Add a user
             const assigns: PondAssigns = { role: 'user' };
-            const onMessage = jest.fn();
 
+            onMessage = jest.fn();
             channelEngine.addUser(userId, assigns, onMessage);
+            onMessage.mockClear();
         });
 
         it('should send kicked_out message to the user', () => {
-            // We need to check this behavior in a different way
-            // Mock the sendMessage method
-            const sendMessageMock = jest.fn();
-
-            channelEngine.sendMessage = sendMessageMock;
-
             const reason = 'Bad behavior';
 
             channelEngine.kickUser(userId, reason);
 
-            // Check first call is kicked_out
-            expect(sendMessageMock.mock.calls[0][0]).toBe(SystemSender.CHANNEL);
-            expect(sendMessageMock.mock.calls[0][1]).toEqual([userId]);
-            expect(sendMessageMock.mock.calls[0][2]).toBe(ServerActions.SYSTEM);
-            expect(sendMessageMock.mock.calls[0][3]).toBe('kicked_out');
-            expect(sendMessageMock.mock.calls[0][4]).toEqual({
-                message: reason,
-                code: 403,
-            });
+            expect(onMessage).toHaveBeenCalledTimes(1);
+            expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+                action: ServerActions.SYSTEM,
+                event: 'kicked_out',
+                payload: { message: reason,
+                    code: 403 },
+            }));
         });
 
-        it('should broadcast kicked message to all users', () => {
+        it('should broadcast kicked message to all remaining users', async () => {
             // Mock the sendMessage method
-            const sendMessageMock = jest.fn();
+            const sendMessageMock = jest.spyOn(channelEngine, 'sendMessage');
+            const otherUser = jest.fn();
 
-            channelEngine.sendMessage = sendMessageMock;
+            channelEngine.addUser('user2', {}, otherUser);
+            otherUser.mockClear();
 
             const reason = 'Bad behavior';
 
             channelEngine.kickUser(userId, reason);
 
-            // Check second call is kicked broadcast
-            expect(sendMessageMock.mock.calls[1][0]).toBe(SystemSender.CHANNEL);
-            expect(sendMessageMock.mock.calls[1][1]).toBe(ChannelReceiver.ALL_USERS);
-            expect(sendMessageMock.mock.calls[1][2]).toBe(ServerActions.SYSTEM);
-            expect(sendMessageMock.mock.calls[1][3]).toBe('kicked');
-            expect(sendMessageMock.mock.calls[1][4]).toEqual({
+            expect(sendMessageMock.mock.calls[0][0]).toBe(SystemSender.CHANNEL);
+            expect(sendMessageMock.mock.calls[0][1]).toBe(ChannelReceiver.ALL_USERS);
+            expect(sendMessageMock.mock.calls[0][2]).toBe(ServerActions.SYSTEM);
+            expect(sendMessageMock.mock.calls[0][3]).toBe('kicked');
+            expect(sendMessageMock.mock.calls[0][4]).toEqual({
                 userId,
                 reason,
             });
+            await flushPromises(0);
+            expect(otherUser).toHaveBeenCalledWith(expect.objectContaining({
+                event: 'kicked',
+                payload: { userId,
+                    reason },
+            }));
         });
 
         it('should remove the user from the channel', () => {
@@ -554,37 +564,31 @@ describe('ChannelEngine', () => {
 
     describe('destroy', () => {
         it('should send destroyed message to all users', () => {
-            // Replace the sendMessage method with a mock
-            const sendMessageMock = jest.fn();
-
-            channelEngine.sendMessage = sendMessageMock;
-
+            const onMessage = jest.fn();
             const reason = 'Channel closed';
 
+            channelEngine.addUser('user1', {}, onMessage);
+            onMessage.mockClear();
             channelEngine.destroy(reason);
 
-            // Check message parameters directly
-            expect(sendMessageMock).toHaveBeenCalled();
-            expect(sendMessageMock.mock.calls[0][0]).toBe(SystemSender.CHANNEL);
-            expect(sendMessageMock.mock.calls[0][1]).toBe(ChannelReceiver.ALL_USERS);
-            expect(sendMessageMock.mock.calls[0][2]).toBe(ServerActions.ERROR);
-            expect(sendMessageMock.mock.calls[0][3]).toBe('destroyed');
-            expect(sendMessageMock.mock.calls[0][4]).toEqual({ message: reason });
+            expect(onMessage).toHaveBeenCalledTimes(1);
+            expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+                action: ServerActions.ERROR,
+                event: 'destroyed',
+                payload: { message: reason },
+            }));
         });
 
         it('should use default message if no reason provided', () => {
-            // Replace the sendMessage method with a mock
-            const sendMessageMock = jest.fn();
+            const onMessage = jest.fn();
 
-            channelEngine.sendMessage = sendMessageMock;
-
+            channelEngine.addUser('user1', {}, onMessage);
+            onMessage.mockClear();
             channelEngine.destroy();
 
-            // Check defaults
-            expect(sendMessageMock).toHaveBeenCalled();
-            expect(sendMessageMock.mock.calls[0][4]).toEqual({
-                message: 'Channel has been destroyed',
-            });
+            expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+                payload: { message: 'Channel has been destroyed' },
+            }));
         });
 
         it('should close the channel', () => {
@@ -690,6 +694,16 @@ describe('ChannelEngine', () => {
                 user2: { role: 'user' },
             });
         });
+
+        it('treats prototype-like user IDs as ordinary keys', () => {
+            channelEngine.addUser('__proto__', { role: 'user' }, jest.fn());
+
+            const assigns = channelEngine.getAssigns();
+
+            expect(Object.prototype.hasOwnProperty.call(assigns, '__proto__')).toBe(true);
+            expect(assigns.__proto__).toEqual({ role: 'user' });
+            expect(Object.getPrototypeOf(assigns)).toBe(Object.prototype);
+        });
     });
 
     describe('removeUser cleans up last user', () => {
@@ -704,16 +718,16 @@ describe('ChannelEngine', () => {
     });
 
     describe('broadcastMessage error handling', () => {
-        it('should invoke middleware final callback with error info when no handler matches', () => {
+        it('should invoke middleware final callback with error info when no handler matches', async () => {
             channelEngine.addUser('user1', {}, jest.fn());
 
-            mockLobbyEngine.middleware.run = jest.fn((_event, _channel, final) => {
+            mockLobbyEngine.middleware.runAsync = jest.fn(async (_event, _channel, final) => {
                 final();
             });
 
             const sendMessageSpy = jest.spyOn(channelEngine, 'sendMessage');
 
-            channelEngine.broadcastMessage('user1', {
+            await channelEngine.broadcastMessage('user1', {
                 event: 'unhandled',
                 payload: {},
                 requestId: 'req-1',
@@ -730,6 +744,99 @@ describe('ChannelEngine', () => {
                 'req-1',
             );
         });
+    });
+});
+
+describe('ChannelEngine ordered delivery', () => {
+    let lobby: MockLobbyEngine;
+    let engine: ChannelEngine;
+
+    beforeEach(() => {
+        lobby = new MockLobbyEngine();
+        engine = new ChannelEngine(lobby, 'ordered-channel');
+    });
+
+    afterEach(() => engine.close());
+
+    it('serializes async outgoing middleware per user', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => release = resolve);
+        const onMessage = jest.fn();
+
+        lobby.handleOutgoingEvent('*', async (context) => {
+            if (context.event.event === 'first') {
+                await gate;
+            }
+        });
+        engine.addUser('user1', {}, onMessage);
+        onMessage.mockClear();
+
+        engine.sendMessage(SystemSender.CHANNEL, ChannelReceiver.ALL_USERS, ServerActions.BROADCAST, 'first', {});
+        engine.sendMessage(SystemSender.CHANNEL, ChannelReceiver.ALL_USERS, ServerActions.BROADCAST, 'second', {});
+        await Promise.resolve();
+
+        expect(onMessage).not.toHaveBeenCalled();
+
+        release();
+        await flushPromises(0);
+
+        expect(onMessage.mock.calls.map(([event]) => event.event)).toEqual(['first', 'second']);
+    });
+
+    it('does not deliver an event after the membership was removed during middleware', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => release = resolve);
+        const onMessage = jest.fn();
+
+        lobby.handleOutgoingEvent('*', async () => gate);
+        engine.addUser('user1', {}, onMessage);
+        onMessage.mockClear();
+        engine.sendMessage(SystemSender.CHANNEL, ChannelReceiver.ALL_USERS, ServerActions.BROADCAST, 'delayed', {});
+        await Promise.resolve();
+
+        engine.removeUser('user1');
+        release();
+        await flushPromises(0);
+
+        expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it('evicts a slow consumer when its bounded delivery queue overflows', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => release = resolve);
+        const overflow = jest.fn();
+        const bounded = new ChannelEngine(lobby, 'bounded-channel', null, 2, 10_000);
+
+        lobby.handleOutgoingEvent('*', async () => gate);
+        bounded.addUser('user1', {}, jest.fn(), undefined, overflow);
+
+        for (let index = 0; index < 4; index++) {
+            bounded.sendMessage(SystemSender.CHANNEL, ChannelReceiver.ALL_USERS, ServerActions.BROADCAST, `event-${index}`, { index });
+        }
+
+        expect(overflow).toHaveBeenCalledTimes(1);
+        expect(bounded.users.has('user1')).toBe(false);
+
+        release();
+        await flushPromises(0);
+        bounded.close();
+    });
+
+    it('evicts a consumer whose active outgoing delivery hangs', async () => {
+        jest.useFakeTimers();
+        const overflow = jest.fn();
+        const bounded = new ChannelEngine(lobby, 'timed-channel', null, 10, 10_000, 100);
+
+        lobby.handleOutgoingEvent('*', () => new Promise(() => {}));
+        bounded.addUser('user1', {}, jest.fn(), undefined, overflow);
+        bounded.sendMessage(SystemSender.CHANNEL, ChannelReceiver.ALL_USERS, ServerActions.BROADCAST, 'slow', {});
+        await jest.advanceTimersByTimeAsync(100);
+
+        expect(overflow).toHaveBeenCalledTimes(1);
+        expect(bounded.users.has('user1')).toBe(false);
+
+        bounded.close();
+        jest.useRealTimers();
     });
 });
 
@@ -756,6 +863,39 @@ describe('ChannelEngine distributed', () => {
     describe('constructor with backend', () => {
         it('should set up distributed subscription and heartbeat tracking', () => {
             expect(channelEngine.name).toBe(channelName);
+        });
+
+        it('fails closed and removes a channel when its distributed subscription cannot start', async () => {
+            const backend = new MockDistributedBackend();
+            const lobby = new LobbyEngine(new MockEndpointEngine(), backend);
+
+            backend.subscriptionError = new Error('subscribe unavailable');
+            const failed = lobby.getOrCreateChannel('failed-channel');
+
+            await expect(failed.ready()).rejects.toThrow('subscribe unavailable');
+            await Promise.resolve();
+
+            expect(() => lobby.getChannel('failed-channel')).toThrow(HttpError);
+            expect(() => failed.addUser('user1', {}, jest.fn())).toThrow('Distributed channel failed-channel is unavailable');
+
+            lobby.close();
+        });
+
+        it('shares one heartbeat subscription and stale timer across many channels', async () => {
+            const backend = new MockDistributedBackend();
+            const lobby = new LobbyEngine(new MockEndpointEngine(), backend);
+            const timerCountBefore = jest.getTimerCount();
+            const channels = Array.from({ length: 50 }, (_, index) => lobby.getOrCreateChannel(`channel-${index}`));
+
+            await Promise.all(channels.map((channel) => channel.ready()));
+
+            expect(backend.heartbeatSubscribeCalls).toBe(1);
+            expect(jest.getTimerCount()).toBe(timerCountBefore + 1);
+
+            lobby.close();
+
+            expect(backend.heartbeatUnsubscribeCalls).toBe(1);
+            expect(jest.getTimerCount()).toBe(timerCountBefore);
         });
     });
 
@@ -828,6 +968,23 @@ describe('ChannelEngine distributed', () => {
             );
 
             expect(leftMsg).toBeUndefined();
+        });
+
+        it('closes after the last local user leaves even when remote users are cached', () => {
+            channelEngine.addUser('local-user', {}, jest.fn());
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_JOINED,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+                assigns: {},
+                presence: {},
+            });
+
+            channelEngine.removeUser('local-user');
+
+            expect(() => channelEngine.addUser('new-user', {}, jest.fn())).toThrow('is closed');
         });
     });
 
@@ -961,6 +1118,7 @@ describe('ChannelEngine distributed', () => {
             expect((msg as any).event).toBe('test-event');
             expect((msg as any).payload).toEqual({ data: 'hello' });
             expect((msg as any).recipientDescriptor).toBe(ChannelReceiver.ALL_USERS);
+            expect((msg as any).action).toBe(ServerActions.BROADCAST);
         });
     });
 
@@ -968,6 +1126,15 @@ describe('ChannelEngine distributed', () => {
         it('should respond with STATE_RESPONSE when channel has users', async () => {
             channelEngine.addUser('user1', { role: 'admin' }, jest.fn());
             channelEngine.trackPresence('user1', { status: 'online' });
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_JOINED,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+                assigns: { role: 'remote' },
+                presence: {},
+            });
             mockBackend.broadcastCalls = [];
 
             mockBackend.simulateMessage({
@@ -988,6 +1155,9 @@ describe('ChannelEngine distributed', () => {
             expect((response as any).users[0].id).toBe('user1');
             expect((response as any).users[0].assigns).toEqual({ role: 'admin' });
             expect((response as any).users[0].presence).toEqual({ status: 'online' });
+            expect((response as any).users).not.toEqual(expect.arrayContaining([
+                expect.objectContaining({ id: 'remote-user' }),
+            ]));
         });
 
         it('should not respond when channel has no users', async () => {
@@ -1216,10 +1386,63 @@ describe('ChannelEngine distributed', () => {
 
             expect(onMessage).toHaveBeenCalledWith(
                 expect.objectContaining({
+                    action: ServerActions.BROADCAST,
                     event: 'chat',
                     payload: { text: 'hello' },
                 }),
             );
+        });
+
+        it('should preserve a validated remote SYSTEM action', async () => {
+            const onMessage = jest.fn();
+
+            channelEngine.addUser('local-user', {}, onMessage);
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_MESSAGE,
+                endpointName: 'String',
+                channelName,
+                fromUserId: 'remote-sender',
+                action: ServerActions.SYSTEM,
+                event: 'notice',
+                payload: { text: 'maintenance' },
+                requestId: 'req-system',
+                recipientDescriptor: ChannelReceiver.ALL_USERS,
+            });
+
+            await new Promise(process.nextTick);
+
+            expect(onMessage).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    action: ServerActions.SYSTEM,
+                    event: 'notice',
+                }),
+            );
+        });
+
+        it('delivers a remote destroyed terminal event directly', () => {
+            const onMessage = jest.fn();
+
+            channelEngine.addUser('local-user', {}, onMessage);
+            onMessage.mockClear();
+
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_MESSAGE,
+                endpointName: 'String',
+                channelName,
+                fromUserId: SystemSender.CHANNEL,
+                action: ServerActions.ERROR,
+                event: 'destroyed',
+                payload: { message: 'gone' },
+                requestId: 'req-destroyed',
+                recipientDescriptor: ChannelReceiver.ALL_USERS,
+            });
+
+            expect(onMessage).toHaveBeenCalledTimes(1);
+            expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+                action: ServerActions.ERROR,
+                event: 'destroyed',
+            }));
         });
 
         it('should filter messages using ALL_EXCEPT_SENDER', async () => {
@@ -1385,6 +1608,9 @@ describe('ChannelEngine distributed', () => {
     describe('handleDistributedMessage - EVICT_USER', () => {
         it('should evict a local user when receiving remote eviction', async () => {
             const onMessage = jest.fn();
+            const leaveCallback = jest.fn();
+
+            mockLobbyEngine.leaveCallback = leaveCallback;
 
             channelEngine.addUser('user1', {}, onMessage);
             channelEngine.addUser('user2', {}, jest.fn());
@@ -1405,6 +1631,11 @@ describe('ChannelEngine distributed', () => {
                     payload: expect.objectContaining({ message: 'bad behavior' }),
                 }),
             );
+            expect(channelEngine.users.has('user1')).toBe(false);
+            expect(leaveCallback).toHaveBeenCalledTimes(1);
+            expect(leaveCallback).toHaveBeenCalledWith(expect.objectContaining({
+                user: expect.objectContaining({ id: 'user1' }),
+            }));
         });
 
         it('should handle eviction for non-local user', () => {
@@ -1717,6 +1948,43 @@ describe('ChannelEngine distributed', () => {
 
             expect(channelEngine.users.has('active-user')).toBe(true);
         });
+
+        it('closes a channel when the last remote user leaves', () => {
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_JOINED,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+                assigns: {},
+                presence: {},
+            });
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_LEFT,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'remote-node',
+                userId: 'remote-user',
+            });
+
+            expect(() => channelEngine.addUser('new-user', {}, jest.fn())).toThrow('is closed');
+        });
+
+        it('closes a remote-only channel after its owning node becomes stale', () => {
+            mockBackend.simulateMessage({
+                type: DistributedMessageType.USER_JOINED,
+                endpointName: 'String',
+                channelName,
+                sourceNodeId: 'stale-node',
+                userId: 'stale-user',
+                assigns: {},
+                presence: {},
+            });
+
+            jest.advanceTimersByTime(mockBackend.heartbeatTimeoutMs);
+
+            expect(() => channelEngine.addUser('new-user', {}, jest.fn())).toThrow('is closed');
+        });
     });
 
     describe('close with backend', () => {
@@ -1731,7 +1999,7 @@ describe('ChannelEngine distributed', () => {
     });
 
     describe('broadcast failure handling', () => {
-        it('should silently handle broadcast errors', async () => {
+        it('should fail closed and expose broadcast errors', async () => {
             const failingBackend = new MockDistributedBackend();
 
             failingBackend.broadcast = jest.fn().mockRejectedValue(new Error('network error'));
@@ -1742,15 +2010,9 @@ describe('ChannelEngine distributed', () => {
 
             await Promise.resolve();
 
-            expect(() => {
-                engine.sendMessage(
-                    'user1',
-                    ChannelReceiver.ALL_USERS,
-                    ServerActions.BROADCAST,
-                    'test',
-                    {},
-                );
-            }).not.toThrow();
+            await expect(engine.ready()).resolves.toBeUndefined();
+            expect(engine.users.size).toBe(0);
+            expect(() => engine.addUser('user2', {}, jest.fn())).toThrow('network error');
 
             engine.close();
         });

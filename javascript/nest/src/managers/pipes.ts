@@ -1,4 +1,4 @@
-import type { PipeTransform } from '@nestjs/common';
+import type { PipeTransform } from '@nestjs/common' with { 'resolution-mode': 'import' };
 
 import { pondValidatorsKey } from '../constants';
 import { createMetadataManager } from './createMetadataManager';

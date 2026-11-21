@@ -84,7 +84,39 @@ describe('behaviorSubject', () => {
     });
 
     it('should close and prevent further subscriptions', () => {
+        const observer = jest.fn();
+
         testSubject.close();
-        expect(() => testSubject.subscribe(jest.fn())).toThrow('Cannot subscribe to a closed subject');
+        expect(() => testSubject.subscribe(observer)).toThrow('Cannot subscribe to a closed subject');
+        expect(observer).not.toHaveBeenCalled();
+    });
+
+    it('should retain its final value after close', () => {
+        testSubject.publish(42);
+        testSubject.close();
+        testSubject.publish(99);
+
+        expect(testSubject.value).toBe(42);
+    });
+
+    it('should replay the currently delivering value during a reentrant publication', () => {
+        const subject = new BehaviorSubject<number>();
+        const lateObserver = jest.fn();
+
+        subject.subscribe((message) => {
+            if (message === 1) {
+                subject.publish(2);
+            }
+        });
+        subject.subscribe((message) => {
+            if (message === 1) {
+                subject.subscribe(lateObserver);
+            }
+        });
+
+        subject.publish(1);
+
+        expect(lateObserver.mock.calls).toEqual([[1], [2]]);
+        expect(subject.value).toBe(2);
     });
 });

@@ -23,8 +23,8 @@ import type {
     SchemaOf,
     ServerActions,
 } from '@eleven-am/pondsocket/types';
-import type { ModuleMetadata, PipeTransform, Type } from '@nestjs/common';
-import type { ModuleRef } from '@nestjs/core';
+import type { ModuleMetadata, PipeTransform, Type } from '@nestjs/common' with { 'resolution-mode': 'import' };
+import type { ContextId, ModuleRef } from '@nestjs/core' with { 'resolution-mode': 'import' };
 
 import type { Context } from './context/context';
 
@@ -44,7 +44,12 @@ export type ParamDecoratorCallback<Input> = (data: Input, context: Context, type
 
 export interface ParamDecoratorMetadata {
     index: number;
-    callback: (context: Context, globalPipes: Constructor<PipeTransform>[], moduleRef: ModuleRef) => Promise<unknown>;
+    callback: (
+        context: Context,
+        globalPipes: Constructor<PipeTransform>[],
+        moduleRef: ModuleRef,
+        contextId?: ContextId,
+    ) => Promise<unknown>;
 }
 
 export type HandlerFunction<Context> = (instance: unknown, moduleRef: ModuleRef, globalGuards: Constructor<CanActivate>[], globalPipes: Constructor<PipeTransform>[], ctx: Context) => Promise<unknown>;
@@ -85,17 +90,48 @@ export interface Metadata extends Omit<ModuleMetadata, 'controllers'> {
     isExclusiveSocketServer?: boolean;
     backend?: IDistributedBackend;
     maxMessageSize?: number;
+    maxBufferedAmount?: number;
     heartbeatInterval?: number;
+    connectionTimeout?: number;
+    joinTimeout?: number;
+    maxPendingJoins?: number;
+    maxPendingMessagesPerUser?: number;
+    maxPendingBytesPerUser?: number;
+    maxPendingMessagesPerSocket?: number;
+    maxPendingBytesPerSocket?: number;
+    eventTimeout?: number;
     isGlobal?: boolean;
 }
 
 export interface AsyncFactoryResult {
     backend?: IDistributedBackend;
     maxMessageSize?: number;
+    maxBufferedAmount?: number;
     heartbeatInterval?: number;
+    connectionTimeout?: number;
+    joinTimeout?: number;
+    maxPendingJoins?: number;
+    maxPendingMessagesPerUser?: number;
+    maxPendingBytesPerUser?: number;
+    maxPendingMessagesPerSocket?: number;
+    maxPendingBytesPerSocket?: number;
+    eventTimeout?: number;
 }
 
-export interface AsyncMetadata extends Omit<Metadata, 'backend' | 'maxMessageSize' | 'heartbeatInterval'> {
+export interface AsyncMetadata extends Omit<Metadata,
+    'backend' |
+    'maxMessageSize' |
+    'maxBufferedAmount' |
+    'heartbeatInterval' |
+    'connectionTimeout' |
+    'joinTimeout' |
+    'maxPendingJoins' |
+    'maxPendingMessagesPerUser' |
+    'maxPendingBytesPerUser' |
+    'maxPendingMessagesPerSocket' |
+    'maxPendingBytesPerSocket' |
+    'eventTimeout'
+> {
     isGlobal?: boolean;
     inject?: any[];
     imports?: any[];

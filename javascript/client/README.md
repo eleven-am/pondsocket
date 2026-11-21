@@ -101,6 +101,11 @@ const client = new PondClient('wss://example.com/v1/socket', {}, {
     connectionTimeout: 10_000,
     joinTimeout: 8_000,
     maxReconnectDelay: 30_000,
+    maxQueueSize: 100,
+    maxQueueBytes: 4 * 1024 * 1024,
+    maxChannels: 100,
+    maxMessageSize: 1024 * 1024,
+    maxBufferedAmount: 1024 * 1024,
 });
 
 const channel = client.createChannel(Chat, {
@@ -118,13 +123,15 @@ channel.join();
 
 `joinError` contains the most recent terminal join error. Messages cannot be queued after a channel is declined or closed. A later acknowledgement cannot reopen an explicitly closed channel.
 
+Server `kicked_out` and `destroyed` events end the current membership and move the channel to `DECLINED` after delivering the final event to `onMessage` and `onError`. Pending work is rejected rather than replayed. Call `join()` explicitly to request a fresh membership after policy or channel availability changes.
+
 ## Presence
 
 `presence`, `onJoin`, `onLeave`, `onPresenceChange`, and `onUsersChange` use the schema's presence type.
 
 ## SSE
 
-`SSEClient` has the same channel API and adds `withCredentials` and `getConnectionId()`.
+`SSEClient` has the same channel API and adds `withCredentials` and `getConnectionId()`. It requires the browser `EventSource` API; Node.js applications should use `PondClient` unless they install an `EventSource` polyfill. HTTP writes are considered delivered only after a successful response. Ambiguous failed writes are not replayed automatically, preventing accidental duplicate broadcasts; the stream reconnects before later messages are sent.
 
 ```ts
 import { SSEClient } from '@eleven-am/pondsocket-client';

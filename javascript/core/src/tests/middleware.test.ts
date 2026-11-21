@@ -199,6 +199,35 @@ describe('Middleware', () => {
             expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
             expect(finalFn.mock.calls[0][0].statusCode).toBe(403);
         });
+
+        it('ignores duplicate next calls', () => {
+            const downstream = jest.fn((_req, _res, next) => next());
+            const finalFn = jest.fn();
+
+            middleware.use((_req, _res, next) => {
+                next();
+                next();
+            });
+            middleware.use(downstream);
+            middleware.run({}, {}, finalFn);
+
+            expect(downstream).toHaveBeenCalledTimes(1);
+            expect(finalFn).toHaveBeenCalledTimes(1);
+        });
+
+        it('ignores a rejection after middleware has delegated', async () => {
+            const finalFn = jest.fn();
+
+            middleware.use(async (_req, _res, next) => {
+                next();
+                throw new Error('late failure');
+            });
+            middleware.run({}, {}, finalFn);
+            await Promise.resolve();
+
+            expect(finalFn).toHaveBeenCalledTimes(1);
+            expect(finalFn).toHaveBeenCalledWith(undefined);
+        });
     });
 
     describe('runAsync', () => {
@@ -279,6 +308,24 @@ describe('Middleware', () => {
 
             expect(finalFn).toHaveBeenCalledWith(expect.any(HttpError));
             expect(finalFn.mock.calls[0][0].message).toBe('An error occurred while processing the request');
+        });
+
+        it('settles once when async middleware calls next twice then throws', async () => {
+            const downstream = jest.fn((_req, _res, next) => next());
+            const finalFn = jest.fn();
+
+            middleware.use(async (_req, _res, next) => {
+                next();
+                next(new HttpError(500, 'duplicate'));
+                throw new Error('late failure');
+            });
+            middleware.use(downstream);
+
+            await middleware.runAsync({}, {}, finalFn);
+
+            expect(downstream).toHaveBeenCalledTimes(1);
+            expect(finalFn).toHaveBeenCalledTimes(1);
+            expect(finalFn).toHaveBeenCalledWith(undefined);
         });
     });
 });

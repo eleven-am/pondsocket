@@ -1,6 +1,6 @@
 import 'reflect-metadata';
-import type { ArgumentMetadata, PipeTransform } from '@nestjs/common';
-import type { ModuleRef } from '@nestjs/core';
+import type { ArgumentMetadata, PipeTransform } from '@nestjs/common' with { 'resolution-mode': 'import' };
+import type { ContextId, ModuleRef } from '@nestjs/core' with { 'resolution-mode': 'import' };
 
 import { Context } from '../context/context';
 import { manageParameters } from '../managers/parametres';
@@ -9,15 +9,19 @@ import { ParamDecoratorCallback, Constructor } from '../types';
 import { retrieveInstance } from './misc';
 
 function wrapTransform <Input> (metadata: unknown, data: Input, handler: ParamDecoratorCallback<Input>) {
-    return async (context: Context, globalPipes: Constructor<PipeTransform>[], moduleRef: ModuleRef) => {
+    return async (
+        context: Context,
+        globalPipes: Constructor<PipeTransform>[],
+        moduleRef: ModuleRef,
+        contextId?: ContextId,
+    ) => {
         const value = await handler(data, context, metadata);
 
         const classTransforms = managePipes(context.getClass()).get();
         const methodTransforms = managePipes(context.getInstance(), context.getMethod()).get();
 
-        const transformers = await Promise.all(globalPipes
-            .concat(classTransforms, methodTransforms)
-            .map((Transformer) => retrieveInstance(moduleRef, Transformer)));
+        const transformers = await Promise.all(globalPipes.concat(classTransforms, methodTransforms)
+            .map((Transformer) => retrieveInstance(moduleRef, Transformer, contextId)));
 
         const argumentMetadata: ArgumentMetadata = {
             metatype: metadata as Constructor<unknown>,

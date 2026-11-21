@@ -1,21 +1,63 @@
-import { ChannelReceiver } from '@eleven-am/pondsocket-common';
+import { ChannelReceiver, ServerActions } from '@eleven-am/pondsocket-common';
 
 import { RedisDistributedBackend } from '../abstracts/distributor';
 import { DistributedChannelMessage, DistributedMessageType } from '../types';
+
+const mockRedisControl = { failNextPublish: false,
+    hangConnect: false,
+    hangSubscribe: false,
+    clients: [] as Array<{
+        emit: (event: string, ...args: any[]) => void;
+        setReady: (ready: boolean) => void;
+    }> };
 
 jest.mock('redis', () => {
     const channels = new Map<string, Set<(message: string) => void>>();
 
     const makeClient = () => {
         const own = new Map<string, (message: string) => void>();
+        let isOpen = false;
+        let isReady = false;
+        let rejectConnect: ((error: Error) => void) | null = null;
+        const eventHandlers = new Map<string, Array<(...args: any[]) => void>>();
 
-        return {
-            isOpen: true,
-            isReady: true,
-            connect: async () => {},
+        const client = {
+            get isOpen () {
+                return isOpen;
+            },
+            get isReady () {
+                return isReady;
+            },
+            connect: async () => {
+                isOpen = true;
+                if (mockRedisControl.hangConnect) {
+                    await new Promise<void>((_resolve, reject) => {
+                        rejectConnect = reject;
+                    });
+
+                    return;
+                }
+                isReady = true;
+            },
             duplicate: () => makeClient(),
-            on: () => {},
+            on: (event: string, handler: (...args: any[]) => void) => {
+                const handlers = eventHandlers.get(event) ?? [];
+
+                handlers.push(handler);
+                eventHandlers.set(event, handlers);
+            },
+            emit: (event: string, ...args: any[]) => {
+                eventHandlers.get(event)?.forEach((handler) => handler(...args));
+            },
+            setReady: (ready: boolean) => {
+                isReady = ready;
+            },
             subscribe: async (key: string, listener: (message: string) => void) => {
+                if (mockRedisControl.hangSubscribe && !key.endsWith(':__heartbeat__')) {
+                    await new Promise<void>(() => {});
+
+                    return;
+                }
                 if (!channels.has(key)) {
                     channels.set(key, new Set());
                 }
@@ -31,6 +73,10 @@ jest.mock('redis', () => {
                 own.delete(key);
             },
             publish: async (key: string, message: string) => {
+                if (mockRedisControl.failNextPublish) {
+                    mockRedisControl.failNextPublish = false;
+                    throw new Error('publish unavailable');
+                }
                 const subscribers = channels.get(key);
 
                 if (subscribers) {
@@ -44,8 +90,20 @@ jest.mock('redis', () => {
                     channels.get(key)?.delete(listener);
                 }
                 own.clear();
+                isOpen = false;
+                isReady = false;
+            },
+            destroy: () => {
+                isOpen = false;
+                isReady = false;
+                rejectConnect?.(new Error('Redis client destroyed'));
+                rejectConnect = null;
             },
         };
+
+        mockRedisControl.clients.push(client);
+
+        return client;
     };
 
     return {
@@ -62,6 +120,10 @@ describe('RedisDistributedBackend transport', () => {
     let nodeB: RedisDistributedBackend;
 
     beforeEach(async () => {
+        mockRedisControl.failNextPublish = false;
+        mockRedisControl.hangConnect = false;
+        mockRedisControl.hangSubscribe = false;
+        mockRedisControl.clients.length = 0;
         nodeA = new RedisDistributedBackend({ namespace: 'test-ns' });
         nodeB = new RedisDistributedBackend({ namespace: 'test-ns' });
         await nodeA.initialize();
@@ -111,6 +173,169 @@ describe('RedisDistributedBackend transport', () => {
         expect(selfReceived).toHaveLength(0);
     });
 
+    it('deduplicates messages and rejects messages for a different topic', async () => {
+        const received: DistributedChannelMessage[] = [];
+        const message: DistributedChannelMessage = {
+            type: DistributedMessageType.USER_LEFT,
+            endpointName: ENDPOINT,
+            channelName: CHANNEL,
+            userId: 'user1',
+            messageId: 'fixed-message-id',
+            timestamp: Date.now(),
+        };
+
+        await nodeB.subscribeToChannel(ENDPOINT, CHANNEL, (value) => received.push(value));
+        await nodeA.broadcast(ENDPOINT, CHANNEL, message);
+        await nodeA.broadcast(ENDPOINT, CHANNEL, message);
+        await nodeA.broadcast(ENDPOINT, CHANNEL, { ...message,
+            messageId: 'wrong-topic-id',
+            channelName: '/wrong-channel' });
+
+        expect(received).toHaveLength(1);
+        expect(received[0].messageId).toBe('fixed-message-id');
+    });
+
+    it('keeps a shared Redis subscription alive until the last local handler unsubscribes', async () => {
+        const first = jest.fn();
+        const second = jest.fn();
+        const unsubscribeFirst = await nodeB.subscribeToChannel(ENDPOINT, CHANNEL, first);
+        const unsubscribeSecond = await nodeB.subscribeToChannel(ENDPOINT, CHANNEL, second);
+
+        unsubscribeFirst();
+        await nodeA.broadcast(ENDPOINT, CHANNEL, {
+            type: DistributedMessageType.USER_LEFT,
+            endpointName: ENDPOINT,
+            channelName: CHANNEL,
+            userId: 'user1',
+        });
+
+        expect(first).not.toHaveBeenCalled();
+        expect(second).toHaveBeenCalledTimes(1);
+
+        unsubscribeSecond();
+    });
+
+    it('keeps delimiter-containing endpoint and channel topics isolated', async () => {
+        const first = jest.fn();
+        const second = jest.fn();
+
+        await nodeB.subscribeToChannel('/a:b', 'c', first);
+        await nodeB.subscribeToChannel('/a', 'b:c', second);
+
+        await nodeA.broadcast('/a:b', 'c', {
+            type: DistributedMessageType.USER_LEFT,
+            endpointName: '/a:b',
+            channelName: 'c',
+            userId: 'first-user',
+        });
+        await nodeA.broadcast('/a', 'b:c', {
+            type: DistributedMessageType.USER_LEFT,
+            endpointName: '/a',
+            channelName: 'b:c',
+            userId: 'second-user',
+        });
+
+        expect(first).toHaveBeenCalledTimes(1);
+        expect((first.mock.calls[0][0] as any).userId).toBe('first-user');
+        expect(second).toHaveBeenCalledTimes(1);
+        expect((second.mock.calls[0][0] as any).userId).toBe('second-user');
+    });
+
+    it('reports Redis publish failures and rejects the broadcast', async () => {
+        const onError = jest.fn();
+        const node = new RedisDistributedBackend({ namespace: 'publish-error',
+            onError });
+
+        await node.initialize();
+        mockRedisControl.failNextPublish = true;
+
+        await expect(node.broadcast(ENDPOINT, CHANNEL, {
+            type: DistributedMessageType.USER_LEFT,
+            endpointName: ENDPOINT,
+            channelName: CHANNEL,
+            userId: 'user1',
+        })).rejects.toThrow('publish unavailable');
+        expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Failed to publish'),
+        }));
+
+        await node.cleanup();
+    });
+
+    it('reports runtime disconnects, recovery, and terminal cleanup through health', async () => {
+        const [publishClient, subscribeClient] = mockRedisControl.clients.slice(0, 2);
+
+        expect(nodeA.isHealthy()).toBe(true);
+        publishClient.setReady(false);
+        publishClient.emit('error', new Error('connection lost'));
+        expect(nodeA.isHealthy()).toBe(false);
+
+        publishClient.setReady(true);
+        subscribeClient.setReady(true);
+        publishClient.emit('ready');
+        expect(nodeA.isHealthy()).toBe(true);
+
+        await nodeA.cleanup();
+        expect(nodeA.isHealthy()).toBe(false);
+    });
+
+    it('bounds initialization when Redis remains unavailable', async () => {
+        mockRedisControl.hangConnect = true;
+        const node = new RedisDistributedBackend({
+            namespace: 'initialization-timeout',
+            initializationTimeoutMs: 20,
+        });
+
+        await expect(node.initialize()).rejects.toThrow('initialization timed out');
+        mockRedisControl.hangConnect = false;
+        await expect(node.initialize()).resolves.toBeUndefined();
+        await expect(node.cleanup()).resolves.toBeUndefined();
+    });
+
+    it('cancels pending initialization promptly during cleanup', async () => {
+        mockRedisControl.hangConnect = true;
+        const node = new RedisDistributedBackend({
+            namespace: 'initialization-cleanup',
+            initializationTimeoutMs: 60_000,
+        });
+        const initialization = node.initialize();
+        const cleanup = node.cleanup();
+        const result = await Promise.race([
+            cleanup.then(() => 'cleaned'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 250)),
+        ]);
+
+        expect(result).toBe('cleaned');
+        await expect(initialization).rejects.toThrow('destroyed');
+    });
+
+    it('bounds cleanup even when a Redis command never settles', async () => {
+        const node = new RedisDistributedBackend({
+            namespace: 'cleanup-timeout',
+            cleanupTimeoutMs: 20,
+        });
+
+        await node.initialize();
+        mockRedisControl.hangSubscribe = true;
+        void node.subscribeToChannel(ENDPOINT, CHANNEL, jest.fn());
+        await Promise.resolve();
+        await Promise.resolve();
+
+        const result = await Promise.race([
+            node.cleanup().then(() => 'cleaned'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 250)),
+        ]);
+
+        expect(result).toBe('cleaned');
+    });
+
+    it.each([
+        ['initializationTimeoutMs', 0],
+        ['cleanupTimeoutMs', Number.POSITIVE_INFINITY],
+    ] as const)('rejects an invalid %s option', (option, value) => {
+        expect(() => new RedisDistributedBackend({ [option]: value })).toThrow(TypeError);
+    });
+
     it('round-trips USER_MESSAGE preserving camelCase keys', async () => {
         const { received } = await roundTrip({
             type: DistributedMessageType.USER_MESSAGE,
@@ -121,6 +346,7 @@ describe('RedisDistributedBackend transport', () => {
             payload: { text: 'hi' },
             requestId: 'req-1',
             recipientDescriptor: ChannelReceiver.ALL_USERS,
+            action: ServerActions.SYSTEM,
         });
 
         const msg = received[0] as any;
@@ -131,6 +357,7 @@ describe('RedisDistributedBackend transport', () => {
         expect(msg.payload).toEqual({ text: 'hi' });
         expect(msg.requestId).toBe('req-1');
         expect(msg.recipientDescriptor).toBe(ChannelReceiver.ALL_USERS);
+        expect(msg.action).toBe(ServerActions.SYSTEM);
     });
 
     it('round-trips PRESENCE_UPDATE with no event field', async () => {

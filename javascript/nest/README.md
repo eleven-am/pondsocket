@@ -8,7 +8,10 @@ NestJS integration for PondSocket endpoints and channels.
 npm install @eleven-am/pondsocket @eleven-am/pondsocket-common @eleven-am/pondsocket-nest
 ```
 
-`@nestjs/common`, `@nestjs/core`, and `rxjs` are peer dependencies.
+`@nestjs/common`, `@nestjs/core`, and `rxjs` are peer dependencies. NestJS 10,
+11, and 12 are supported. TypeScript consumers need TypeScript 5.3 or newer;
+this is required for declarations that work with both CommonJS Nest 10/11 and
+the ESM packages introduced by Nest 12.
 
 ## Shared schema
 
@@ -118,14 +121,17 @@ import { PondSocketModule } from '@eleven-am/pondsocket-nest';
     imports: [
         PondSocketModule.forRoot({
             providers: [SocketEndpoint, ChatController],
-            isExclusiveSocketServer: false,
         }),
     ],
 })
 export class AppModule {}
 ```
 
-`forRootAsync` accepts the same Nest module metadata plus `inject` and `useFactory`. Its factory can return `backend`, `maxMessageSize`, and `heartbeatInterval`.
+PondSocket owns unmatched WebSocket upgrades by default and rejects them. Set `isExclusiveSocketServer: false` only when another upgrade handler on the same HTTP server is guaranteed to accept or reject every route PondSocket does not handle; otherwise unmatched upgrade sockets can remain open.
+
+Use `maxMessageSize`, `maxBufferedAmount`, `heartbeatInterval`, `connectionTimeout`, `joinTimeout`, `eventTimeout`, and the `maxPending*` options to bound frames, socket buffers, handler lifetimes, concurrent joins, and queued work. Core transport failures are reported through Nest's logger.
+
+`forRootAsync` accepts the same limits through `useFactory`, plus `backend`; `inject` works like other Nest async modules.
 
 ## Client
 

@@ -12,8 +12,18 @@ import {
     PondSocket,
 } from '@eleven-am/pondsocket';
 import type { Endpoint, IDistributedBackend } from '@eleven-am/pondsocket/types';
-import { Logger, OnModuleDestroy, OnModuleInit, PipeTransform, Type } from '@nestjs/common';
-import { DiscoveryService, HttpAdapterHost, ModuleRef } from '@nestjs/core';
+import { Logger, Scope } from '@nestjs/common';
+import type {
+    OnModuleDestroy,
+    OnModuleInit,
+    PipeTransform,
+    Type,
+} from '@nestjs/common' with { 'resolution-mode': 'import' };
+import type {
+    DiscoveryService,
+    HttpAdapterHost,
+    ModuleRef,
+} from '@nestjs/core' with { 'resolution-mode': 'import' };
 
 import { manageChannel } from '../managers/channel';
 import { manageChannelInstance } from '../managers/channelInstance';
@@ -42,6 +52,14 @@ export class PondSocketService implements OnModuleInit, OnModuleDestroy {
 
     private socket: PondSocket | null = null;
 
+    private initialization: Promise<void> | null = null;
+
+    private destruction: Promise<void> | null = null;
+
+    private destroyRequested = false;
+
+    private readonly registrationCleanups = new Set<() => void>();
+
     constructor (
         private readonly moduleRef: ModuleRef,
         private readonly discovery: DiscoveryService,
@@ -52,6 +70,15 @@ export class PondSocketService implements OnModuleInit, OnModuleDestroy {
         private readonly distributedBackend?: IDistributedBackend,
         private readonly maxMessageSize?: number,
         private readonly heartbeatInterval?: number,
+        private readonly maxBufferedAmount?: number,
+        private readonly connectionTimeout?: number,
+        private readonly joinTimeout?: number,
+        private readonly maxPendingJoins?: number,
+        private readonly maxPendingMessagesPerUser?: number,
+        private readonly maxPendingBytesPerUser?: number,
+        private readonly maxPendingMessagesPerSocket?: number,
+        private readonly maxPendingBytesPerSocket?: number,
+        private readonly eventTimeout?: number,
     ) {}
 
     get pondSocket (): PondSocket | null {
@@ -59,36 +86,104 @@ export class PondSocketService implements OnModuleInit, OnModuleDestroy {
     }
 
     isHealthy (): boolean {
-        return this.socket?.isHealthy() ?? false;
+        return !this.destroyRequested && (this.socket?.isHealthy() ?? false);
     }
 
-    async onModuleInit () {
-        const instances = this.getGroupedInstances();
+    onModuleInit (): Promise<void> {
+        if (this.destroyRequested) {
+            return Promise.reject(new Error('PondSocketService cannot initialize after shutdown has begun'));
+        }
 
-        this.socket = new PondSocket({
+        if (!this.initialization) {
+            this.initialization = this.initialize();
+        }
+
+        return this.initialization;
+    }
+
+    onModuleDestroy (): Promise<void> {
+        this.destroyRequested = true;
+
+        if (!this.destruction) {
+            this.destruction = this.destroy();
+        }
+
+        return this.destruction;
+    }
+
+    private async initialize () {
+        const instances = this.getGroupedInstances();
+        const socket = new PondSocket({
             server: this.adapterHost.httpAdapter.getHttpServer(),
             closeHttpServerOnShutdown: false,
             exclusiveServer: this.isExclusiveSocketServer,
             distributedBackend: this.distributedBackend,
             maxMessageSize: this.maxMessageSize,
+            maxBufferedAmount: this.maxBufferedAmount,
             heartbeatInterval: this.heartbeatInterval,
+            connectionTimeout: this.connectionTimeout,
+            joinTimeout: this.joinTimeout,
+            maxPendingJoins: this.maxPendingJoins,
+            maxPendingMessagesPerUser: this.maxPendingMessagesPerUser,
+            maxPendingBytesPerUser: this.maxPendingBytesPerUser,
+            maxPendingMessagesPerSocket: this.maxPendingMessagesPerSocket,
+            maxPendingBytesPerSocket: this.maxPendingBytesPerSocket,
+            eventTimeout: this.eventTimeout,
+            onError: (error) => this.logger.error(error.message, error.stack),
         });
 
-        await this.socket.ready();
-        instances.forEach((instance) => this.manageEndpoint(this.socket!, instance));
+        this.socket = socket;
+
+        try {
+            await socket.ready();
+
+            if (this.destroyRequested) {
+                throw new Error('PondSocketService shutdown began during initialization');
+            }
+
+            instances.forEach((instance) => this.manageEndpoint(socket, instance));
+        } catch (error) {
+            if (this.socket === socket) {
+                this.socket = null;
+            }
+
+            this.clearRegistrations();
+
+            try {
+                await socket.closeAsync();
+            } catch (closeError) {
+                const message = closeError instanceof Error ? closeError.message : String(closeError);
+
+                this.logger.error(`Failed to close PondSocket after initialization error: ${message}`);
+            }
+
+            throw error;
+        }
     }
 
-    async onModuleDestroy () {
+    private async destroy () {
+        try {
+            await this.initialization;
+        } catch {
+            // Initialization performs its own rollback. Shutdown remains idempotent.
+        }
+
         const socket = this.socket;
 
         this.socket = null;
+        this.clearRegistrations();
         await socket?.closeAsync();
+    }
+
+    private clearRegistrations () {
+        this.registrationCleanups.forEach((cleanup) => cleanup());
+        this.registrationCleanups.clear();
     }
 
     private manageEndpoint (socket: PondSocket, groupedInstance: GroupedInstances) {
         const instance = groupedInstance.endpoint.instance;
         const registration = this.getEndpointRegistration(groupedInstance.endpoint);
-        const { set: setEndpoint } = manageEndpointInstance(instance);
+        const { clear: clearEndpoint, set: setEndpoint } = manageEndpointInstance(instance);
 
         if (!registration) {
             return;
@@ -115,6 +210,7 @@ export class PondSocketService implements OnModuleInit, OnModuleDestroy {
         }
 
         setEndpoint(endpoint);
+        this.registrationCleanups.add(clearEndpoint);
         groupedInstance.channels.forEach((channel) => this.manageChannel(channel, endpoint, endpointPath));
     }
 
@@ -126,7 +222,7 @@ export class PondSocketService implements OnModuleInit, OnModuleDestroy {
             return;
         }
 
-        const { set: setChannel } = manageChannelInstance(instance);
+        const { clear: clearChannel, set: setChannel } = manageChannelInstance(instance);
         const joinHandlers = [
             ...manageJoin(instance).get(),
             ...this.getDefinitionHandlers(instance, registration, 'join'),
@@ -149,6 +245,7 @@ export class PondSocketService implements OnModuleInit, OnModuleDestroy {
         }
 
         setChannel(channelInstance);
+        this.registrationCleanups.add(clearChannel);
 
         const eventHandlers = [
             ...manageEvent(instance).get(),
@@ -287,14 +384,47 @@ export class PondSocketService implements OnModuleInit, OnModuleDestroy {
         const providers = new Map<Type, PondProvider>();
 
         wrappers.forEach((wrapper) => {
-            if (wrapper.instance && typeof wrapper.metatype === 'function') {
-                providers.set(wrapper.metatype as Type, {
-                    host: wrapper.host,
-                    instance: wrapper.instance,
-                    metatype: wrapper.metatype as Type,
-                    name: String(wrapper.name ?? wrapper.metatype.name),
-                });
+            if (typeof wrapper.metatype !== 'function') {
+                return;
             }
+
+            const metatype = wrapper.metatype as Type;
+            const isPondProvider = Boolean(
+                getPondMetadata<PondEndpointClassMetadata>(metatype, pondEndpointMetadataKey) ||
+                getPondMetadata<PondChannelClassMetadata>(metatype, pondChannelMetadataKey) ||
+                manageEndpoint(metatype).get() ||
+                manageChannel(metatype).get(),
+            );
+            const isScoped = wrapper.scope === Scope.REQUEST || wrapper.scope === Scope.TRANSIENT;
+            const hasStaticDependencies = typeof wrapper.isDependencyTreeStatic !== 'function' ||
+                wrapper.isDependencyTreeStatic();
+
+            if (isPondProvider && (isScoped || !hasStaticDependencies)) {
+                throw new Error(
+                    `${metatype.name} must be a singleton provider; request-scoped and transient PondSocket endpoints/channels are not supported`,
+                );
+            }
+
+            if (!wrapper.instance) {
+                if (isPondProvider) {
+                    throw new Error(`${metatype.name} was not instantiated as a singleton Nest provider`);
+                }
+
+                return;
+            }
+
+            const existing = providers.get(metatype);
+
+            if (isPondProvider && existing && existing.instance !== wrapper.instance) {
+                throw new Error(`${metatype.name} is registered as multiple Nest provider instances`);
+            }
+
+            providers.set(metatype, {
+                host: wrapper.host,
+                instance: wrapper.instance,
+                metatype,
+                name: String(wrapper.name ?? wrapper.metatype.name),
+            });
         });
 
         return [...providers.values()];

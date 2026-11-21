@@ -39,64 +39,122 @@ export class Middleware<Request, Response> {
      */
     public run (req: Request, res: Response, final: NextFunction) {
         let index = 0;
+        let settled = false;
 
-        const next: NextFunction = (err?: HttpError) => {
-            if (err) {
-                return final(this.#handleError(err));
+        const finish: NextFunction = (err?: HttpError) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            final(err);
+        };
+
+        const dispatch = () => {
+            if (settled) {
+                return;
             }
 
             if (index >= this.#stack.length) {
-                return final();
+                finish();
+
+                return;
             }
 
             const middleware = this.#stack[index];
+            let delegated = false;
 
             index++;
+            const next: NextFunction = (err?: HttpError) => {
+                if (delegated || settled) {
+                    return;
+                }
+                delegated = true;
+
+                if (err) {
+                    finish(this.#handleError(err));
+
+                    return;
+                }
+
+                dispatch();
+            };
 
             try {
                 const result = middleware(req, res, next);
 
                 if (result instanceof Promise) {
-                    result.catch((error) => {
-                        try {
-                            final(this.#handleError(error));
-                        } catch (_) {
-                            void 0;
+                    void result.catch((error) => {
+                        if (!delegated) {
+                            finish(this.#handleError(error));
                         }
                     });
                 }
             } catch (error) {
-                return final(this.#handleError(error));
+                if (!delegated) {
+                    finish(this.#handleError(error));
+                }
             }
         };
 
-        next();
+        dispatch();
     }
 
-    runAsync (req: Request, res: Response, final: NextFunction): Promise<void> {
+    async runAsync (req: Request, res: Response, final: NextFunction): Promise<void> {
         let index = 0;
+        let settled = false;
 
-        const next = async (err?: HttpError) => {
-            if (err) {
-                return final(this.#handleError(err));
+        const finish: NextFunction = (err?: HttpError) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            final(err);
+        };
+
+        const dispatch = async (): Promise<void> => {
+            if (settled) {
+                return;
             }
 
             if (index >= this.#stack.length) {
-                return final();
+                finish();
+
+                return;
             }
 
             const middleware = this.#stack[index];
+            let delegated = false;
+            let delegatedWork: Promise<void> | null = null;
 
             index++;
+            const next: NextFunction = (err?: HttpError) => {
+                if (delegated || settled) {
+                    return;
+                }
+                delegated = true;
+
+                if (err) {
+                    finish(this.#handleError(err));
+                    delegatedWork = Promise.resolve();
+
+                    return;
+                }
+
+                delegatedWork = dispatch();
+            };
 
             try {
                 await middleware(req, res, next);
             } catch (error) {
-                return final(this.#handleError(error));
+                if (!delegated) {
+                    finish(this.#handleError(error));
+                }
             }
+
+            await delegatedWork;
         };
 
-        return next();
+        await dispatch();
     }
 
     #handleError (error: unknown): HttpError {

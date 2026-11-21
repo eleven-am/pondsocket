@@ -8,6 +8,7 @@ import { LobbyEngine } from '../../engines/lobbyEngine';
 export class MockLobbyEngine extends LobbyEngine {
     middleware = {
         run: jest.fn(),
+        runAsync: jest.fn().mockResolvedValue(undefined),
         use: jest.fn(),
     } as unknown as Middleware<BroadcastEvent, ChannelEngine>;
 

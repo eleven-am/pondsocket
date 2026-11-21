@@ -21,6 +21,16 @@ jobs:
   validate:
     name: Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     strategy:
       fail-fast: false
       matrix:
@@ -44,3 +54,46 @@ jobs:
 
       - name: Validate packages
         run: npm run validate
+        env:
+          PONDSOCKET_REDIS_URL: redis://127.0.0.1:6379
+
+  nest-compatibility:
+    name: NestJS ${{ matrix.nest-version }} / TypeScript ${{ matrix.typescript-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nest-version: [10, 11, 12]
+        typescript-version: [5.3.3]
+    defaults:
+      run:
+        working-directory: javascript
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: javascript/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Select compatibility versions
+        run: >-
+          npm install --no-save --package-lock=false --ignore-scripts --no-audit --no-fund
+          @nestjs/common@${{ matrix.nest-version }}
+          @nestjs/core@${{ matrix.nest-version }}
+          typescript@${{ matrix.typescript-version }}
+
+      - name: Build compatibility target
+        run: npm run build:common && npm run build:core && npm run build:nest
+
+      - name: Test NestJS integration
+        run: npm run test:nest
+
+      - name: Verify installed package declarations
+        run: npm run pack:check

@@ -1,6 +1,6 @@
 {
   "name": "@eleven-am/pondsocket",
-  "version": "0.1.219",
+  "version": "0.1.220",
   "description": "Typed WebSocket and SSE server with presence and distributed messaging.",
   "keywords": [
     "pondsocket",
@@ -28,6 +28,13 @@
   "type": "commonjs",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "types": [
+        "./dist/index.d.ts"
+      ]
+    }
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -55,11 +62,11 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@eleven-am/pondsocket-common": "^0.0.41",
+    "@eleven-am/pondsocket-common": "^0.0.42",
     "@types/node": "^20.19.43",
     "@types/ws": "^8.18.1",
     "redis": "^6.1.0",
-    "ws": "^8.21.0"
+    "ws": "^8.23.0"
   },
   "jest": {
     "moduleFileExtensions": [
