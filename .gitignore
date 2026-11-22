@@ -1,4 +1,6 @@
 #ignore all the node modules and dists in the packages subfolders
+.DS_Store
+**/.DS_Store
 javascript/*/node_modules
 javascript/*/dist
 javascript/*/coverage

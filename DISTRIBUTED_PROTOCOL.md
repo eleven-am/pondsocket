@@ -1,9 +1,22 @@
 # PondSocket Distributed Protocol v1
 
-All PondSocket implementations use this protocol for server-to-server distribution.
-It is intentionally separate from the client WebSocket/SSE wire format.
+This file is the canonical contract for server-to-server distribution across the
+JavaScript, Go, Python, and Rust implementations of PondSocket. It is separate
+from the client WebSocket/SSE wire format.
 
-## Topics
+All runtimes MUST produce and consume the shapes below. A difference between an
+implementation and this document is a conformance bug; protocol changes require
+updating this document and the cross-runtime tests together.
+
+The JavaScript reference implementation lives in:
+
+- `javascript/core/src/abstracts/distributor.ts` for envelopes, Redis topics,
+  heartbeats, validation, deduplication, and self-filtering.
+- `javascript/core/src/engines/channelEngine.ts` for state synchronization,
+  node/user tracking, presence, assigns, and stale-node cleanup.
+- `javascript/core/src/types.ts` for message types and TypeScript shapes.
+
+## Redis topics
 
 Channel topic:
 
@@ -17,11 +30,13 @@ Heartbeat topic:
 pondsocket:v1:<namespace>:__heartbeat__
 ```
 
-The default namespace is `default`.
+The default namespace is `default`. `endpointName` has its leading slash removed;
+`channelName` is kept verbatim. JavaScript and Python can configure the key prefix,
+but `pondsocket` MUST be used when interoperating with Go or Rust nodes.
 
 ## Envelope
 
-Every distributed message is a UTF-8 JSON object:
+Every message is a UTF-8 JSON object with camelCase fields:
 
 ```json
 {
@@ -36,29 +51,41 @@ Every distributed message is a UTF-8 JSON object:
 }
 ```
 
-Implementations must ignore messages with their own `sourceNodeId`.
-`endpointName` is the endpoint path with its leading slash removed, matching the
-endpoint segment used in the Redis topic.
+The envelope fields are required: `protocol`, `version`, `type`, `messageId`,
+`sourceNodeId`, `endpointName`, `channelName`, and `timestamp` (epoch milliseconds).
+Receivers MUST reject malformed or unsupported envelopes, ignore messages from
+their own `sourceNodeId`, and deduplicate repeated `messageId` values within their
+configured deduplication window.
 
-## Message Types
+## Message types and payloads
 
-- `STATE_REQUEST`
-- `STATE_RESPONSE`
-- `USER_JOINED`
-- `USER_LEFT`
-- `USER_MESSAGE`
-- `PRESENCE_UPDATE`
-- `PRESENCE_REMOVED`
-- `ASSIGNS_UPDATE`
-- `EVICT_USER`
-- `USER_REMOVE`
-- `USER_GET_REQUEST`
-- `USER_GET_RESPONSE`
-- `NODE_HEARTBEAT`
+`?` marks an optional field. Each runtime MUST both produce and consume all 13
+message types.
 
-## Recipient Descriptors
+1. `USER_MESSAGE` — `fromUserId`, `event`, `payload`, `requestId?`, and
+   `recipientDescriptor`.
+2. `PRESENCE_UPDATE` — `userId` and `presence`. There is no `event` field; join
+   and update both upsert presence.
+3. `PRESENCE_REMOVED` — `userId`. Consumers remove that user's presence.
+4. `ASSIGNS_UPDATE` — producers send `userId` and the complete post-update
+   `assigns` snapshot. Consumers also accept `key`/`value` delta fields when
+   `assigns` is absent for legacy compatibility.
+5. `EVICT_USER` — `userId` and `reason?`.
+6. `USER_REMOVE` — `userId`.
+7. `USER_GET_REQUEST` — `userId`, `requestId`, and `fromNode`.
+8. `USER_GET_RESPONSE` — `userId`, `requestId`, `assigns`, and `presence`.
+9. `USER_JOINED` — `userId`, `presence`, and `assigns`.
+10. `USER_LEFT` — `userId`.
+11. `STATE_REQUEST` — `fromNode`. A receiving peer replies with its local users
+    in a `STATE_RESPONSE`.
+12. `STATE_RESPONSE` — `users`, an array of `{ id, assigns, presence }`. The user
+    identifier key is `id`, not `userId`.
+13. `NODE_HEARTBEAT` — sent on the heartbeat topic with the full envelope and
+    `nodeId`; `nodeId` MUST equal `sourceNodeId`.
 
-`USER_MESSAGE.recipientDescriptor` is one of:
+## Recipient descriptors
+
+`USER_MESSAGE.recipientDescriptor` is exactly one of:
 
 ```json
 "ALL_USERS"
@@ -72,48 +99,29 @@ endpoint segment used in the Redis topic.
 ["user-1", "user-2"]
 ```
 
-These names match the existing client/common enums.
+Every runtime MUST support all three forms.
 
-## Presence
+## State synchronization and liveness
 
-Presence updates are distributed as:
+- When a node subscribes to a channel, it emits `STATE_REQUEST`; peers answer with
+  `STATE_RESPONSE` containing their local users.
+- Node-to-user membership is tracked from `STATE_RESPONSE`, `USER_JOINED`, and
+  `USER_LEFT` messages.
+- A node publishes `NODE_HEARTBEAT` every 30 seconds by default.
+- A node is stale after 90 seconds without a heartbeat by default. Its tracked
+  users, presence, and assigns are then removed.
+- State synchronization MUST use `STATE_REQUEST` and `STATE_RESPONSE`; it must not
+  be tunneled through presence event values.
 
-```json
-{
-  "type": "PRESENCE_UPDATE",
-  "userId": "user-1",
-  "presence": { "status": "online" }
-}
-```
+## Conformance tests
 
-Presence removals are distributed as:
+Every runtime MUST keep tests for:
 
-```json
-{
-  "type": "PRESENCE_REMOVED",
-  "userId": "user-1"
-}
-```
+1. Encode/decode round trips for all 13 message types, including exact camelCase
+   wire keys and values.
+2. All three `recipientDescriptor` forms.
+3. Two-node integration covering presence propagation, assigns propagation,
+   `STATE_REQUEST`/`STATE_RESPONSE`, and heartbeat-driven stale-node cleanup.
 
-Implementations may include a client-shaped `payload`, `event`, or
-`presenceEvent` for local or legacy compatibility, but `userId` and `presence`
-are the canonical cross-runtime fields. Consumers must not require those
-optional compatibility fields.
-
-## Assigns
-
-Assign updates are distributed as:
-
-```json
-{
-  "type": "ASSIGNS_UPDATE",
-  "userId": "user-1",
-  "key": "role",
-  "value": "admin",
-  "assigns": { "role": "admin" }
-}
-```
-
-`assigns` is the canonical post-update assigns snapshot for the user. `key` and
-`value` are optional delta fields and exist so runtimes can process partial
-updates without losing compatibility.
+All four runtime test suites must remain green for a protocol change to be
+considered conformant.
