@@ -4,6 +4,8 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 
+import pytest
+
 from pondsocket.channel import (
     Channel,
     ChannelOptions,
@@ -13,6 +15,7 @@ from pondsocket.channel import (
 from pondsocket.distributed_wire import distributed_bytes, heartbeat_bytes, parse_envelope
 from pondsocket.heartbeat import HeartbeatCoordinator
 from pondsocket.in_memory_transport import InMemoryTransport
+from pondsocket.lobby import Lobby
 from pondsocket.pubsub_local import LocalPubSub
 from pondsocket.types import DistributedMessageType, Event, InternalActions, Options
 from pondsocket_common import ServerActions
@@ -497,3 +500,53 @@ async def test_heartbeat_stale_node_cleanup_evicts_remote_users() -> None:
     await ch_b.close()
     await coord_b.close()
     await bus.close()
+
+
+async def test_heartbeat_start_surfaces_subscription_failure() -> None:
+    class FailingPubSub:
+        async def subscribe(self, pattern: str, handler: object) -> None:
+            del pattern, handler
+            raise RuntimeError("subscribe failed")
+
+        async def unsubscribe(self, pattern: str) -> None:
+            del pattern
+
+        async def publish(self, topic: str, data: bytes) -> None:
+            del topic, data
+
+        async def close(self) -> None:
+            return
+
+    coordinator = HeartbeatCoordinator(FailingPubSub(), "node-a")  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="subscribe failed"):
+        await coordinator.start()
+
+    assert coordinator._started is False  # type: ignore[attr-defined]
+
+
+async def test_channel_start_surfaces_pubsub_subscription_failure() -> None:
+    class FailingPubSub:
+        async def subscribe(self, pattern: str, handler: object) -> None:
+            del pattern, handler
+            raise RuntimeError("subscribe failed")
+
+        async def unsubscribe(self, pattern: str) -> None:
+            del pattern
+
+        async def publish(self, topic: str, data: bytes) -> None:
+            del topic, data
+
+        async def close(self) -> None:
+            return
+
+    lobby = Lobby(
+        path="/room/:id",
+        endpoint_path="/socket",
+        options=Options(node_id="node-a"),
+        pubsub=FailingPubSub(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="subscribe failed"):
+        await lobby.get_or_create_channel("/room/1")
+
+    assert await lobby.get_channel("/room/1") is None

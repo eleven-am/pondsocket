@@ -19,6 +19,12 @@ class PubSubClosedError(Exception):
         super().__init__("pubsub: closed")
 
 
+class PubSubBackpressureError(Exception):
+    def __init__(self, topic: str) -> None:
+        super().__init__(f"pubsub: subscriber queue is full for topic {topic!r}")
+        self.topic = topic
+
+
 def match_topic(pattern: str, topic: str) -> bool:
     if pattern == topic:
         return True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -132,6 +133,37 @@ class Options:
     heartbeat_timeout: float = 90.0
     user_get_timeout: float = 0.5
     hooks: Hooks | None = None
+
+    def __post_init__(self) -> None:
+        positive_integers: dict[str, int] = {
+            "max_message_size": self.max_message_size,
+            "internal_queue_buffer": self.internal_queue_buffer,
+            "dispatch_concurrency": self.dispatch_concurrency,
+            "send_channel_buffer": self.send_channel_buffer,
+            "receive_channel_buffer": self.receive_channel_buffer,
+            "max_concurrent_handlers": self.max_concurrent_handlers,
+        }
+        for integer_name, integer_value in positive_integers.items():
+            if integer_value <= 0:
+                raise ValueError(f"{integer_name} must be greater than zero")
+        if self.max_connections < 0:
+            raise ValueError("max_connections must be zero or greater")
+
+        positive_floats: dict[str, float] = {
+            "ping_interval": self.ping_interval,
+            "pong_wait": self.pong_wait,
+            "write_wait": self.write_wait,
+            "send_timeout": self.send_timeout,
+            "internal_queue_timeout": self.internal_queue_timeout,
+            "heartbeat_interval": self.heartbeat_interval,
+            "heartbeat_timeout": self.heartbeat_timeout,
+            "user_get_timeout": self.user_get_timeout,
+        }
+        for float_name, float_value in positive_floats.items():
+            if not math.isfinite(float_value) or float_value <= 0:
+                raise ValueError(f"{float_name} must be a finite value greater than zero")
+        if self.heartbeat_timeout <= self.heartbeat_interval:
+            raise ValueError("heartbeat_timeout must be greater than heartbeat_interval")
 
 
 Recipients: TypeAlias = ChannelReceivers

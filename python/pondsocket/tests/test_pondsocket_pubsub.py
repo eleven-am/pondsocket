@@ -7,6 +7,7 @@ import pytest
 from pondsocket.errors import PondError
 from pondsocket.pubsub import (
     PubSub,
+    PubSubBackpressureError,
     PubSubClosedError,
     format_message_topic,
     format_presence_topic,
@@ -180,7 +181,7 @@ async def test_handler_exception_does_not_kill_subscription() -> None:
     await bus.close()
 
 
-async def test_full_queue_drops_silently() -> None:
+async def test_full_queue_fails_explicitly_without_partial_enqueue() -> None:
     bus = LocalPubSub(buffer_size=1)
 
     started = asyncio.Event()
@@ -195,10 +196,15 @@ async def test_full_queue_drops_silently() -> None:
     await bus.publish("topic.x", b"1")
     await started.wait()
 
-    for i in range(10):
-        await bus.publish("topic.x", b"")
-        _ = i
+    await bus.publish("topic.x", b"queued")
+    with pytest.raises(PubSubBackpressureError, match=r"topic\.x"):
+        await bus.publish("topic.x", b"overflow")
 
     proceed.set()
     await asyncio.sleep(0.02)
     await bus.close()
+
+
+def test_invalid_buffer_size_is_rejected() -> None:
+    with pytest.raises(ValueError, match="buffer_size"):
+        LocalPubSub(buffer_size=0)

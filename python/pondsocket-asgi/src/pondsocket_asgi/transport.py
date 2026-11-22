@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeAlias
 
 from pondsocket.errors import internal
 from pondsocket.transport import OnCloseCallback, OnMessageHandler
-from pondsocket.types import Event, SystemEntity, TransportType
+from pondsocket.types import DEFAULT_MAX_MESSAGE_SIZE, Event, SystemEntity, TransportType
 from pondsocket_common import ErrorTypes, ServerActions, ValidationError, uuid
 
 from ._serialize import event_to_json, parse_inbound_text
@@ -22,6 +23,7 @@ class ASGIWebSocketTransport:
         "_close_callbacks",
         "_closed_event",
         "_id",
+        "_max_message_size",
         "_message_handler",
         "_receive",
         "_receive_task",
@@ -36,7 +38,10 @@ class ASGIWebSocketTransport:
         send: ASGISend,
         receive: ASGIReceive,
         assigns: dict[str, Any] | None = None,
+        max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
     ) -> None:
+        if max_message_size <= 0:
+            raise ValueError("max_message_size must be greater than zero")
         self._id = id
         self._send = send
         self._receive = receive
@@ -44,6 +49,7 @@ class ASGIWebSocketTransport:
         self._active = True
         self._close_callbacks: list[OnCloseCallback] = []
         self._message_handler: OnMessageHandler | None = None
+        self._max_message_size = max_message_size
         self._receive_task: asyncio.Task[None] | None = None
         self._closed_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
@@ -86,8 +92,14 @@ class ASGIWebSocketTransport:
         except Exception:
             pass
         await self._fire_close_callbacks()
-        if self._receive_task is not None and not self._receive_task.done():
+        if (
+            self._receive_task is not None
+            and self._receive_task is not asyncio.current_task()
+            and not self._receive_task.done()
+        ):
             self._receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receive_task
         self._closed_event.set()
 
     def on_close(self, callback: OnCloseCallback) -> None:
@@ -139,6 +151,12 @@ class ASGIWebSocketTransport:
             except UnicodeDecodeError:
                 await self._send_invalid_message("Binary frame is not valid UTF-8")
                 return
+            size = len(bytes_payload)
+        else:
+            size = len(text.encode("utf-8"))
+        if size > self._max_message_size:
+            await self.close(code=1009, reason="message too large")
+            return
         try:
             event = parse_inbound_text(text)
         except (ValidationError, RecursionError) as e:

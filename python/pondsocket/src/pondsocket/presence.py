@@ -115,3 +115,7 @@ class PresenceClient:
     async def len(self) -> int:
         async with self._lock:
             return len(self._store)
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._store.clear()

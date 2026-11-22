@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from pondsocket_client import (
     BaseClient,
     ClientOptions,
     ConnectionState,
 )
+from pondsocket_client._base import _reconnect_delay
 
 from pondsocket_common import ClientMessage
 
@@ -112,9 +114,11 @@ async def test_create_channel_does_not_replace_one_still_flushing_leave() -> Non
     channel = client.create_channel("/chat/1", {})
     channel.join()
     await asyncio.sleep(0)
+    join_request_id = channel._join_request_id  # type: ignore[attr-defined]
+    assert join_request_id is not None
     client._handle_inbound_text(
         '{"action":"SYSTEM","event":"ACKNOWLEDGE","channelName":"/chat/1",'
-        '"requestId":"r1","payload":{}}'
+        f'"requestId":"{join_request_id}","payload":{{}}}}'
     )
     channel.leave()
     await asyncio.sleep(0)
@@ -165,6 +169,8 @@ async def test_inbound_text_routes_to_matching_channel() -> None:
     channel = client.create_channel("/chat/42", {})
     channel.join()
     await asyncio.sleep(0)
+    join_request_id = channel._join_request_id  # type: ignore[attr-defined]
+    assert join_request_id is not None
     received: list[str] = []
 
     def on_msg(msg) -> None:  # type: ignore[no-untyped-def]
@@ -172,7 +178,8 @@ async def test_inbound_text_routes_to_matching_channel() -> None:
 
     channel.on_message(on_msg)
     client._handle_inbound_text(
-        '{"action":"SYSTEM","event":"ACKNOWLEDGE","channelName":"/chat/42","requestId":"r1","payload":{}}'
+        '{"action":"SYSTEM","event":"ACKNOWLEDGE","channelName":"/chat/42",'
+        f'"requestId":"{join_request_id}","payload":{{}}}}'
     )
     client._handle_inbound_text(
         '{"action":"BROADCAST","event":"ping","channelName":"/chat/42","requestId":"r2","payload":{"text":"hi"}}'
@@ -186,12 +193,14 @@ async def test_newline_batched_inbound_frames_are_dispatched_in_order() -> None:
     await client.connect()
     channel = client.create_channel("/chat/42", {})
     channel.join()
+    join_request_id = channel._join_request_id  # type: ignore[attr-defined]
+    assert join_request_id is not None
     received: list[str] = []
     channel.on_message(lambda msg: received.append(msg.event))
 
     client._handle_inbound_text(
         '{"action":"SYSTEM","event":"ACKNOWLEDGE","channelName":"/chat/42",'
-        '"requestId":"join","payload":{}}\n'
+        f'"requestId":"{join_request_id}","payload":{{}}}}\n'
         '{"action":"BROADCAST","event":"first","channelName":"/chat/42",'
         '"requestId":"r1","payload":{}}\n'
         '{"action":"BROADCAST","event":"second","channelName":"/chat/42",'
@@ -230,6 +239,28 @@ async def test_options_can_be_provided() -> None:
     assert client.options.max_queue_size == 50
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connection_timeout", 0.0),
+        ("base_reconnect_delay", 0.0),
+        ("max_reconnect_delay", 0.0),
+        ("max_reconnect_attempts", -2),
+        ("max_queue_size", 0),
+        ("response_timeout", 0.0),
+        ("ping_interval", 0.0),
+    ],
+)
+def test_invalid_client_options_fail_immediately(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        ClientOptions(**{field: value})  # type: ignore[arg-type]
+
+
+def test_reconnect_delay_caps_without_huge_exponentiation() -> None:
+    options = ClientOptions(base_reconnect_delay=0.001, max_reconnect_delay=30.0)
+    assert _reconnect_delay(options, 1_000_000) == 30.0
+
+
 async def test_transport_sends_are_serialized_across_channels() -> None:
     class _SlowClient(_FakeClient):
         __slots__ = ("active_sends", "peak_active_sends")
@@ -255,13 +286,17 @@ async def test_transport_sends_are_serialized_across_channels() -> None:
     first.join()
     second.join()
     await asyncio.sleep(0.01)
+    first_join_id = first._join_request_id  # type: ignore[attr-defined]
+    second_join_id = second._join_request_id  # type: ignore[attr-defined]
+    assert first_join_id is not None
+    assert second_join_id is not None
     client._handle_inbound_text(
         '{"action":"SYSTEM","event":"ACKNOWLEDGE","channelName":"/first",'
-        '"requestId":"r1","payload":{}}'
+        f'"requestId":"{first_join_id}","payload":{{}}}}'
     )
     client._handle_inbound_text(
         '{"action":"SYSTEM","event":"ACKNOWLEDGE","channelName":"/second",'
-        '"requestId":"r2","payload":{}}'
+        f'"requestId":"{second_join_id}","payload":{{}}}}'
     )
     first.send_message("one", {})
     second.send_message("two", {})

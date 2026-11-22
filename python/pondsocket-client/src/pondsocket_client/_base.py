@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+import math
 from collections.abc import Callable
 from typing import TypeAlias, TypeVar
 
@@ -28,6 +29,17 @@ ErrorHandler: TypeAlias = Callable[[BaseException], None]
 PresenceT = TypeVar("PresenceT")
 AssignsT = TypeVar("AssignsT")
 JoinParamsT = TypeVar("JoinParamsT")
+
+
+def _reconnect_delay(options: ClientOptions, attempts: int) -> float:
+    base = options.base_reconnect_delay
+    maximum = options.max_reconnect_delay
+    if attempts <= 0 or base >= maximum:
+        return min(base, maximum)
+    doublings_to_cap = math.ceil(math.log2(maximum / base))
+    if attempts >= doublings_to_cap:
+        return maximum
+    return float(min(base * (2**attempts), maximum))
 
 
 class BaseClient(abc.ABC):
@@ -212,10 +224,7 @@ class BaseClient(abc.ABC):
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
-        delay = min(
-            self._options.base_reconnect_delay * (2 ** self._reconnect_attempts),
-            self._options.max_reconnect_delay,
-        )
+        delay = _reconnect_delay(self._options, self._reconnect_attempts)
         self._reconnect_attempts += 1
         self._reconnect_task = asyncio.create_task(self._reconnect_after(delay))
         self._reconnect_task.add_done_callback(self._on_reconnect_task_done)

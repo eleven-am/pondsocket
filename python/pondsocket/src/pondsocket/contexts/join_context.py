@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 from pondsocket_common import (
@@ -68,16 +69,21 @@ class JoinContext:
         async with self._lock:
             if self._responded:
                 raise bad_request(self.channel.name, "Already responded to the join request")
+            if assigns:
+                for k, v in assigns.items():
+                    self.transport.set_assign(k, v)
+            await self.channel.add_user(self.transport)
+            try:
+                await self.channel.send_acknowledge(
+                    self.event.request_id,
+                    self.transport.get_id(),
+                )
+            except BaseException:
+                with contextlib.suppress(BaseException):
+                    await self.channel.remove_user(self.transport.get_id())
+                raise
             self._responded = True
             self._accepted = True
-        if assigns:
-            for k, v in assigns.items():
-                self.transport.set_assign(k, v)
-        await self.channel.add_user(self.transport)
-        await self.channel.send_acknowledge(
-            self.event.request_id,
-            self.transport.get_id(),
-        )
         return self
 
     async def decline(self, code: int, message: str) -> None:

@@ -30,6 +30,16 @@ from pondsocket_common import (
     uuid,
 )
 
+_LATEST_JOIN_REQUEST_IDS: dict[str, str] = {}
+
+
+class _TrackedChannel(Channel):
+    def join(self) -> None:
+        super().join()
+        request_id = self._join_request_id  # type: ignore[attr-defined]
+        if request_id is not None:
+            _LATEST_JOIN_REQUEST_IDS[self.name] = request_id
+
 
 def _server_msg(
     channel: str,
@@ -39,6 +49,17 @@ def _server_msg(
     request_id: str | None = None,
     payload: dict | None = None,
 ) -> ServerMessage:
+    if (
+        request_id is None
+        and action == ServerActions.SYSTEM
+        and event
+        in {
+            Events.ACKNOWLEDGE.value,
+            Events.UNAUTHORIZED.value,
+            Events.NOT_FOUND.value,
+        }
+    ):
+        request_id = _LATEST_JOIN_REQUEST_IDS.get(channel)
     return ServerMessage(
         action=action,
         channelName=channel,
@@ -71,7 +92,7 @@ def _make_channel(
     async def publisher(msg: ClientMessage) -> None:
         sent.append(msg)
 
-    channel = Channel(
+    channel = _TrackedChannel(
         name="/chat/1",
         params={"user": "alice"},
         publisher=publisher,
@@ -85,6 +106,50 @@ async def test_initial_state_is_idle() -> None:
     channel, _, _ = _make_channel()
     assert channel.channel_state == ChannelState.IDLE
     assert channel.presence == []
+
+
+async def test_initial_join_ignores_response_for_wrong_request() -> None:
+    channel, sent, _ = _make_channel()
+    channel.join()
+    await asyncio.sleep(0)
+
+    assert len(sent) == 1
+    join_request_id = sent[0].request_id
+
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+            request_id="wrong-request",
+        )
+    )
+    assert channel.channel_state == ChannelState.JOINING
+
+    channel.handle_event(
+        _server_msg(
+            "/chat/1",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+            request_id=join_request_id,
+        )
+    )
+    assert channel.channel_state == ChannelState.JOINED
+
+
+async def test_leave_while_joining_discards_queued_application_messages() -> None:
+    channel, sent, _ = _make_channel()
+    channel.join()
+    await asyncio.sleep(0)
+    channel.send_message("must-not-send", {"secret": True})
+
+    channel.leave()
+    await asyncio.sleep(0)
+
+    assert [message.action for message in sent] == [
+        ClientActions.JOIN_CHANNEL,
+        ClientActions.LEAVE_CHANNEL,
+    ]
 
 
 class TypedChatPayload(TypedDict):
@@ -563,11 +628,14 @@ async def test_outbound_messages_are_published_one_at_a_time_in_fifo_order() -> 
         max_queue_size=32,
     )
     channel.join()
+    join_request_id = channel._join_request_id  # type: ignore[attr-defined]
+    assert join_request_id is not None
     channel.handle_event(
         _server_msg(
             "/chat/ordered",
             Events.ACKNOWLEDGE.value,
             action=ServerActions.SYSTEM,
+            request_id=join_request_id,
         )
     )
     for i in range(20):
@@ -691,8 +759,15 @@ async def test_failed_publish_is_retained_and_retried_before_later_messages() ->
         max_queue_size=3,
     )
     channel.join()
+    join_request_id = channel._join_request_id  # type: ignore[attr-defined]
+    assert join_request_id is not None
     channel.handle_event(
-        _server_msg("/chat/retry", Events.ACKNOWLEDGE.value, action=ServerActions.SYSTEM)
+        _server_msg(
+            "/chat/retry",
+            Events.ACKNOWLEDGE.value,
+            action=ServerActions.SYSTEM,
+            request_id=join_request_id,
+        )
     )
     channel.send_message("first", {})
     await asyncio.sleep(0)

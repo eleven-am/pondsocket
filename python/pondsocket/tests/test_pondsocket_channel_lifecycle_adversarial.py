@@ -14,6 +14,8 @@ from pondsocket import (
     PondSocket,
 )
 from pondsocket.channel import Channel, ChannelOptions
+from pondsocket.lobby import Lobby
+from pondsocket.pubsub_local import LocalPubSub
 from pondsocket.types import Event, Options, SystemEvents
 from pondsocket_common import ClientActions, IncomingConnection, ServerActions, uuid
 
@@ -126,6 +128,42 @@ async def test_concurrent_close_and_recursive_destroy_complete_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_channel_creation_waits_for_the_same_started_channel() -> None:
+    class SlowSubscribePubSub(LocalPubSub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.subscribe_started = asyncio.Event()
+            self.allow_subscribe = asyncio.Event()
+
+        async def subscribe(self, pattern, handler):  # type: ignore[no-untyped-def]
+            self.subscribe_started.set()
+            await self.allow_subscribe.wait()
+            await super().subscribe(pattern, handler)
+
+    bus = SlowSubscribePubSub()
+    lobby = Lobby(
+        path="/chat/:room",
+        endpoint_path="/api/socket",
+        options=Options(node_id="node-a"),
+        pubsub=bus,
+    )
+
+    first = asyncio.create_task(lobby.get_or_create_channel("/chat/1"))
+    await bus.subscribe_started.wait()
+    second = asyncio.create_task(lobby.get_or_create_channel("/chat/1"))
+    await asyncio.sleep(0)
+    assert not first.done()
+    assert not second.done()
+
+    bus.allow_subscribe.set()
+    channel_a, channel_b = await asyncio.gather(first, second)
+    assert channel_a is channel_b
+    assert channel_a.is_active
+    await lobby.close()
+    await bus.close()
+
+
+@pytest.mark.asyncio
 async def test_explicit_leave_completes_channel_dispatcher() -> None:
     channels: list[Channel] = []
 
@@ -170,6 +208,47 @@ async def test_abrupt_disconnect_completes_channel_dispatcher() -> None:
     assert not channels[0].is_active
     assert await lobby.get_channel("/chat/1") is None
     await pond.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cleans_endpoint_when_distributed_leave_fails() -> None:
+    class ToggleFailPubSub(LocalPubSub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_publish = False
+
+        async def publish(self, topic: str, data: bytes) -> None:
+            if self.fail_publish:
+                raise RuntimeError("pubsub unavailable")
+            await super().publish(topic, data)
+
+    bus = ToggleFailPubSub()
+    pond = PondSocket(pubsub=bus)
+
+    async def auth(ctx: ConnectionContext) -> None:
+        ctx.accept()
+
+    async def on_join(ctx: JoinContext) -> None:
+        await ctx.accept()
+
+    endpoint = pond.create_endpoint("/api/socket", auth)
+    lobby = endpoint.create_channel("/chat/:room", on_join)
+    transport = await _connect(pond, "alice")
+    await transport.push_inbound(
+        _client_event(ClientActions.JOIN_CHANNEL.value, "/chat/1", "join")
+    )
+    await _expect_event(transport, SystemEvents.ACKNOWLEDGE.value)
+    channel = await lobby.get_channel("/chat/1")
+    assert channel is not None
+
+    bus.fail_publish = True
+    await transport.close()
+
+    assert await endpoint.connection_count() == 0
+    assert not await channel.has_user("alice")
+    assert await lobby.get_channel("/chat/1") is None
+    await pond.close()
+    await bus.close()
 
 
 @pytest.mark.asyncio

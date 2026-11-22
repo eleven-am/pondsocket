@@ -15,6 +15,15 @@ from pondsocket_common import (
     uuid,
 )
 
+_CURRENT_JOIN_REQUEST_ID: str | None = None
+
+
+class _TrackedChannel(Channel):
+    def join(self) -> None:
+        global _CURRENT_JOIN_REQUEST_ID
+        super().join()
+        _CURRENT_JOIN_REQUEST_ID = self._join_request_id  # type: ignore[attr-defined]
+
 
 def _make_channel(
     *,
@@ -26,7 +35,7 @@ def _make_channel(
     async def publisher(msg: ClientMessage) -> None:
         sent.append(msg)
 
-    channel = Channel(
+    channel = _TrackedChannel(
         name="/chat/1",
         params={"user": "alice"},
         publisher=publisher,
@@ -35,12 +44,17 @@ def _make_channel(
     return channel, sent, state
 
 
-def _system(event: str, channel: str = "/chat/1", payload: dict | None = None) -> ServerMessage:
+def _system(
+    event: str,
+    channel: str = "/chat/1",
+    payload: dict | None = None,
+    request_id: str | None = None,
+) -> ServerMessage:
     return ServerMessage(
         action=ServerActions.SYSTEM,
         channelName=channel,
         event=event,
-        requestId=uuid(),
+        requestId=request_id or _CURRENT_JOIN_REQUEST_ID or uuid(),
         payload=payload if payload is not None else {},
     )
 

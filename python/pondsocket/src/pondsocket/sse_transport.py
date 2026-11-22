@@ -7,7 +7,13 @@ from pondsocket_common import ErrorTypes, ServerActions, uuid
 
 from .errors import internal
 from .transport import OnCloseCallback, OnMessageHandler
-from .types import Event, SystemEntity, TransportType
+from .types import (
+    DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_SEND_CHANNEL_BUFFER,
+    Event,
+    SystemEntity,
+    TransportType,
+)
 
 
 class SSEServerTransport:
@@ -17,6 +23,7 @@ class SSEServerTransport:
         "_close_callbacks",
         "_closed_event",
         "_id",
+        "_max_message_size",
         "_message_handler",
         "_outbound",
     )
@@ -26,13 +33,20 @@ class SSEServerTransport:
         *,
         id: str,
         assigns: dict[str, Any] | None = None,
+        max_queue_size: int = DEFAULT_SEND_CHANNEL_BUFFER,
+        max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
     ) -> None:
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be greater than zero")
+        if max_message_size <= 0:
+            raise ValueError("max_message_size must be greater than zero")
         self._id = id
         self._assigns: dict[str, Any] = dict(assigns or {})
         self._active = True
-        self._outbound: asyncio.Queue[Event] = asyncio.Queue()
+        self._outbound: asyncio.Queue[Event] = asyncio.Queue(max_queue_size)
         self._close_callbacks: list[OnCloseCallback] = []
         self._message_handler: OnMessageHandler | None = None
+        self._max_message_size = max_message_size
         self._closed_event = asyncio.Event()
 
     def get_id(self) -> str:
@@ -56,7 +70,32 @@ class SSEServerTransport:
     async def send_event(self, event: Event) -> None:
         if not self._active:
             raise internal("", "Transport is closed")
-        await self._outbound.put(event)
+        try:
+            self._outbound.put_nowait(event)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        put_task = asyncio.create_task(self._outbound.put(event))
+        close_task = asyncio.create_task(self._closed_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {put_task, close_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            put_task.cancel()
+            close_task.cancel()
+            await asyncio.gather(put_task, close_task, return_exceptions=True)
+            raise
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if put_task in done:
+            put_task.result()
+            return
+        raise internal("", "Transport closed while waiting for outbound capacity")
 
     def on_close(self, callback: OnCloseCallback) -> None:
         self._close_callbacks.append(callback)
@@ -69,6 +108,9 @@ class SSEServerTransport:
 
     async def push_message(self, data: bytes) -> None:
         if not self._active or self._message_handler is None:
+            return
+        if len(data) > self._max_message_size:
+            await self._send_invalid_message("Message exceeds configured maximum size")
             return
         from pondsocket_common import ValidationError
 
@@ -126,9 +168,12 @@ class SSEServerTransport:
         except asyncio.CancelledError:
             get_task.cancel()
             close_task.cancel()
+            await asyncio.gather(get_task, close_task, return_exceptions=True)
             raise
         for t in pending:
             t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if get_task in done:
             return get_task.result()
         if not self._outbound.empty():

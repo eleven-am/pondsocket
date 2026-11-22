@@ -130,8 +130,8 @@ class Channel:
         self._closing = True
         self._state.publish(ChannelState.CLOSED)
         self._pending_join = None
+        self._queue.clear()
         if self._connection_state.value != ConnectionState.CONNECTED:
-            self._queue.clear()
             self._finish_close()
             return
         self._queue.append(msg)
@@ -292,9 +292,7 @@ class Channel:
         self._pending_join = msg
 
     def _is_current_join_response(self, request_id: str) -> bool:
-        if self._join_generation <= 1:
-            return True
-        return request_id == self._join_request_id
+        return self._join_request_id is not None and request_id == self._join_request_id
 
     def _enqueue(self, msg: ClientMessage) -> None:
         if len(self._queue) >= self._max_queue_size:

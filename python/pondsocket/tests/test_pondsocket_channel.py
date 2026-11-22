@@ -5,10 +5,33 @@ import asyncio
 import pytest
 
 from pondsocket.channel import Channel, ChannelOptions
+from pondsocket.contexts.join_context import JoinContext
 from pondsocket.errors import PondError
 from pondsocket.in_memory_transport import InMemoryTransport
-from pondsocket.types import Options
-from pondsocket_common import PresenceEventTypes, ServerActions
+from pondsocket.pubsub_local import LocalPubSub
+from pondsocket.types import Event, Options
+from pondsocket_common import ClientActions, PresenceEventTypes, ServerActions
+
+
+class _ToggleFailPubSub(LocalPubSub):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_publish = False
+
+    async def publish(self, topic: str, data: bytes) -> None:
+        if self.fail_publish:
+            raise RuntimeError("pubsub unavailable")
+        await super().publish(topic, data)
+
+
+def _join_event() -> Event:
+    return Event(
+        action=ClientActions.JOIN_CHANNEL.value,
+        channel_name="room/distributed",
+        request_id="join-1",
+        event="join",
+        payload={},
+    )
 
 
 async def _channel(name: str = "room/1") -> Channel:
@@ -30,6 +53,52 @@ async def test_start_close_lifecycle() -> None:
     assert ch.is_active is False
 
 
+async def test_close_releases_all_channel_owned_user_state() -> None:
+    ch = await _channel()
+    await _seat(ch, "alice")
+    await ch.track_presence("alice", {"status": "online"})
+
+    await ch.close()
+
+    assert await ch.user_count() == 0
+    assert await ch.get_assigns() == {}
+    assert await ch.get_presence() == {}
+
+
+async def test_dispatch_queue_timeout_is_reported_instead_of_dropping() -> None:
+    class StalledTransport(InMemoryTransport):
+        def __init__(self, id: str) -> None:
+            super().__init__(id)
+            self.send_started = asyncio.Event()
+
+        async def send_event(self, event: Event) -> None:
+            del event
+            self.send_started.set()
+            await asyncio.Event().wait()
+
+    ch = Channel(
+        ChannelOptions(
+            name="room/backpressure",
+            options=Options(
+                node_id="node-a",
+                internal_queue_buffer=1,
+                internal_queue_timeout=0.01,
+                send_timeout=1.0,
+            ),
+        )
+    )
+    await ch.start()
+    transport = StalledTransport("slow")
+    await ch.add_user(transport)
+
+    await ch.broadcast("one", {})
+    await transport.send_started.wait()
+    await ch.broadcast("two", {})
+    with pytest.raises(TimeoutError):
+        await ch.broadcast("three", {})
+    await ch.close()
+
+
 async def test_add_user_initializes_assigns_from_transport() -> None:
     ch = await _channel()
     t = await _seat(ch, "u1")
@@ -48,6 +117,104 @@ async def test_add_user_duplicate_raises_conflict() -> None:
         await ch.add_user(t)
     assert exc.value.code == 409
     await ch.close()
+
+
+async def test_add_user_rolls_back_when_distributed_publish_fails() -> None:
+    bus = _ToggleFailPubSub()
+    ch = Channel(
+        ChannelOptions(
+            name="room/distributed",
+            options=Options(node_id="node-a"),
+            endpoint_path="/api/socket",
+            pubsub=bus,
+        )
+    )
+    await ch.start()
+    bus.fail_publish = True
+
+    with pytest.raises(RuntimeError, match="pubsub unavailable"):
+        await ch.add_user(InMemoryTransport("alice", assigns={"role": "admin"}))
+
+    assert not await ch.has_user("alice")
+    assert "alice" not in await ch.get_assigns()
+    await ch.close()
+    await bus.close()
+
+
+async def test_join_context_remains_unanswered_when_registration_fails() -> None:
+    bus = _ToggleFailPubSub()
+    ch = Channel(
+        ChannelOptions(
+            name="room/distributed",
+            options=Options(node_id="node-a"),
+            endpoint_path="/api/socket",
+            pubsub=bus,
+        )
+    )
+    await ch.start()
+    bus.fail_publish = True
+    transport = InMemoryTransport("alice")
+    ctx = JoinContext(channel=ch, event=_join_event(), transport=transport)
+
+    with pytest.raises(RuntimeError, match="pubsub unavailable"):
+        await ctx.accept()
+
+    assert not ctx.has_responded
+    assert not ctx.is_accepted
+    assert not await ch.has_user("alice")
+    await ch.close()
+    await bus.close()
+
+
+async def test_join_ack_failure_rolls_back_membership() -> None:
+    class FailingTransport(InMemoryTransport):
+        async def send_event(self, event: Event) -> None:
+            del event
+            raise RuntimeError("send failed")
+
+    ch = await _channel("room/distributed")
+    transport = FailingTransport("alice")
+    ctx = JoinContext(channel=ch, event=_join_event(), transport=transport)
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        await ctx.accept()
+
+    assert not ctx.has_responded
+    assert not ctx.is_accepted
+    assert not await ch.has_user("alice")
+    await ch.close()
+
+
+async def test_remove_user_finishes_cleanup_when_distributed_publish_fails() -> None:
+    bus = _ToggleFailPubSub()
+    left: list[str] = []
+
+    async def on_leave(ctx):  # type: ignore[no-untyped-def]
+        left.append(ctx.user.id)
+
+    ch = Channel(
+        ChannelOptions(
+            name="room/distributed",
+            options=Options(node_id="node-a"),
+            endpoint_path="/api/socket",
+            pubsub=bus,
+            leave_handler=on_leave,
+        )
+    )
+    await ch.start()
+    await ch.add_user(InMemoryTransport("alice", assigns={"role": "admin"}))
+    await ch.track_presence("alice", {"status": "online"})
+    bus.fail_publish = True
+
+    with pytest.raises(RuntimeError, match="pubsub unavailable"):
+        await ch.remove_user("alice")
+
+    assert not await ch.has_user("alice")
+    assert "alice" not in await ch.get_assigns()
+    assert "alice" not in await ch.get_presence()
+    assert left == ["alice"]
+    assert not ch.is_active
+    await bus.close()
 
 
 async def test_remove_user_clears_state() -> None:
@@ -73,6 +240,37 @@ async def test_broadcast_delivers_to_all_users() -> None:
     assert ev_a.channel_name == "room/1"
     assert ev_a.action == ServerActions.BROADCAST.value
     assert ev_b.event == "chat"
+    await ch.close()
+
+
+async def test_stalled_transport_is_closed_after_send_timeout() -> None:
+    class StalledTransport(InMemoryTransport):
+        def __init__(self, id: str) -> None:
+            super().__init__(id)
+            self.close_called = asyncio.Event()
+
+        async def send_event(self, event):  # type: ignore[no-untyped-def]
+            del event
+            await asyncio.Event().wait()
+
+        async def close(self) -> None:
+            await super().close()
+            self.close_called.set()
+
+    ch = Channel(
+        ChannelOptions(
+            name="room/timeout",
+            options=Options(node_id="node-a", send_timeout=0.01),
+        )
+    )
+    await ch.start()
+    transport = StalledTransport("slow")
+    await ch.add_user(transport)
+
+    await ch.broadcast("chat", {"text": "hi"})
+
+    await asyncio.wait_for(transport.close_called.wait(), timeout=1.0)
+    assert not transport.is_active()
     await ch.close()
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -154,12 +155,19 @@ class Endpoint:
             await self._check_max_connections()
             await self._connections.create(transport.get_id(), transport)
             self._connect_times[transport.get_id()] = time.monotonic()
-        await self._send_connect_event(transport)
-        transport.on_close(self._on_transport_closed)
-        transport.on_message(self._handle_transport_message)
+        try:
+            await self._send_connect_event(transport)
+            transport.on_close(self._on_transport_closed)
+            transport.on_message(self._handle_transport_message)
+            await transport.handle_messages()
+        except BaseException:
+            await self._connections.discard(transport.get_id())
+            self._connect_times.pop(transport.get_id(), None)
+            with contextlib.suppress(Exception):
+                await transport.close()
+            raise
         self._fire_metric_connection_opened(transport)
         await self._fire_on_connect(transport)
-        await transport.handle_messages()
 
     async def _check_max_connections(self) -> None:
         if self._options.max_connections <= 0:
@@ -180,22 +188,29 @@ class Endpoint:
             event=SystemEvents.CONNECTION.value,
             payload={"id": transport_id, "connectionId": transport_id},
         )
-        try:
-            await transport.send_event(ev)
-        except Exception:
-            return
+        await transport.send_event(ev)
 
     async def _on_transport_closed(self, transport: Transport) -> None:
         user_id = transport.get_id()
+        first_error: BaseException | None = None
         for reg in list(self._channel_registrations):
             for channel in await reg.lobby.list_channels():
                 if await channel.has_user(user_id):
-                    await channel.remove_user(user_id, reason=LeaveReason.CONNECTION_CLOSED.value)
+                    try:
+                        await channel.remove_user(
+                            user_id,
+                            reason=LeaveReason.CONNECTION_CLOSED.value,
+                        )
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
         await self._connections.discard(user_id)
         connect_at = self._connect_times.pop(user_id, None)
         duration = time.monotonic() - connect_at if connect_at is not None else 0.0
         self._fire_metric_connection_closed(user_id, duration)
         await self._fire_on_disconnect(transport)
+        if first_error is not None:
+            raise first_error
 
     async def _handle_transport_message(self, event: Event, transport: Transport) -> None:
         action = event.action

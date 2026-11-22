@@ -61,11 +61,10 @@ class HeartbeatCoordinator:
         async with self._lock:
             if self._started or self._closed:
                 return
-            self._started = True
-        with contextlib.suppress(Exception):
             await self._pubsub.subscribe(self._topic, self._on_message)
-        self._publish_task = asyncio.create_task(self._publish_loop())
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            self._started = True
+            self._publish_task = asyncio.create_task(self._publish_loop())
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     def register(self, channel: HeartbeatChannel) -> None:
         self._channels.add(channel)
@@ -131,7 +130,9 @@ class HeartbeatCoordinator:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-        with contextlib.suppress(Exception):
-            await self._pubsub.unsubscribe(self._topic)
+        if self._started:
+            with contextlib.suppress(Exception):
+                await self._pubsub.unsubscribe(self._topic)
+            self._started = False
         self._channels.clear()
         self._last_seen.clear()

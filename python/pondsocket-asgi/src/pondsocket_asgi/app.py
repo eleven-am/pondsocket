@@ -127,6 +127,7 @@ class PondASGIApp:
             send=send,
             receive=receive,
             assigns=ctx.assigns,
+            max_message_size=self._pond.options.max_message_size,
         )
         await endpoint.register_transport(transport)
         await self._send_pending_reply(ctx, transport, endpoint)
@@ -195,7 +196,12 @@ class PondASGIApp:
             }
         )
 
-        transport = SSEServerTransport(id=ctx.user_id, assigns=ctx.assigns)
+        transport = SSEServerTransport(
+            id=ctx.user_id,
+            assigns=ctx.assigns,
+            max_queue_size=self._pond.options.send_channel_buffer,
+            max_message_size=self._pond.options.max_message_size,
+        )
         await endpoint.register_transport(transport)
         await self._send_pending_reply_sse(ctx, transport)
 
@@ -217,6 +223,7 @@ class PondASGIApp:
                 )
                 if disconnect_task in done:
                     next_task.cancel()
+                    await asyncio.gather(next_task, return_exceptions=True)
                     break
                 event = next_task.result()
                 if event is None:
@@ -234,6 +241,7 @@ class PondASGIApp:
                     break
         finally:
             disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
             await transport.close()
             try:
                 await send(
@@ -261,7 +269,18 @@ class PondASGIApp:
                 body=b"connection does not accept inbound messages",
             )
             return
-        body = await _read_body(receive)
+        try:
+            body = await _read_body(
+                receive,
+                max_bytes=self._pond.options.max_message_size,
+            )
+        except _MessageTooLargeError:
+            await self._send_simple_http(
+                send,
+                status=413,
+                body=b"message too large",
+            )
+            return
         await transport.push_message(body)
         await self._send_simple_http(send, status=204, body=b"")
 
@@ -362,13 +381,24 @@ def _is_sse_request(headers: Headers) -> bool:
     return "text/event-stream" in accept
 
 
-async def _read_body(receive: ASGIReceive) -> bytes:
+class _MessageTooLargeError(Exception):
+    pass
+
+
+async def _read_body(receive: ASGIReceive, *, max_bytes: int) -> bytes:
     chunks: list[bytes] = []
+    size = 0
     while True:
         msg = await receive()
         msg_type = msg.get("type")
         if msg_type == "http.request":
-            chunks.append(msg.get("body", b""))
+            chunk = msg.get("body", b"")
+            if not isinstance(chunk, bytes):
+                chunk = b""
+            size += len(chunk)
+            if size > max_bytes:
+                raise _MessageTooLargeError()
+            chunks.append(chunk)
             if not msg.get("more_body", False):
                 break
         elif msg_type == "http.disconnect":

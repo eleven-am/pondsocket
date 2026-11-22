@@ -9,7 +9,7 @@ from pondsocket import (
     PondSocket,
     SystemEvents,
 )
-from pondsocket.types import Event
+from pondsocket.types import Event, Options
 from pondsocket_asgi import PondASGIApp
 from pondsocket_asgi._sse import event_to_sse_frame
 from pondsocket_asgi.testing import ASGITestDriver
@@ -104,6 +104,29 @@ async def test_sse_push_unknown_connection_id_returns_404() -> None:
     pond = PondSocket()
     status, _ = await _driver_for(pond).sse_push("nonexistent", {})
     assert status == 404
+
+
+async def test_sse_push_rejects_body_larger_than_configured_message_limit() -> None:
+    pond = PondSocket(options=Options(max_message_size=64))
+
+    async def auth(ctx: ConnectionContext) -> None:
+        ctx.accept()
+
+    pond.create_endpoint("/sse", auth)
+    driver = _driver_for(pond)
+    sess = await driver.connect_sse("/sse")
+    assert sess.accepted is True
+
+    status, body = await driver.call_http(
+        "/push",
+        method="POST",
+        headers=[(b"x-connection-id", sess.connection_id.encode("utf-8"))],
+        body=b"x" * 65,
+    )
+
+    assert status == 413
+    assert body == b"message too large"
+    await sess.disconnect()
 
 
 async def test_sse_push_invalid_json_is_silently_dropped_with_204() -> None:

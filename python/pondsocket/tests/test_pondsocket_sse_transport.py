@@ -29,6 +29,22 @@ async def test_send_event_queues_outbound() -> None:
     assert got is ev
 
 
+async def test_outbound_queue_applies_backpressure_at_capacity() -> None:
+    t = SSEServerTransport(id="u1", max_queue_size=1)
+    first = _event("first")
+    second = _event("second")
+    await t.send_event(first)
+
+    blocked_send = asyncio.create_task(t.send_event(second))
+    await asyncio.sleep(0)
+    assert not blocked_send.done()
+
+    assert await t.next_event() is first
+    await asyncio.wait_for(blocked_send, timeout=1.0)
+    assert await t.next_event() is second
+    await t.close()
+
+
 async def test_send_event_after_close_raises() -> None:
     t = SSEServerTransport(id="u1")
     await t.close()

@@ -114,6 +114,28 @@ async def test_connection_decline_does_not_register() -> None:
     await pond.close()
 
 
+async def test_failed_connect_event_rolls_back_transport_registration() -> None:
+    pond = PondSocket()
+
+    async def auth(ctx: ConnectionContext) -> None:
+        ctx.accept()
+
+    endpoint = pond.create_endpoint("/api/socket", auth)
+
+    class FailingTransport(InMemoryTransport):
+        async def send_event(self, event: Event) -> None:
+            del event
+            raise RuntimeError("send failed")
+
+    transport = FailingTransport("broken")
+    with pytest.raises(RuntimeError, match="send failed"):
+        await endpoint.register_transport(transport)
+
+    assert await endpoint.connection_count() == 0
+    assert not transport.is_active()
+    await pond.close()
+
+
 async def test_join_channel_acknowledge_flow() -> None:
     pond = PondSocket()
 

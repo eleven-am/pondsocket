@@ -12,6 +12,7 @@ from pondsocket import (
     PondSocket,
     SystemEvents,
 )
+from pondsocket.types import Options
 from pondsocket_asgi import PondASGIApp
 from pondsocket_asgi.testing import ASGITestDriver, WebSocketSession
 from pondsocket_common import (
@@ -178,6 +179,24 @@ async def test_invalid_inbound_json_replies_with_invalid_message_error() -> None
     )
     assert "error" in err["payload"]
     await sess.disconnect()
+
+
+async def test_oversized_websocket_message_closes_with_1009() -> None:
+    pond = PondSocket(options=Options(max_message_size=64))
+
+    async def auth(ctx: ConnectionContext) -> None:
+        ctx.accept()
+
+    pond.create_endpoint("/ws", auth)
+    sess = await _driver_for_pond(pond).connect_websocket("/ws")
+    await sess.receive_json()
+
+    await sess.send_text("x" * 65)
+
+    close = await asyncio.wait_for(sess.outbox.get(), timeout=1.0)
+    assert close["type"] == "websocket.close"
+    assert close["code"] == 1009
+    await asyncio.wait_for(sess.app_task, timeout=1.0)
 
 
 async def test_disconnect_fires_leave_handler() -> None:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from .errors import internal
 from .transport import OnCloseCallback, OnMessageHandler
-from .types import Event, TransportType
+from .types import DEFAULT_RECEIVE_CHANNEL_BUFFER, DEFAULT_SEND_CHANNEL_BUFFER, Event, TransportType
 
 
 class InMemoryTransport:
@@ -21,12 +22,23 @@ class InMemoryTransport:
         "_receive_task",
     )
 
-    def __init__(self, id: str, *, assigns: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        id: str,
+        *,
+        assigns: dict[str, Any] | None = None,
+        max_inbox_size: int = DEFAULT_RECEIVE_CHANNEL_BUFFER,
+        max_outbox_size: int = DEFAULT_SEND_CHANNEL_BUFFER,
+    ) -> None:
+        if max_inbox_size <= 0:
+            raise ValueError("max_inbox_size must be greater than zero")
+        if max_outbox_size <= 0:
+            raise ValueError("max_outbox_size must be greater than zero")
         self._id = id
         self._assigns: dict[str, Any] = dict(assigns or {})
         self._active = True
-        self._outbox: asyncio.Queue[Event] = asyncio.Queue()
-        self._inbox: asyncio.Queue[Event] = asyncio.Queue()
+        self._outbox: asyncio.Queue[Event] = asyncio.Queue(max_outbox_size)
+        self._inbox: asyncio.Queue[Event] = asyncio.Queue(max_inbox_size)
         self._close_callbacks: list[OnCloseCallback] = []
         self._message_handler: OnMessageHandler | None = None
         self._receive_task: asyncio.Task[None] | None = None
@@ -56,8 +68,14 @@ class InMemoryTransport:
         if not self._active:
             return
         self._active = False
-        if self._receive_task is not None and not self._receive_task.done():
+        if (
+            self._receive_task is not None
+            and self._receive_task is not asyncio.current_task()
+            and not self._receive_task.done()
+        ):
             self._receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receive_task
         for cb in list(self._close_callbacks):
             try:
                 await cb(self)

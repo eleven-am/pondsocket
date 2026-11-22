@@ -5,7 +5,12 @@ import contextlib
 from dataclasses import dataclass
 
 from .errors import not_found
-from .pubsub import PubSubClosedError, PubSubHandler, match_topic
+from .pubsub import (
+    PubSubBackpressureError,
+    PubSubClosedError,
+    PubSubHandler,
+    match_topic,
+)
 
 
 @dataclass(slots=True)
@@ -21,7 +26,7 @@ class LocalPubSub:
 
     def __init__(self, *, buffer_size: int = 100) -> None:
         if buffer_size <= 0:
-            buffer_size = 100
+            raise ValueError("buffer_size must be greater than zero")
         self._buffer_size = buffer_size
         self._closed = False
         self._lock = asyncio.Lock()
@@ -71,11 +76,10 @@ class LocalPubSub:
             for pattern, subs in self._subs.items():
                 if match_topic(pattern, topic):
                     targets.extend(subs)
+        if any(sub.queue.full() for sub in targets):
+            raise PubSubBackpressureError(topic)
         for sub in targets:
-            try:
-                sub.queue.put_nowait((topic, data))
-            except asyncio.QueueFull:
-                continue
+            sub.queue.put_nowait((topic, data))
 
     async def close(self) -> None:
         async with self._lock:

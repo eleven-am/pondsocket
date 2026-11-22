@@ -66,6 +66,7 @@ from .parser import parse
 from .presence import PresenceClient
 from .pubsub import (
     PubSub,
+    PubSubBackpressureError,
     PubSubClosedError,
     format_heartbeat_topic,
     format_message_topic,
@@ -174,6 +175,7 @@ __all__ = [
     "PresenceClient",
     "PresenceEventTypes",
     "PubSub",
+    "PubSubBackpressureError",
     "PubSubClosedError",
     "PushableTransport",
     "RateLimiter",

@@ -144,10 +144,14 @@ class Channel:
             self._close_task = None
             self._active = True
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
-        await self._subscribe_to_pubsub()
-        await self._start_liveness()
-        await self._request_channel_state()
-        self._fire_metric_channel_created()
+        try:
+            await self._subscribe_to_pubsub()
+            await self._start_liveness()
+            await self._request_channel_state()
+            self._fire_metric_channel_created()
+        except BaseException:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         async with self._lifecycle_lock:
@@ -175,6 +179,12 @@ class Channel:
             dispatch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await dispatch_task
+        while not self._dispatch_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._dispatch_queue.get_nowait()
+        await self._connections.clear()
+        await self._assigns.clear()
+        await self._presence.clear()
         await self._unsubscribe_from_pubsub()
         self._stop_liveness()
         self._node_users.clear()
@@ -225,12 +235,17 @@ class Channel:
         user_id = transport.get_id()
         assigns = dict(transport.clone_assigns())
         await self._connections.create(user_id, transport)
-        await self._assigns.upsert(user_id, assigns)
+        try:
+            await self._assigns.upsert(user_id, assigns)
+            await self._publish_distributed(
+                DistributedMessageType.USER_JOINED.value,
+                {"userId": user_id, "presence": {}, "assigns": assigns},
+            )
+        except BaseException:
+            await self._assigns.discard(user_id)
+            await self._connections.discard(user_id)
+            raise
         self._fire_metric_channel_joined(user_id)
-        await self._publish_distributed(
-            DistributedMessageType.USER_JOINED.value,
-            {"userId": user_id, "presence": {}, "assigns": assigns},
-        )
 
     async def remove_user(
         self,
@@ -248,20 +263,36 @@ class Channel:
             presence = await self._presence.get(user_id)
         user = User(id=user_id, assigns=dict(assigns), presence=presence)
 
+        first_error: BaseException | None = None
+
         await self._assigns.discard(user_id)
-        await self._presence.untrack(user_id)
+        try:
+            await self._presence.untrack(user_id)
+        except BaseException as exc:
+            first_error = exc
+            await self._presence.discard(user_id)
         self._fire_metric_channel_left(user_id)
 
         if not skip_distributed:
-            await self._publish_distributed(
-                DistributedMessageType.USER_LEFT.value,
-                {"userId": user_id},
-            )
+            try:
+                await self._publish_distributed(
+                    DistributedMessageType.USER_LEFT.value,
+                    {"userId": user_id},
+                )
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
 
         await self._fire_leave_handler(user, reason)
 
         if await self._connections.len() == 0:
-            await self.close()
+            try:
+                await self.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
         return True
 
     async def _fire_leave_handler(self, user: User, reason: str) -> None:
@@ -391,12 +422,15 @@ class Channel:
         await self._send_direct(user_ids, ev)
 
     async def send_acknowledge(self, request_id: str, user_id: str) -> None:
-        await self.send_system(
-            SystemEvents.ACKNOWLEDGE.value,
-            {},
+        ev = Event(
+            action=ServerActions.SYSTEM.value,
+            channel_name=self.name,
             request_id=request_id,
-            user_ids=[user_id],
+            event=SystemEvents.ACKNOWLEDGE.value,
+            payload={},
+            node_id=self.node_id,
         )
+        await self._send_required(user_id, ev)
 
     async def send_unauthorized(
         self,
@@ -422,9 +456,29 @@ class Channel:
             if transport is None or not transport.is_active():
                 continue
             try:
-                await transport.send_event(event)
+                await asyncio.wait_for(
+                    transport.send_event(event),
+                    timeout=self._options.send_timeout,
+                )
+            except TimeoutError:
+                with contextlib.suppress(Exception):
+                    await transport.close()
             except Exception:
                 continue
+
+    async def _send_required(self, user_id: str, event: Event) -> None:
+        transport = await self._connections.get(user_id)
+        if transport is None or not transport.is_active():
+            raise internal(self.name, f"User {user_id} has no active transport")
+        try:
+            await asyncio.wait_for(
+                transport.send_event(event),
+                timeout=self._options.send_timeout,
+            )
+        except TimeoutError:
+            with contextlib.suppress(Exception):
+                await transport.close()
+            raise
 
     async def handle_incoming_event(self, event: Event, sender_id: str) -> None:
         if not await self._connections.has(sender_id):
@@ -515,10 +569,7 @@ class Channel:
             return
         item = _DispatchItem(event=event, recipient_ids=recipient_ids)
         timeout = self._options.internal_queue_timeout
-        try:
-            await asyncio.wait_for(self._dispatch_queue.put(item), timeout=timeout)
-        except TimeoutError:
-            return
+        await asyncio.wait_for(self._dispatch_queue.put(item), timeout=timeout)
 
     async def _dispatch_loop(self) -> None:
         while True:
@@ -574,7 +625,13 @@ class Channel:
         if ctx.is_blocked():
             return
         try:
-            await transport.send_event(ctx.event)
+            await asyncio.wait_for(
+                transport.send_event(ctx.event),
+                timeout=self._options.send_timeout,
+            )
+        except TimeoutError:
+            with contextlib.suppress(Exception):
+                await transport.close()
         except Exception:
             return
 
@@ -597,10 +654,7 @@ class Channel:
     async def _subscribe_to_pubsub(self) -> None:
         if self._pubsub is None or not self._endpoint_path:
             return
-        try:
-            await self._pubsub.subscribe(self._pubsub_pattern(), self._handle_pubsub_message)
-        except Exception:
-            return
+        await self._pubsub.subscribe(self._pubsub_pattern(), self._handle_pubsub_message)
 
     async def _unsubscribe_from_pubsub(self) -> None:
         if self._pubsub is None or not self._endpoint_path:
@@ -614,23 +668,17 @@ class Channel:
         if self._pubsub is None or not self._endpoint_path:
             return
         topic = self._channel_topic()
-        try:
-            await self._pubsub.publish(
-                topic,
-                _event_to_distributed_bytes(event, event_subtype, self._clean_endpoint()),
-            )
-        except Exception:
-            return
+        await self._pubsub.publish(
+            topic,
+            _event_to_distributed_bytes(event, event_subtype, self._clean_endpoint()),
+        )
 
     async def _publish_distributed(self, msg_type: str, extra: dict[str, Any]) -> None:
         if self._pubsub is None or not self._endpoint_path:
             return
         topic = self._channel_topic()
         data = distributed_bytes(msg_type, self.node_id, self._clean_endpoint(), self.name, extra)
-        try:
-            await self._pubsub.publish(topic, data)
-        except Exception:
-            return
+        await self._pubsub.publish(topic, data)
 
     async def _handle_pubsub_message(self, _topic: str, data: bytes) -> None:
         raw = parse_envelope(data)

@@ -52,7 +52,9 @@ def _broadcast(event: str, request_id: str, payload: dict | None = None) -> Serv
 async def _join(channel: Channel) -> None:
     channel.join()
     await asyncio.sleep(0)
-    channel.handle_event(_system(Events.ACKNOWLEDGE.value, uuid()))
+    request_id = channel._join_request_id  # type: ignore[attr-defined]
+    assert request_id is not None
+    channel.handle_event(_system(Events.ACKNOWLEDGE.value, request_id))
     assert channel.channel_state == ChannelState.JOINED
 
 
