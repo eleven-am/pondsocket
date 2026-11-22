@@ -1,371 +1,198 @@
 # PondSocket
 
-PondSocket is a high-performance, minimalist, and bidirectional socket framework designed for Node.js. It provides a seamless way to handle real-time communication between server and client applications, making it an ideal choice for building WebSocket-based projects.
+PondSocket is a channel-based real-time framework with compatible server and client implementations for TypeScript, Go, Python, and Rust. It provides WebSocket messaging, Server-Sent Events where supported, presence, private per-user assigns, request/reply events, middleware, and Redis-backed multi-node delivery.
 
-## Core Concepts
+The common model is:
 
-PondSocket is built around four main entities:
+```text
+server -> endpoint -> channel pattern -> concrete channel -> user
+```
 
-1. **Server**: The main instance that manages all WebSocket connections and endpoints
-2. **Endpoint**: A WebSocket gateway that handles client connections and authentication
-3. **Channel**: A communication group where users can interact and exchange messages
-4. **Client**: The client-side implementation that connects to endpoints and joins channels
+An endpoint authenticates a connection. A channel handler authorizes membership. Event handlers then reply, broadcast, update presence or assigns, and remove users without turning the entire connection lifecycle into one callback.
 
-### Server
-The server is the main entry point for PondSocket. It manages all WebSocket connections and provides methods to create endpoints.
+## Implementations
 
-```typescript
-import PondSocket from "@eleven-am/pondsocket";
+| Runtime | Packages | Documentation |
+|---|---|---|
+| TypeScript / Node.js | Core server, browser/Node client, Express and NestJS adapters | [TypeScript packages](#typescript-packages) |
+| Go | Server and client modules | [Go server](./go/pondsocket/README.md), [Go client](./go/pondsocket-client/README.md) |
+| Python | Server core, ASGI adapter, client and shared wire types | [Python workspace](./python/README.md) |
+| Rust | Server, Axum adapter, client and shared wire types | [Rust workspace](./rust/README.md) |
 
-// Create a new PondSocket server
-const pond = new PondSocket({
-    // Optional: Use an existing HTTP server
-    server: httpServer,
-    // Optional: Use an existing WebSocket server
-    socketServer: wsServer,
-    // Optional: Whether to create an exclusive server
-    exclusiveServer: true,
-    // Optional: Distributed backend for scaling
-    distributedBackend: new RedisDistributedBackend({
-        host: 'localhost',
-        port: 6379
-    })
+## Compatibility
+
+The Go, Rust, Python, and JavaScript WebSocket clients and servers use the same client/server JSON actions and are designed for any-to-any connections. Applications still need matching endpoint names, channel names, event names, authentication, and payload expectations.
+
+The browser JavaScript `SSEClient` can connect to the TypeScript, Go, and Python SSE transports. The Rust/Axum adapter currently provides WebSocket transport, not SSE.
+
+Server-to-server distribution is a separate protocol. All runtimes implement the same v1 JSON envelope, but mixed-runtime Redis clusters are not universally interoperable today: the TypeScript backend percent-encodes Redis topic segments while Go, Python, Rust, and the written contract use raw segments. Homogeneous clusters are supported. Go/Python/Rust have aligned topic and envelope implementations, but the repository does not yet contain a mixed-process integration suite proving that deployment matrix. See the [distributed protocol](./DISTRIBUTED_PROTOCOL.md) for the contract and current limitation.
+
+## TypeScript quick start
+
+Install the server and client:
+
+```bash
+npm install @eleven-am/pondsocket @eleven-am/pondsocket-client
+```
+
+Create a server:
+
+```ts
+import { PondSocket } from '@eleven-am/pondsocket';
+
+const pond = new PondSocket();
+
+const endpoint = pond.createEndpoint('/v1/socket', (ctx) => {
+    if (!ctx.query.token) {
+        ctx.decline('Missing token', 401);
+        return;
+    }
+
+    ctx.accept({ role: 'member' });
 });
 
-// Start the server
+const chat = endpoint.createChannel('/chat/:roomId', (ctx) => {
+    ctx.accept({ displayName: ctx.joinParams.displayName });
+    ctx.trackPresence({ online: true });
+});
+
+chat.onEvent('message', (ctx) => {
+    ctx.broadcast('message', ctx.payload);
+});
+
 pond.listen(3000);
 ```
 
-### Endpoint
-Endpoints are WebSocket gateways that handle client connections. Each endpoint:
-- Manages its own set of connections
-- Handles authentication
-- Creates channels
-- Is isolated from other endpoints
+Connect a client:
 
-```typescript
-// Create an endpoint
-const endpoint = pond.createEndpoint('/api/socket', (ctx, next) => {
-    // Handle authentication
-    const token = ctx.request.query.token;
-    
-    if (isValidToken(token)) {
-        // Accept the connection and assign user data
-        ctx.accept({
-            userId: getUserIdFromToken(token),
-            role: getRoleFromToken(token)
-        });
-    } else {
-        // Reject invalid connections
-        ctx.reject('Invalid token', 401);
-    }
+```ts
+import { PondClient } from '@eleven-am/pondsocket-client';
+
+const client = new PondClient('ws://localhost:3000/v1/socket', {
+    token: 'connection-token',
 });
 
-// Endpoints can have middleware
-endpoint.use(async (ctx, next) => {
-    // Log all connections
-    console.log(`New connection from ${ctx.request.ip}`);
-    await next();
-});
-```
+client.connect();
 
-### Channel
-Channels are communication groups where users can interact. Each channel:
-- Has a unique path (can include parameters)
-- Manages its own set of users
-- Handles join requests
-- Tracks user presence
-- Manages message broadcasting
-
-```typescript
-// Create a channel with path parameters
-const channel = endpoint.createChannel('/chat/:roomId', async (ctx, next) => {
-    const { role } = ctx.user.assigns;
-    const { username } = ctx.joinParams;
-    const { roomId } = ctx.event.params;
-
-    // Handle join requests
-    if (role === 'user') {
-        // Accept the join request
-        ctx.accept({ username })
-            // Track user presence
-            .trackPresence({
-                username,
-                status: 'online',
-                joinedAt: Date.now()
-            })
-            // Send channel history
-            .sendToUsers('history', {
-                messages: await getChannelHistory(roomId)
-            });
-    } else {
-        ctx.decline('Unauthorized', 403);
-    }
+const channel = client.createChannel('/chat/general', {
+    displayName: 'Ada',
 });
 
-// Handle channel events
-channel.onEvent('message', (ctx, next) => {
-    const { text } = ctx.event.payload;
-    const { username } = ctx.user.assigns;
-    
-    // Broadcast to all users in the channel
-    ctx.broadcast('message', {
-        text,
-        username,
-        timestamp: Date.now()
-    });
-});
-
-// Handle user presence
-channel.onEvent('presence', (ctx, next) => {
-    const { status } = ctx.event.payload;
-    ctx.updatePresence({
-        status,
-        lastSeen: Date.now()
-    });
-});
-
-// Handle user leaves
-channel.onLeave((ctx) => {
-    console.log(`User ${ctx.user.assigns.username} left the channel`);
-});
-```
-
-### Client
-The client connects to endpoints and joins channels. It provides:
-- Connection management
-- Channel management
-- Event handling
-- Presence tracking
-
-```typescript
-import PondClient from "@eleven-am/pondsocket-client";
-
-// Create a client instance
-const socket = new PondClient('ws://localhost:3000/api/socket', {
-    // Connection parameters (e.g., authentication token)
-    token: 'your-auth-token'
-});
-
-// Handle connection state
-socket.onConnectionChange((connected) => {
-    if (connected) {
-        console.log('Connected to server');
-    } else {
-        console.log('Disconnected from server');
-    }
-});
-
-// Connect to the server
-socket.connect();
-
-// Create a channel
-const channel = socket.createChannel('/chat/123', {
-    // Join parameters
-    username: 'user123'
-});
-
-// Handle channel state
-channel.onChannelStateChange((state) => {
-    switch (state) {
-        case 'joining':
-            console.log('Joining channel...');
-            break;
-        case 'joined':
-            console.log('Joined channel');
-            break;
-        case 'left':
-            console.log('Left channel');
-            break;
-    }
-});
-
-// Handle presence updates
-channel.onPresenceChange((presence) => {
-    console.log('Presence updated:', presence);
-});
-
-// Handle user changes
-channel.onUsersChange((users) => {
-    console.log('Users in channel:', users);
-});
-
-// Join the channel
+channel.onMessageEvent('message', console.log);
 channel.join();
-
-// Send a message
-channel.sendMessage('message', {
-    text: 'Hello, World!'
-});
-
-// Listen for messages
-channel.onMessage('message', (message) => {
-    console.log(`${message.username}: ${message.text}`);
-});
-
-// Update presence
-channel.sendMessage('presence', {
-    status: 'away'
-});
-
-// Leave the channel
-channel.leave();
+channel.sendMessage('message', { text: 'hello' });
 ```
 
-## Framework Integration
+Call `client.disconnect()` and `await pond.closeAsync()` during shutdown so timers, sockets, subscriptions, and broker resources are released.
 
-### Express.js
+## TypeScript packages
 
-```typescript
-import express from 'express';
-import pondSocket from '@eleven-am/pondsocket-express';
+| Package | Purpose | Documentation |
+|---|---|---|
+| `@eleven-am/pondsocket` | Node.js server core and Redis distribution | [Core](./javascript/core/README.md) |
+| `@eleven-am/pondsocket-client` | Browser/Node WebSocket client and browser SSE client | [Client](./javascript/client/README.md) |
+| `@eleven-am/pondsocket-common` | Shared schema definitions, wire validators, enums and utilities | [Common](./javascript/comnon/README.md) |
+| `@eleven-am/pondsocket-express` | Express-owned HTTP server integration | [Express](./javascript/express/README.md) |
+| `@eleven-am/pondsocket-nest` | NestJS module, guards, interceptors and decorators | [NestJS](./javascript/nest/README.md) |
 
-const app = express();
-const pondApp = pondSocket(app);
+The directory name `javascript/comnon` is retained for package-history compatibility; the published package name is `@eleven-am/pondsocket-common`.
 
-// Create a WebSocket endpoint
-const endpoint = pondApp.createEndpoint('/api/socket', (ctx, next) => {
-    const token = ctx.request.query.token;
-    if (isValidToken(token)) {
-        ctx.accept({ role: 'user' });
-    } else {
-        ctx.reject('Invalid token', 401);
-    }
-});
+## Shared TypeScript schemas
 
-// Create a channel
-const channel = endpoint.createChannel('/chat/:roomId', (ctx, next) => {
-    ctx.accept()
-        .trackPresence({
-            username: ctx.joinParams.username,
-            status: 'online'
-        });
-});
+Schemas are optional, but a shared definition lets the server, NestJS adapter, and client type event payloads, replies, presence, assigns, join parameters, and route parameters from one source.
 
-// Handle messages
-channel.onEvent('message', (ctx, next) => {
-    ctx.broadcast('message', ctx.event.payload);
-});
+```ts
+import {
+    definePondChannel,
+    definePondSchema,
+} from '@eleven-am/pondsocket-common';
 
-app.listen(3000);
-```
-
-### NestJS
-
-```typescript
-import { Module } from '@nestjs/common';
-import { PondSocketModule } from '@eleven-am/pondsocket-nest';
-
-@Module({
-    imports: [
-        PondSocketModule.forRoot({
-            isGlobal: true,
-            guards: [AuthGuard],
-            pipes: [ValidationPipe]
-        })
-    ]
-})
-export class AppModule {}
-
-// Create a WebSocket endpoint
-@Endpoint('/api/socket')
-export class SocketController {
-    @OnConnection()
-    async handleConnection(ctx: Context) {
-        const token = ctx.request.query.token;
-        if (isValidToken(token)) {
-            ctx.accept({ role: 'user' });
-        } else {
-            ctx.reject('Invalid token', 401);
-        }
-    }
+interface ChatSchema {
+    events: {
+        message: { text: string };
+        ping: [{ sentAt: number }, { receivedAt: number }];
+    };
+    presence: { online: boolean };
+    assigns: { role: 'admin' | 'member' };
+    joinParams: { token: string };
 }
 
-// Create a channel
-@Channel('/chat/:roomId')
-export class ChatController {
-    @OnJoin()
-    async handleJoin(ctx: Context) {
-        // You can return an object with specific properties to trigger actions
-        return {
-            // Send an event to the user
-            event: 'welcome',
-            message: 'Welcome to the channel!',
-            
-            // Broadcast to all users in the channel
-            broadcast: 'user_joined',
-            username: ctx.joinParams.username,
-            
-            // Broadcast to all users except the sender
-            broadcastFrom: 'user_joined',
-            username: ctx.joinParams.username,
-            
-            // Update user assigns
-            assigns: {
-                username: ctx.joinParams.username,
-                joinedAt: Date.now()
-            },
-            
-            // Update user presence
-            presence: {
-                username: ctx.joinParams.username,
-                status: 'online',
-                lastSeen: Date.now()
-            }
-        };
-    }
-
-    @OnEvent('message')
-    async handleMessage(ctx: Context) {
-        const { text } = ctx.event.payload;
-        
-        // Return an object to broadcast the message
-        return {
-            broadcast: 'message',
-            text,
-            username: ctx.user.assigns.username,
-            timestamp: Date.now()
-        };
-    }
-
-    @OnEvent('presence')
-    async handlePresence(ctx: Context) {
-        const { status } = ctx.event.payload;
-        
-        // Return an object to update presence
-        return {
-            presence: {
-                status,
-                lastSeen: Date.now()
-            }
-        };
-    }
-}
+export const Chat = definePondChannel(
+    definePondSchema<ChatSchema>(),
+    '/chat/:roomId',
+);
 ```
 
-The NestJS integration provides a convenient way to handle WebSocket events by returning objects with specific properties. When you return an object with any of these properties, the corresponding action will be taken automatically:
+See the [core](./javascript/core/README.md), [client](./javascript/client/README.md), and [NestJS](./javascript/nest/README.md) guides for definition-bound examples.
 
-- `event`: Sends an event to the user
-- `broadcast`: Broadcasts an event to all users in the channel
-- `broadcastFrom`: Broadcasts an event to all users except the sender
-- `assigns`: Updates the user's assigns
-- `presence`: Updates the user's presence
+## Multi-node deployment
 
-This allows you to write cleaner, more declarative code without having to use the context object directly for common operations.
+The TypeScript, Go, Python, and Rust servers can each distribute events through Redis. For TypeScript:
 
-## Advanced Features
+```ts
+import { PondSocket, RedisDistributedBackend } from '@eleven-am/pondsocket';
 
-For detailed information about advanced features, please refer to the specific package documentation:
+const backend = new RedisDistributedBackend({
+    url: process.env.REDIS_URL,
+    namespace: 'my-app',
+    initializationTimeoutMs: 10_000,
+    cleanupTimeoutMs: 5_000,
+});
 
-- [Core Package Documentation](packages/core/README.md) - Learn about channels, presence, broadcasting, and distributed deployment
-- [Express Integration Documentation](packages/express/README.md) - Discover how to integrate with Express.js applications
-- [NestJS Integration Documentation](packages/nest/README.md) - Explore decorators, guards, and dependency injection
-- [Client Package Documentation](packages/client/README.md) - Master client-side implementation and event handling
+const pond = new PondSocket({ distributedBackend: backend });
+await pond.ready();
+```
 
-## Contributing
+Use a unique namespace for each mutually trusted application. Redis Pub/Sub is a transport, not an authorization boundary: isolate credentials and networks, use TLS where appropriate, and never share a PondSocket namespace with untrusted publishers.
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+The normative topic and message contract, including the current mixed-runtime limitation, is [DISTRIBUTED_PROTOCOL.md](./DISTRIBUTED_PROTOCOL.md).
+
+## Reliability model
+
+The implementations are designed to make overload and shutdown explicit:
+
+- bounded inbound and outbound queues prevent unlimited memory growth;
+- per-connection ordering prevents a later event overtaking an earlier one;
+- connection, join, handler, write, and cleanup timeouts bound stalled work;
+- slow consumers are disconnected instead of accumulating an unbounded backlog;
+- join failures reach a terminal state rather than leaving callers pending;
+- graceful close paths release transports, subscriptions, timers, channels, and broker clients;
+- origin checks, message-size limits, and configurable hooks provide security and operational controls.
+
+Exact option names and defaults differ by runtime. Use the package README for the implementation you deploy.
+
+## Repository documentation
+
+Each Markdown file has one durable responsibility:
+
+- this README is the cross-runtime project entry point;
+- each package README is the landing page published by npm, PyPI, Go documentation, or crates.io;
+- [DISTRIBUTED_PROTOCOL.md](./DISTRIBUTED_PROTOCOL.md) is the canonical cross-runtime broker contract;
+- `.github/workflows/npm-publish.yml` and `javascript/scripts/publish-packages.mjs` are the executable npm release procedure.
+
+Historical porting checklists and AI-specific instruction files are deliberately not kept as product documentation because they become stale and can contradict the code.
+
+## Development
+
+Run checks from the runtime workspace you changed:
+
+```bash
+# TypeScript
+cd javascript && npm run validate
+
+# Go
+cd go/pondsocket && go test ./...
+cd ../pondsocket-client && go test ./...
+
+# Python
+cd python && make check
+
+# Rust
+cd rust && cargo test --workspace
+```
+
+Runtime packages are versioned and released independently. npm publishing is defined by `.github/workflows/npm-publish.yml` and `javascript/scripts/publish-packages.mjs`; keeping the procedure executable avoids a second, drifting Markdown copy.
 
 ## License
 
-This project is licensed under the GPL-3.0 License - see the LICENSE file for details.
+GPL-3.0. See [LICENSE](./LICENSE).

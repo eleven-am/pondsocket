@@ -63,19 +63,17 @@ Then connect from the JS client at `ws://localhost:8000/ws/?token=secret` and jo
 ```
 python/
 ├── README.md                 (this file)
-├── PARITY.md                 Go ↔ Python file and symbol mapping
 ├── pyproject.toml            uv workspace root, shared tool config
 ├── Makefile                  sync / lint / type / test / clean
 ├── pondsocket-common/        shared types & schemas
 ├── pondsocket/               server core
-└── pondsocket-asgi/          ASGI adapter
+├── pondsocket-asgi/          ASGI adapter
+└── pondsocket-client/        WebSocket client
 ```
 
 ## Status
 
-417 tests passing. ruff clean. mypy strict in 53 source files. The WebSocket wire format is aligned with the existing JS client, and the SSE `CONNECTION` event now carries the same `connectionId` field the browser client expects.
-
-See [`PARITY.md`](./PARITY.md) for the Go → Python mapping and a list of intentional divergences.
+The workspace is checked with pytest, Ruff, and strict mypy. The WebSocket wire format is shared with the other PondSocket runtimes, and the SSE `CONNECTION` event carries the `connectionId` field expected by the browser client. Run `make check` for the current result rather than relying on a hard-coded test count in this document.
 
 ## Development
 

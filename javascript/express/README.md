@@ -1,173 +1,112 @@
-# PondSocket Express Integration
+# PondSocket Express
 
-This package provides seamless integration of [PondSocket](https://www.npmjs.com/package/@eleven-am/pondsocket) with [Express](https://expressjs.com/), allowing you to add high-performance, bidirectional WebSocket endpoints to your Express applications with minimal effort.
+Express adapter for `@eleven-am/pondsocket`. It creates one HTTP server for an existing Express application and attaches PondSocket to that same server.
 
-## Installation
-
-Install the Express adapter alongside PondSocket:
+## Install
 
 ```bash
-npm install @eleven-am/pondsocket @eleven-am/pondsocket-express
+npm install express @eleven-am/pondsocket @eleven-am/pondsocket-express
 ```
 
-## Overview
+## Use
 
-This package exposes a function that takes your Express app and PondSocket options, and returns the app with additional methods for real-time socket communication:
-
-- `createEndpoint(path, handler)`: Define a WebSocket endpoint on your Express app.
-- `listen(...)`: Start the HTTP server and WebSocket server together.
-
-## Server-side Usage
-
-```typescript
-import express from "express";
-import pondSocket from "@eleven-am/pondsocket-express";
+```ts
+import express from 'express';
+import createPondSocket from '@eleven-am/pondsocket-express';
 
 const app = express();
+app.get('/health', (_request, response) => response.send('ok'));
 
-const pondApp = pondSocket(app, {
-  // PondSocket options (except 'server')
+const realtime = createPondSocket(app);
+
+const endpoint = realtime.createEndpoint('/v1/socket', (ctx) => {
+    if (!ctx.query.token) {
+        ctx.decline('Missing token', 401);
+        return;
+    }
+
+    ctx.accept({ role: 'member' });
 });
 
-// Create a WebSocket endpoint
-const endpoint = pondApp.createEndpoint('/api/socket', (ctx, next) => {
-  const token = ctx.request.query.token;
-  if (isValidToken(token)) {
-    ctx.accept({ role: getRoleFromToken(token) });
-  } else {
-    ctx.reject('Invalid token', 401);
-  }
+const chat = endpoint.createChannel('/chat/:roomId', (ctx) => {
+    ctx.accept({ displayName: ctx.joinParams.displayName });
+    ctx.trackPresence({ online: true });
 });
 
-// Create a channel
-const channel = endpoint.createChannel('/channel/:id', (ctx, next) => {
-  const { role } = ctx.user.assigns;
-  const { username } = ctx.joinParams;
-  if (role === 'admin') {
-    ctx.accept({ username }).trackPresence({
-      username,
-      role,
-      status: 'online',
-      onlineSince: Date.now(),
-    });
-  } else {
-    ctx.decline('Insufficient permissions', 403);
-  }
+chat.onEvent('message', (ctx) => {
+    ctx.broadcast('message', ctx.payload);
 });
 
-// Start the server
-pondApp.listen(3000);
+realtime.listen(3000);
 ```
 
-## Client-side Usage
+The returned object contains:
 
-The client API is unchanged—use `@eleven-am/pondsocket-client` as described in the main PondSocket documentation.
+- `app`: the original Express application;
+- `server`: the shared Node.js HTTP server;
+- `pond`: the underlying `PondSocket` instance;
+- `createEndpoint`: the bound PondSocket endpoint factory;
+- `listen`: the shared server's bound `listen` method;
+- `close`: closes PondSocket first, then the HTTP server.
 
-```typescript
-import PondClient from "@eleven-am/pondsocket-client";
+All options accepted by `PondSocket` except `server` may be passed as the second argument. The adapter owns the HTTP server it creates and configures PondSocket to close that server during shutdown.
 
-const socket = new PondClient('ws://your-server/api/socket', {
-  token: 'your-auth-token'
+## Client
+
+Use the named `PondClient` export:
+
+```ts
+import { PondClient } from '@eleven-am/pondsocket-client';
+
+const client = new PondClient('ws://localhost:3000/v1/socket', {
+    token: 'connection-token',
 });
-socket.connect();
 
-const channel = socket.createChannel('/channel/123', { username: 'user123' });
+client.connect();
+
+const channel = client.createChannel('/chat/general', {
+    displayName: 'Ada',
+});
+
+channel.onMessageEvent('message', console.log);
 channel.join();
-channel.broadcast('message', { text: 'Hello, PondSocket!' });
+channel.sendMessage('message', { text: 'hello' });
 ```
 
-## Key Features
+## Redis distribution
 
-- **Express Integration**: Add real-time endpoints to your existing Express app.
-- **Simple and Efficient API**: Easy-to-use, type-safe API for WebSocket communication.
-- **Organized Channels**: Group users and manage communication efficiently.
-- **Assigns**: Store private information for users and channels.
-- **Presence**: Track and broadcast user state changes.
-- **Broadcasting**: Send messages to all or specific users.
-- **Middleware Support**: Extensible request processing.
-- **Distributed Support**: Built-in distributed deployment with state sync.
+```ts
+import express from 'express';
+import { RedisDistributedBackend } from '@eleven-am/pondsocket';
+import createPondSocket from '@eleven-am/pondsocket-express';
 
-## Advanced Features
-
-### Presence Management
-
-```typescript
-// Server-side
-channel.onEvent('presence', (ctx, next) => {
-  ctx.trackPresence({
-    username: ctx.user.assigns.username,
-    status: 'online',
-    lastSeen: Date.now()
-  });
+const backend = new RedisDistributedBackend({
+    url: process.env.REDIS_URL,
+    namespace: 'my-app',
+    initializationTimeoutMs: 10_000,
+    cleanupTimeoutMs: 5_000,
 });
 
-// Client-side
-channel.onPresence((presences) => {
-  console.log('Current users:', presences);
+const realtime = createPondSocket(express(), {
+    distributedBackend: backend,
 });
+
+await realtime.pond.ready();
+realtime.listen(3000);
 ```
 
-### User Assigns
+Use a namespace and Redis deployment shared only by mutually trusted application nodes. Redis Pub/Sub does not authenticate individual PondSocket messages.
 
-```typescript
-// Server-side
-channel.onEvent('update-profile', (ctx, next) => {
-  ctx.assign({
-    ...ctx.user.assigns,
-    profile: ctx.event.payload
-  });
-});
+## Shutdown
 
-// Client-side
-channel.onAssigns((assigns) => {
-  console.log('User data updated:', assigns);
-});
+`close()` starts asynchronous PondSocket cleanup and closes the shared HTTP server. For code that must await complete cleanup directly, use the underlying instance:
+
+```ts
+await realtime.pond.closeAsync();
 ```
 
-### Error Handling
-
-```typescript
-// Server-side
-channel.onEvent('message', (ctx, next) => {
-  try {
-    ctx.accept();
-  } catch (error) {
-    ctx.decline(error.message, 400);
-  }
-});
-
-// Client-side
-channel.onError((error) => {
-  console.error('Channel error:', error);
-});
-```
-
-## Distributed Deployment
-
-PondSocket supports distributed deployment through its distributed backend system. This allows you to scale your application across multiple nodes while maintaining state synchronization.
-
-```typescript
-import express from "express";
-import pondSocket from "@eleven-am/pondsocket-express";
-import { RedisBackend } from "@eleven-am/pondsocket";
-
-const app = express();
-
-const pondApp = pondSocket(app, {
-  backend: new RedisBackend({
-    host: 'localhost',
-    port: 6379
-  }),
-  // ...other PondSocket options
-});
-
-// Now use pondApp.createEndpoint(...) as usual
-```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+The core server's queue limits, timeouts, origin policy, health checks, and lifecycle options are documented in [`@eleven-am/pondsocket`](../core/README.md).
 
 ## License
 
-This project is licensed under the GPL-3.0 License - see the LICENSE file for details.
+GPL-3.0

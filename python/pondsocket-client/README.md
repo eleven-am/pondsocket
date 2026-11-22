@@ -2,7 +2,7 @@
 
 Python client for the [PondSocket](../pondsocket/) server. Connects to PondSocket servers (Python, Go, or TypeScript implementation) over WebSocket.
 
-Modeled after the JavaScript client architecture (`@eleven-am/pondsocket-client`) rather than the Go one — the JS client fixes several bugs the Go client has (see [Parity notes](#parity-notes) below).
+It follows the shared PondSocket wire protocol and exposes an asyncio-native connection and channel lifecycle.
 
 ## Install
 
@@ -80,21 +80,6 @@ Subscribe via `channel.on_channel_state_change(handler)`:
 | `STALLED` | socket dropped while JOINED; will rejoin on reconnect |
 | `CLOSED` | `leave()` called |
 | `DECLINED` | server sent UNAUTHORIZED; channel is terminal — create a new one |
-
-## Parity notes
-
-Compared to the Go client (`go/pondsocket-client/`):
-
-| Behavior | Go | Python |
-|---|---|---|
-| `send_for_response` correlation | event name (buggy) | `requestId` (correct) |
-| Reconnect backoff | linear despite comment | true exponential, capped |
-| `UNAUTHORIZED` handling | not implemented | → `DECLINED` state |
-| Connection state | bool (no CONNECTING) | three-state enum |
-| Outbound queue | unbounded | bounded FIFO, raises on overflow |
-| Join while disconnected | dropped silently | deferred until CONNECTED |
-
-The Python client follows the JS client design where the two diverge.
 
 ## Public API
 

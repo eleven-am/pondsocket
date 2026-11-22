@@ -8,6 +8,22 @@ All runtimes MUST produce and consume the shapes below. A difference between an
 implementation and this document is a conformance bug; protocol changes require
 updating this document and the cross-runtime tests together.
 
+## Current interoperability status
+
+This document is the target contract, not evidence that every runtime pairing is
+currently production-proven. The repository has runtime-local conformance tests,
+but it does not yet run a mixed-process Redis integration matrix.
+
+There is also one known topic-level conformance bug: the TypeScript Redis backend
+percent-encodes the endpoint and channel topic segments, while Go, Python, Rust,
+and the topic contract below keep those segments raw. Consequently, a mixed
+TypeScript/non-TypeScript cluster will generally subscribe and publish to
+different Redis topics for names containing `/`, `:`, `%`, or other escaped
+characters. Homogeneous clusters are supported. Go, Python, and Rust currently
+use the same raw topic layout and v1 envelopes, but should still be covered by a
+real cross-runtime integration suite before that matrix is described as
+production-proven.
+
 The JavaScript reference implementation lives in:
 
 - `javascript/core/src/abstracts/distributor.ts` for envelopes, Redis topics,
@@ -123,5 +139,6 @@ Every runtime MUST keep tests for:
 3. Two-node integration covering presence propagation, assigns propagation,
    `STATE_REQUEST`/`STATE_RESPONSE`, and heartbeat-driven stale-node cleanup.
 
-All four runtime test suites must remain green for a protocol change to be
-considered conformant.
+All four runtime test suites and a mixed-runtime Redis integration matrix must
+remain green for a protocol change to be considered fully conformant. That
+mixed-runtime matrix is not yet present in this repository.

@@ -1,6 +1,6 @@
 # pondsocket-common
 
-Shared wire types, schemas, and reactive primitives consumed by both `pondsocket` (server) and (eventually) `pondsocket-client` (Python client). Mirrors the role of `@eleven-am/pondsocket-common` in the JavaScript monorepo.
+Shared wire types, schemas, and reactive primitives consumed by both `pondsocket` (server) and `pondsocket-client` (Python client). Mirrors the role of `@eleven-am/pondsocket-common` in the JavaScript monorepo.
 
 This package has **one runtime dependency**: pydantic v2.
 
@@ -17,7 +17,7 @@ In a workspace it's installed automatically via `uv sync`.
 | Module | Purpose |
 |---|---|
 | `pondsocket_common.enums` | `ServerActions`, `ClientActions`, `ChannelState`, `PresenceEventTypes`, `ErrorTypes`, `ChannelReceiver`, `SystemSender`, `Events`, `PubSubEvents` — all `StrEnum` with exact wire strings |
-| `pondsocket_common.schemas` | Pydantic v2 models: `ClientMessage`, `ServerMessage`, `PresenceMessage`, `ChannelEvent`, plus `parse_client_message` / `parse_server_message` / `parse_presence_message` / `parse_channel_event` with comnon-style `ValidationError` |
+| `pondsocket_common.schemas` | Pydantic v2 models: `ClientMessage`, `ServerMessage`, `PresenceMessage`, `ChannelEvent`, plus `parse_client_message` / `parse_server_message` / `parse_presence_message` / `parse_channel_event` with common-style `ValidationError` |
 | `pondsocket_common.types` | `UserData`, `IncomingConnection`, `PresencePayload`, `PubSubEvent` variants, type aliases (`PondMessage`, `PondPresence`, `PondAssigns`, `JoinParams`) |
 | `pondsocket_common.headers` | `Headers` — case-insensitive view over ASGI-shape `list[tuple[bytes, bytes]]` |
 | `pondsocket_common.subjects` | `Subject[T]` and `BehaviorSubject[T]` — synchronous reactive primitives mirroring the JS comnon impl |

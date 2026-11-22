@@ -1,110 +1,68 @@
-# PondSocket Distributed Package
+# PondSocket Go Redis adapter
 
-This package provides distributed PubSub implementations for PondSocket, enabling multi-node deployments.
+Redis Pub/Sub implementation of the Go server's `pondsocket.PubSub` interface. This subpackage exists because the broker adapter has its own dependency, initialization failure mode, subscription lifecycle, and operational security requirements; the server README only shows how to attach it.
 
-## Redis PubSub
-
-The `RedisPubSub` implementation uses Redis's publish-subscribe functionality to synchronize state and messages across multiple PondSocket server nodes.
-
-### Installation
-
-```bash
-go get github.com/redis/go-redis/v9
-```
-
-### Usage
+## Use
 
 ```go
+package main
+
 import (
-    "context"
-    "github.com/redis/go-redis/v9"
-    "github.com/pondsocket/javascript/core-go/distributed"
+	"context"
+	"log"
+
+	pondsocket "github.com/eleven-am/pondsocket/go/pondsocket"
+	"github.com/eleven-am/pondsocket/go/pondsocket/distributed"
+	"github.com/redis/go-redis/v9"
 )
 
-// Create Redis client
-redisClient := redis.NewClient(&redis.Options{
-    Addr:     "localhost:6379",
-    Password: "", // no password set
-    DB:       0,  // use default DB
-})
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-// Create Redis PubSub adapter
-ctx := context.Background()
-pubsub, err := distributed.NewRedisPubSub(ctx, redisClient)
-if err != nil {
-    log.Fatal(err)
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer redisClient.Close()
+
+	pubsub, err := distributed.NewRedisPubSub(ctx, redisClient)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pubsub.Close()
+
+	options := pondsocket.DefaultOptions()
+	options.PubSub = pubsub
+	options.Namespace = "my-app"
+
+	manager := pondsocket.NewManager(ctx, *options)
+	_ = manager
 }
-defer pubsub.Close()
-
-// Configure PondSocket with Redis PubSub
-options := pondsocket.DefaultOptions()
-options.PubSub = pubsub
-
-server := pondsocket.NewServer(&pondsocket.ServerOptions{
-    Options: options,
-})
 ```
 
-### Features
+`NewRedisPubSub` pings Redis and returns an error if initialization fails. The caller owns the supplied `redis.Client`; close both the PondSocket adapter and the client during shutdown.
 
-- **Pattern Matching**: Supports wildcard patterns (e.g., `pondsocket:api:chat:.*`)
-- **Concurrent Safe**: Thread-safe for concurrent publish/subscribe operations
-- **Automatic Reconnection**: Handles Redis connection failures gracefully
-- **Efficient Message Delivery**: Uses goroutines for non-blocking message handling
+## Subscription behavior
 
-### Topic Format
+`Subscribe(pattern, handler)` registers an ordered handler. `SubscribeWithCancel` additionally returns an idempotent function that removes only that registration. `Unsubscribe(pattern)` removes every local handler for the pattern. `Close` cancels delivery, closes the Redis subscription, and waits for the receiver goroutine.
 
-PondSocket uses a hierarchical topic structure:
-```
-pondsocket:{endpoint}:{channel}:{event}
-```
+PondSocket topic patterns use `.*` as the multi-segment wildcard. The adapter translates them to Redis glob patterns internally. Applications normally should not publish framework messages directly; configure the adapter on `pondsocket.Options` and let the server produce the canonical envelopes.
 
-Examples:
-- `pondsocket:api:lobby:presence:join`
-- `pondsocket:api:chat-room-123:message`
-- `pondsocket:api:game-42:assigns:update`
+## Protocol and trust boundary
 
-### Production Considerations
+The normative cross-runtime topics and JSON payloads are defined in [`DISTRIBUTED_PROTOCOL.md`](../../../DISTRIBUTED_PROTOCOL.md). Do not duplicate that contract here.
 
-1. **Connection Pooling**: Configure Redis client with appropriate pool settings
-   ```go
-   redisClient := redis.NewClient(&redis.Options{
-       Addr:         "localhost:6379",
-       PoolSize:     10,
-       MinIdleConns: 5,
-       MaxRetries:   3,
-   })
-   ```
+Redis Pub/Sub does not authenticate publishers or validate application authorization. Use a unique namespace per mutually trusted application, restrict network and credential access, enable TLS where appropriate, and do not expose the broker to untrusted clients.
 
-2. **Redis Cluster**: For high availability, use Redis Cluster
-   ```go
-   redisClient := redis.NewClusterClient(&redis.ClusterOptions{
-       Addrs: []string{":7000", ":7001", ":7002"},
-   })
-   ```
+## Tests
 
-3. **Error Handling**: The implementation recovers from handler panics, but you should add logging in production
+The adapter tests use an in-memory Redis server:
 
-4. **Message Size**: Redis has a default limit of 512MB per message. Keep messages reasonably sized.
-
-### Testing
-
-Run tests with a local Redis instance:
 ```bash
-# Start Redis
-docker run -d -p 6379:6379 redis:latest
-
-# Run tests
-go test ./distributed/...
+go test ./distributed
+go test -race ./distributed
 ```
 
-## Future Implementations
+## License
 
-The package is designed to support additional PubSub backends:
-- NATS
-- RabbitMQ
-- Apache Kafka
-- AWS SNS/SQS
-- Google Cloud Pub/Sub
-
-Each implementation will follow the same `PubSub` interface, making it easy to switch between different backends.
+GPL-3.0
