@@ -262,6 +262,8 @@ def test_reconnect_delay_caps_without_huge_exponentiation() -> None:
 
 
 async def test_transport_sends_are_serialized_across_channels() -> None:
+    broadcasts_sent = asyncio.Event()
+
     class _SlowClient(_FakeClient):
         __slots__ = ("active_sends", "peak_active_sends")
 
@@ -276,6 +278,17 @@ async def test_transport_sends_are_serialized_across_channels() -> None:
             try:
                 await asyncio.sleep(0.001)
                 self.sent.append(message)
+                if (
+                    len(
+                        [
+                            sent
+                            for sent in self.sent
+                            if sent.action.value == "BROADCAST"
+                        ]
+                    )
+                    == 3
+                ):
+                    broadcasts_sent.set()
             finally:
                 self.active_sends -= 1
 
@@ -301,7 +314,7 @@ async def test_transport_sends_are_serialized_across_channels() -> None:
     first.send_message("one", {})
     second.send_message("two", {})
     first.send_message("three", {})
-    await asyncio.sleep(0.02)
+    await asyncio.wait_for(broadcasts_sent.wait(), timeout=1.0)
 
     assert client.peak_active_sends == 1
     assert [msg.event for msg in client.sent if msg.action.value == "BROADCAST"] == [

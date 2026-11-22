@@ -279,7 +279,7 @@ wheels = [
 
 [[package]]
 name = "pondsocket"
-version = "0.0.7"
+version = "0.0.8"
 source = { editable = "pondsocket" }
 dependencies = [
     { name = "pondsocket-common" },
@@ -299,7 +299,7 @@ provides-extras = ["redis"]
 
 [[package]]
 name = "pondsocket-asgi"
-version = "0.0.6"
+version = "0.0.7"
 source = { editable = "pondsocket-asgi" }
 dependencies = [
     { name = "pondsocket" },
@@ -314,7 +314,7 @@ requires-dist = [
 
 [[package]]
 name = "pondsocket-client"
-version = "0.0.6"
+version = "0.0.7"
 source = { editable = "pondsocket-client" }
 dependencies = [
     { name = "pondsocket-common" },

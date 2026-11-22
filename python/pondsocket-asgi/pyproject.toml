@@ -1,6 +1,6 @@
 [project]
 name = "pondsocket-asgi"
-version = "0.0.6"
+version = "0.0.7"
 description = "Canonical ASGI adapter for PondSocket."
 readme = "README.md"
 requires-python = ">=3.11"

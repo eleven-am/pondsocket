@@ -1,6 +1,6 @@
 [project]
 name = "pondsocket"
-version = "0.0.7"
+version = "0.0.8"
 description = "PondSocket - channel-based real-time framework with bring-your-own-server design."
 readme = "README.md"
 requires-python = ">=3.11"
